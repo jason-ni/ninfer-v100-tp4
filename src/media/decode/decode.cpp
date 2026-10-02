@@ -393,13 +393,8 @@ int rotation_of(const AVStream* stream) {
     if (tag != nullptr) {
         rotation = static_cast<int>(std::nearbyint(std::strtod(tag->value, nullptr)));
     }
-    const AVPacketSideData* side =
-        av_packet_side_data_get(stream->codecpar->coded_side_data,
-                                stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
-    if (side != nullptr && side->size >= 9 * sizeof(std::int32_t)) {
-        rotation = static_cast<int>(std::nearbyint(
-            -av_display_rotation_get(reinterpret_cast<const std::int32_t*>(side->data))));
-    }
+    // FFmpeg 6.1 has no AVCodecParameters::coded_side_data; container rotation is carried in the
+    // "rotate" tag above (codec-level display matrices with no tag are not detected on 6.1).
     rotation %= 360;
     if (rotation < 0) { rotation += 360; }
     if (rotation == 89 || rotation == 91) { rotation = 90; }
