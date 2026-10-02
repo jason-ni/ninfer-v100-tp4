@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import json
+import re
 from pathlib import Path
 import time
 from typing import Iterable, Mapping, Sequence
@@ -45,13 +46,43 @@ from . import recipe_nvfp4 as recipe
 RECIPE_ID = "qwen3_8_27b_nvfp4-v1"
 OUTPUT_BASENAME = "qwen3_8_27b_nvfp4.ninfer"
 
-_FP8_TARGETS = [
-    r"re:.*self_attn\.(q|k|v|o)_proj$",
-    r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$",
-    r"re:.*lm_head",
-    r"re:.*layers\.(56|57|58|59|60|61|62|63)\.mlp\.(gate|up|down)_proj$",
-]
-_NVFP4_TARGETS = [r"re:.*mlp\.(gate|up|down)_proj$"]
+_FP8_SOURCE_NAMES = frozenset(
+    source.name for source in recipe.FP8_SOURCES if source.name != "lm_head"
+)
+_NVFP4_SOURCE_NAMES = frozenset(source.name for source in recipe.NVFP4_SOURCES)
+
+
+def _check_target_coverage(
+    scope: str,
+    targets: object,
+    expected_names: frozenset[str],
+) -> None:
+    """Require every expected quantized source to be named by the group targets.
+
+    Accepts either explicit tensor names or ``re:`` patterns, so both the
+    canonical (regex) and community (explicit-name) checkpoint layouts pass.
+    """
+    if not isinstance(targets, list) or not targets:
+        raise ValueError(f"{scope} must be a non-empty list")
+    patterns = [
+        re.compile(target[3:])
+        for target in targets
+        if isinstance(target, str) and target.startswith("re:")
+    ]
+    literals = {
+        target
+        for target in targets
+        if isinstance(target, str) and not target.startswith("re:")
+    }
+    uncovered = [
+        name
+        for name in sorted(expected_names)
+        if name not in literals and not any(p.search(name) for p in patterns)
+    ]
+    if uncovered:
+        raise ValueError(
+            f"{scope} does not cover expected quantized sources: {uncovered[:6]}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +131,12 @@ def _validate_float_group(group: Mapping[str, object]) -> None:
     family_conversion.check_members(
         "quantization_config.config_groups.group_0",
         group,
-        {"format": "float-quantized", "targets": _FP8_TARGETS},
+        {"format": "float-quantized"},
+    )
+    _check_target_coverage(
+        "quantization_config.config_groups.group_0.targets",
+        group.get("targets"),
+        _FP8_SOURCE_NAMES,
     )
     weights = group.get("weights")
     activations = group.get("input_activations")
@@ -129,7 +165,12 @@ def _validate_nvfp4_group(group: Mapping[str, object]) -> None:
     family_conversion.check_members(
         "quantization_config.config_groups.group_1",
         group,
-        {"format": "nvfp4-pack-quantized", "targets": _NVFP4_TARGETS},
+        {"format": "nvfp4-pack-quantized"},
+    )
+    _check_target_coverage(
+        "quantization_config.config_groups.group_1.targets",
+        group.get("targets"),
+        _NVFP4_SOURCE_NAMES,
     )
     weights = group.get("weights")
     activations = group.get("input_activations")
@@ -397,6 +438,15 @@ def convert(
                     payload = fp8_embedding.iter_reader_payload(
                         official_reader,
                         recipe.OFFICIAL_EMBEDDING_SOURCE.name,
+                        spec.shape,
+                    )
+                elif spec.name == "text/output_head":
+                    # Community NVFP4 packages keep lm_head as BF16 (in the
+                    # ignore list); re-encode it to the row-scaled FP8 layout
+                    # instead of reading a pre-quantized FP8 source.
+                    payload = fp8_embedding.iter_reader_payload(
+                        quantized_reader,
+                        "lm_head.weight",
                         spec.shape,
                     )
                 elif spec.name in recipe.FP8_WEIGHTS_BY_NAME:

@@ -477,6 +477,11 @@ def _source_requirements() -> dict[str, tuple[tuple[int, ...], str]]:
     result: dict[str, tuple[tuple[int, ...], str]] = {}
     for source in FP8_SOURCES:
         n, k = source.shape
+        if source.name == "lm_head":
+            # Community NVFP4 packages keep lm_head as plain BF16; it is
+            # re-encoded to row-scaled FP8 at materialization time.
+            _merge_requirement(result, source.field("weight"), (n, k), "BF16")
+            continue
         _merge_requirement(result, source.field("weight"), (n, k), "F8_E4M3")
         _merge_requirement(
             result, source.field("weight_scale"), (n, 1), "BF16"
