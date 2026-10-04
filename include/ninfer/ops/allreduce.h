@@ -11,58 +11,31 @@
 //
 // The implementation is ONE rank-generic algorithm parameterized by the runtime `tp`, not a
 // separate two-rank and four-rank path. At tp == 1 every collective is a validation-only no-op; at
-// tp == 2 the star reduce below degenerates to the historical two-party exchange.
+// tp == 2 the same grouped NCCL calls are simply a two-rank exchange.
 //
-// TRANSPORT. Payloads move with cudaMemcpyAsync(cudaMemcpyDeviceToDevice) over unified virtual
-// addresses, which every 64-bit Linux CUDA context has: a device pointer already names its
-// device, so this one entry point expresses a cross-device transfer as well as a local one. When
-// the driver grants peer access and startup validates it, the copy is a direct device-to-device
-// PCIe transfer. On this V100 topology the translated IOMMU domain prevents direct P2P; CUDA's
-// UVA D2D implementation then selects its driver-managed staging path. Startup validates the
-// exact UVA D2D route in either case. The collectives never allocate or copy through an explicit
-// host buffer, and callers need no peer-access branch; enable_peer_access() only reports whether
-// direct peer access was qualified.
+// TRANSPORT. Cross-device traffic runs over NCCL, one communicator per rank, which on this
+// V100-SXM2 mesh uses the NVLink P2P fabric directly (measured ~48 GB/s per direction on every
+// ordered pair). Every collective is issued as a grouped per-rank call: ncclGroupStart(), one
+// nccl call per rank on that rank's own DeviceContext::stream, ncclGroupEnd(). Grouping is
+// mandatory here because a single host thread drives all communicators; without it the first
+// collective deadlocks waiting for a peer call the same thread has not issued yet.
 //
-// The equivalent cudaMemcpyPeerAsync entry point is deliberately NOT used: it is rejected inside a
-// stream capture region (cudaErrorStreamCaptureUnsupported), which would make the whole
-// tensor-parallel decode program uncapturable. See src/ops/common/allreduce.cu's pull_peer().
+// The calls are stream-ordered GPU work with no host round trip, host-memory spin flag, or
+// explicit host staging, so they are CUDA-Graph capturable. Ordering between consecutive
+// collectives comes from NCCL's own stream semantics; there are no cross-stream cudaEvents, which
+// is what lets each rank be captured into its own independent graph.
 //
-// ORDERING. Every transfer is a PULL: a rank reads a source into storage that same rank alone
-// owns, on its own stream. Nothing a rank owns is ever written by a peer's stream, so the classic
-// push hazard -- the peer overwriting a staging buffer that this rank has not finished reading yet
-// -- cannot exist. The summing reduce is a star through rank 0 so that every rank ends up with the
-// BITWISE-IDENTICAL result: ranks 1..N-1 publish their partial and rank 0 folds all of them into
-// its own buffer in one fixed order, then broadcasts that exact buffer back. An all-to-all
-// "each rank sums independently" reduce is deliberately not used: with N > 2 the ranks would sum
-// the same operands in different orders and the last-bit result could differ across ranks, which
-// would desynchronize the replicated residual and every per-rank GDN/KV state derived from it.
+// The all-reduce is a plain in-place ncclAllReduce(ncclSum) on every rank and is NOT guaranteed
+// bitwise-identical across ranks (NCCL may associate the reduction differently per rank). That is
+// consistent with the Op oracle (an FP64 sum rounded once to BF16) and with the reference
+// tensor-parallel implementations; rank-to-rank lockstep is preserved because every token decision
+// is taken on rank 0 and published to the peers with broadcast_rank0.
 //
-//   allreduce_sum(rank 0):   record(inputs_ready[0]); for s in 1..N-1 { wait(inputs_ready[s]);
-//                            partial[s] -> scratch; scratch += buffer[0] }
-//                            record(pull_done[0])
-//   allreduce_sum(rank r>0): record(inputs_ready[r]); wait(pull_done[0]);
-//                            buffer[0] -> buffer[r]; record(pull_done[r])
-//   rank 0 then waits(pull_done[r]) for every r>0.
-//
-// The waits carry the whole correctness argument: wait(inputs_ready[s]) makes the inbound copy read
-// a completed peer partial; wait(pull_done[r]) (on rank 0) is the write-after-read barrier that
-// lets peer r overwrite its partial on the next call, and wait(pull_done[0]) (on a peer) both
-// orders the peer after rank 0's read of its partial and publishes the summed result.
-//
-// POST-CONDITION. On return each rank's stream is ordered after every peer's read of that rank's
-// inputs. Therefore an unbounded sequence of calls sharing the same buffers, staging, and
-// PeerEvents needs NO host synchronization between calls -- which is exactly what a captured
-// CUDA graph replays, and what a decode token's collectives do. For the 27B model that is
-// 128 all-reduces (64 layers x 2 row-parallel projections: the mixer output and the MLP down
-// projection) plus one allgather_rows per logit column.
-//
-// Everything in a call is stream-ordered CUDA work (memcpy, event record, event wait, kernel
-// launch): there is no host round trip, host-memory spin flag, or explicit host staging allocation
-// in the hot path. That is what makes the sequence capturable. With all device streams enrolled in
-// ONE capture -- each peer stream joined to the origin's by an event fork -- the record/wait pairs
-// above become graph EDGES rather than nodes, and the whole decode program instantiates as a
-// single cross-device cudaGraphExec. Event objects are caller-owned and created once, because
-// cudaEventCreate is not capturable.
+// POST-CONDITION. On return each rank's stream is ordered after the collective; an unbounded
+// sequence of calls reusing the same buffers and communicators needs no host synchronization
+// between calls, which is exactly what a captured CUDA graph replays. For the 27B model that is
+// 128 all-reduces per decode token (64 layers x 2 row-parallel projections: the mixer output and
+// the MLP down projection) plus one allgather_rows per logit column.
 //
 // CALLER OBLIGATION -- the legacy default stream. These ops read their inputs on
 // DeviceContext::stream, which core creates with cudaStreamNonBlocking and which therefore does
@@ -79,79 +52,55 @@
 #include "core/device.h" // DeviceContext, ExecutionContext, kMaximumDevices
 #include "core/tensor.h"
 
-#include <cuda_runtime.h> // cudaEvent_t
+#include <cuda_runtime.h> // cudaStream_t
+#include <nccl.h>         // ncclComm_t
 
 #include <array>
 #include <cstddef>
 
 namespace ninfer::ops {
 
-// Qualifies the actual cross-device copy route at startup. On Linux, first resolve every CUDA
-// device's PCI bus IDs to /sys/bus/pci/devices/<BDF>/iommu_group/type. DMA and DMA-FQ prevent
-// direct P2P, so the function leaves peer access disabled and validates CUDA's UVA D2D fallback
-// instead. Otherwise, when every ordered device pair advertises peer access, enable them and check
-// distinct 16 KiB patterns with the collectives' UVA D2D API on their destination compute streams.
-// Returns true only when direct peer access is enabled and every ordered pair's copy is exact. If
-// direct P2P is unavailable or fails qualification, it is disabled and the same UVA D2D route is
-// qualified with driver-managed staging; the function returns false after emitting one diagnostic.
-// A failed UVA check or CUDA API error throws; inference must not continue.
+// Owns one NCCL communicator per rank for an ExecutionContext with `tp` in {1,2,4}. Construction
+// is a one-time startup cost (ncclCommInitAll over the device ids); the collectives below only
+// issue stream work. At tp == 1 no communicator is created and every collective is a
+// validation-only no-op, so single-device inference never links a live communicator.
 //
-// Call once during setup, before graph capture or concurrent inference. This function allocates
-// temporary probe buffers, synchronizes each compute stream, and releases its buffers while
-// restoring the caller's current device. Peer-access changes are context-level operations;
-// none of this setup is graph-capturable or belongs in a hot path. A tp == 1 context returns false.
-bool enable_peer_access(const ExecutionContext& ec);
-
-// The reusable cross-device ordering events: two per device, created on that device with timing
-// disabled.
-//
-//   inputs_ready(r) - recorded on rank r's stream once the inputs rank r contributes are complete;
-//                     the peers wait on it before reading them.
-//   pull_done(r)    - recorded on rank r's stream once rank r's inbound copy has finished reading
-//                     the peer's source; the peer waits on it before overwriting that source.
-//
-// Re-recording an event a previous call already recorded is well defined: cudaStreamWaitEvent
-// captures the event's state at the time the wait is issued, and the collectives always issue a
-// call's waits before the next call's records, so one instance serves an unbounded number of
-// sequential calls. Instances are not thread-safe: one instance belongs to one stream set. A
-// moved-from instance holds no events and must not be passed to a collective (the ops reject it).
-class PeerEvents {
+// The communicators use NVLink P2P when the topology allows it and are the single cross-device
+// ordering mechanism: consecutive collectives are ordered by NCCL's stream semantics alone, with
+// no cross-stream cudaEvents. Instances are not thread-safe: one instance belongs to the single
+// inference thread. A moved-from instance holds no communicators and must not be passed to a
+// collective (the ops reject it).
+class CollectiveComms {
 public:
-    explicit PeerEvents(const ExecutionContext& ec);
-    ~PeerEvents();
+    explicit CollectiveComms(const ExecutionContext& ec);
+    ~CollectiveComms();
 
-    PeerEvents(const PeerEvents&)            = delete;
-    PeerEvents& operator=(const PeerEvents&) = delete;
-    PeerEvents(PeerEvents&& other) noexcept;
-    PeerEvents& operator=(PeerEvents&& other) noexcept;
+    CollectiveComms(const CollectiveComms&)            = delete;
+    CollectiveComms& operator=(const CollectiveComms&) = delete;
+    CollectiveComms(CollectiveComms&& other) noexcept;
+    CollectiveComms& operator=(CollectiveComms&& other) noexcept;
 
-    [[nodiscard]] cudaEvent_t inputs_ready(int rank) const noexcept {
-        return inputs_ready_[static_cast<std::size_t>(rank)];
-    }
-
-    [[nodiscard]] cudaEvent_t pull_done(int rank) const noexcept {
-        return pull_done_[static_cast<std::size_t>(rank)];
+    [[nodiscard]] ncclComm_t comm(int rank) const noexcept {
+        return comms_[static_cast<std::size_t>(rank)];
     }
 
     // Number of ranks this set was created for.
     [[nodiscard]] int count() const noexcept { return tp_; }
 
-    // False for a moved-from instance.
+    // False for a moved-from instance or one whose communicators failed to initialize. A tp == 1
+    // set is live and its collectives are no-ops.
     [[nodiscard]] bool live() const noexcept {
         if (tp_ < 1) { return false; }
+        if (tp_ == 1) { return true; }
         for (int rank = 0; rank < tp_; ++rank) {
-            if (inputs_ready_[static_cast<std::size_t>(rank)] == nullptr ||
-                pull_done_[static_cast<std::size_t>(rank)] == nullptr) {
-                return false;
-            }
+            if (comms_[static_cast<std::size_t>(rank)] == nullptr) { return false; }
         }
         return true;
     }
 
 private:
     int tp_ = 0;
-    std::array<cudaEvent_t, kMaximumDevices> inputs_ready_{};
-    std::array<cudaEvent_t, kMaximumDevices> pull_done_{};
+    std::array<ncclComm_t, kMaximumDevices> comms_{};
 };
 
 /**
@@ -168,18 +117,20 @@ private:
  * per-rank allocation uniformly.
  *
  * The oracle evaluates `ideal` in FP64 from the represented BF16 inputs; the observable BF16
- * output is that value rounded once to BF16 storage, and rank 0's local combine is the qualified
- * residual_add computation body (FP32 accumulation of the two BF16 operands, one
- * round-to-nearest-even on store) applied once per peer partial. The other ranks receive rank 0's
- * exact bytes. The Op holds no persistent state and allocates nothing.
+ * output is that value rounded once to BF16 storage. NCCL's in-place ncclAllReduce(ncclSum)
+ * evaluates that sum with an internal association that need not match the oracle bit-for-bit, so
+ * the output is checked within the BF16 rounding bound rather than by byte equality. The Op holds
+ * no persistent state and allocates nothing.
  *
- * Requires `ec.tp >= 1`, `ec.tp <= kMaximumDevices`, a live `events` created for the same `tp`, and
+ * Requires `ec.tp >= 1`, `ec.tp <= kMaximumDevices`, a live `comms` created for the same `tp`, and
  * (`ec.tp >= 2`) distinct devices. At `ec.tp == 1` it validates and returns. Consecutive calls
- * sharing the same arguments need no host synchronization between them.
+ * sharing the same arguments need no host synchronization between them. `staging` is validated for
+ * residency and shape but is otherwise unused: ncclAllReduce reduces in place. It is retained only
+ * to keep the row-parallel projection call sites unchanged and will be dropped with them.
  */
 void allreduce_sum(const std::array<Tensor, kMaximumDevices>& buffer,
                    const std::array<Tensor, kMaximumDevices>& staging,
-                   const ExecutionContext& ec, const PeerEvents& events);
+                   const ExecutionContext& ec, const CollectiveComms& comms);
 
 /**
  * N-device row gather, exact (no arithmetic). The gathered axis is `ne[1]`, so each rank
@@ -197,36 +148,38 @@ void allreduce_sum(const std::array<Tensor, kMaximumDevices>& buffer,
  * `[V, B]` logits split by vocabulary with B > 1) arranges the layout so that it is; this Op
  * relocates contiguous storage and performs no transpose.
  *
- * `destination[r]` is written only by rank r's stream: rank r copies its own block locally and
- * pulls every peer's block. The transformation is a pure relocation of storage, so it is verified
- * by exact byte comparison. The Op holds no persistent state and allocates nothing.
+ * `destination[r]` is filled by grouped point-to-point NCCL send/receive (so uneven per-rank
+ * blocks are allowed; the current registered models split the output head evenly). Rank s's
+ * `part[s]` lands at row offset(s) of every destination, so every rank ends up holding the
+ * identical full image. The transformation is a pure relocation of storage, so it is verified by
+ * exact byte comparison. The Op holds no persistent state and allocates nothing.
  *
- * Requires `ec.tp >= 1`, `ec.tp <= kMaximumDevices`, and a live `events` created for the same `tp`.
+ * Requires `ec.tp >= 1`, `ec.tp <= kMaximumDevices`, a live `comms` created for the same `tp`.
  * At `ec.tp == 1` it validates and returns. Consecutive calls sharing the same arguments need no
  * host synchronization between them.
  */
 void allgather_rows(const std::array<Tensor, kMaximumDevices>& destination,
                     const std::array<Tensor, kMaximumDevices>& part, const ExecutionContext& ec,
-                    const PeerEvents& events);
+                    const CollectiveComms& comms);
 
 /**
  * Exact one-way vocabulary gather used by DFlash's rank-0 selector. `destination` is the full
  * `[C,T]` image on rank 0; `part[r]` is rank r's contiguous width block. The first/contiguous
  * dimension is concatenated for every column. Ranks other than 0 are deliberately not written
  * because they never consume DFlash proposal logits.
- * The source lifetime edge still orders every peer after rank 0 has finished importing its shard,
- * so the same work buffers may be reused by the next graph round.
+ * Each peer sends its contiguous block to rank 0, which places it with the same strided addressing
+ * the previous UVA path used, so the same work buffers may be reused by the next graph round.
  */
 void gather_columns_rank0(const Tensor& destination,
                           const std::array<Tensor, kMaximumDevices>& part,
-                          const ExecutionContext& ec, const PeerEvents& events);
+                          const ExecutionContext& ec, const CollectiveComms& comms);
 
 // Exact one-way relocation from rank 0 to every peer. `destination[r]` (r >= 1) has the same
 // contiguous dtype and shape as `source`, and lives on `ec.dev[r]`; `destination[0]` is ignored.
-// Uses the qualified UVA D2D transport and orders rank 0's next overwrite after every peer has
-// consumed the source, including under CUDA Graph capture.
+// Uses ncclBroadcast(root 0) and orders rank 0's next overwrite after every peer has consumed the
+// source, including under CUDA Graph capture.
 void broadcast_rank0(const Tensor& source,
                      const std::array<Tensor, kMaximumDevices>& destination,
-                     const ExecutionContext& ec, const PeerEvents& events);
+                     const ExecutionContext& ec, const CollectiveComms& comms);
 
 } // namespace ninfer::ops

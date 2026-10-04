@@ -2,7 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
-#include "ninfer/ops/allreduce.h" // ExecutionContext, PeerEvents (tp2 split forms)
+#include "ninfer/ops/allreduce.h" // ExecutionContext, CollectiveComms (tp2 split forms)
 
 #include <cuda_runtime.h>
 
@@ -209,11 +209,11 @@ void linear_column_parallel(const std::array<Tensor, kMaximumDevices>& x, const 
 void linear_row_parallel(const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& w,
                          const std::array<Tensor, kMaximumDevices>& out, const std::array<Tensor, kMaximumDevices>& staging,
                          LinearPolicy policy, const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                         const ExecutionContext& ec, const PeerEvents& events);
+                         const ExecutionContext& ec, const CollectiveComms& events);
 
 /// A16-only row-parallel form; requires no transient workspace.
 void linear_row_parallel(const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& w,
                          const std::array<Tensor, kMaximumDevices>& out, const std::array<Tensor, kMaximumDevices>& staging,
-                         const ExecutionContext& ec, const PeerEvents& events);
+                         const ExecutionContext& ec, const CollectiveComms& events);
 
 } // namespace ninfer::ops

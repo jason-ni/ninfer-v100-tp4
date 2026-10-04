@@ -90,7 +90,7 @@ using Guards = std::array<std::unique_ptr<GuardedDeviceBuffer>, kMaximumDevices>
 // the real row-parallel residual passes {5120, 48}. Every rank contributes an independently seeded
 // BF16 partial; the Op's observable result is their sum on every rank.
 int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, std::uint32_t seed,
-                       const ExecutionContext& ec, const ops::PeerEvents& events) {
+                       const ExecutionContext& ec, const ops::CollectiveComms& events) {
     const int tp            = ec.tp;
     const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
 
@@ -171,7 +171,7 @@ int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, st
 // `rows_per_rank[r]` leading rows and receives the full concatenation.
 int run_allgather_case(const char* label, const std::vector<std::int32_t>& rows_per_rank,
                        std::int32_t row_length, std::uint32_t seed, const ExecutionContext& ec,
-                       const ops::PeerEvents& events) {
+                       const ops::CollectiveComms& events) {
     const int tp        = ec.tp;
     std::int32_t rows   = 0;
     for (std::int32_t r : rows_per_rank) rows += r;
@@ -234,7 +234,7 @@ int run_allgather_case(const char* label, const std::vector<std::int32_t>& rows_
 // the full [C, T] image, and only rank 0 is written.
 int run_gather_columns_rank0_case(const char* label, const std::vector<std::int32_t>& widths_per_rank,
                                   std::int32_t columns, std::uint32_t seed,
-                                  const ExecutionContext& ec, const ops::PeerEvents& events) {
+                                  const ExecutionContext& ec, const ops::CollectiveComms& events) {
     const int tp      = ec.tp;
     std::int32_t full = 0;
     for (std::int32_t w : widths_per_rank) full += w;
@@ -295,7 +295,7 @@ int run_gather_columns_rank0_case(const char* label, const std::vector<std::int3
 
 // `source` lives on rank 0; every peer destination must become a bit-exact copy.
 int run_broadcast_case(const char* label, std::int32_t ne0, std::int32_t ne1, std::uint32_t seed,
-                       const ExecutionContext& ec, const ops::PeerEvents& events) {
+                       const ExecutionContext& ec, const ops::CollectiveComms& events) {
     const int tp            = ec.tp;
     const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
 
@@ -334,7 +334,7 @@ int run_broadcast_case(const char* label, std::int32_t ne0, std::int32_t ne1, st
 // post-condition guarantees. Each round multiplies every element by `tp`; the start value is chosen
 // so the value stays an exact power of two through all rounds, then is all-gathered into an
 // [n, tp] image. `log2(tp)` must divide `kStartExponent`.
-int run_chained_case(const ExecutionContext& ec, const ops::PeerEvents& events) {
+int run_chained_case(const ExecutionContext& ec, const ops::CollectiveComms& events) {
     constexpr int kStartExponent = -60;
     const int tp                 = ec.tp;
     const int log2_tp            = static_cast<int>(std::lround(std::log2(static_cast<double>(tp))));
@@ -408,7 +408,7 @@ int run_chained_case(const ExecutionContext& ec, const ops::PeerEvents& events) 
 
 // Coordinator-free throughput probe: the collectives must sustain back-to-back calls without a host
 // synchronization in the loop. Reported only; the suite does not fail on a slow machine.
-int run_microbenchmark(const ExecutionContext& ec, const ops::PeerEvents& events) {
+int run_microbenchmark(const ExecutionContext& ec, const ops::CollectiveComms& events) {
     constexpr std::int32_t n = 5120;
     Guards buffers;
     std::array<Tensor, kMaximumDevices> buffer{};
@@ -449,8 +449,7 @@ int run_suite(int tp) {
     std::vector<int> device_ids;
     for (int rank = 0; rank < tp; ++rank) device_ids.push_back(rank);
     const ExecutionContext ec(device_ids);
-    ops::enable_peer_access(ec);
-    const ops::PeerEvents events(ec);
+    const ops::CollectiveComms events(ec);
 
     int failures = 0;
     std::cout << "== allreduce suite tp=" << tp << " ==\n";

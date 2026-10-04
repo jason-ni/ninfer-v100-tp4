@@ -404,6 +404,39 @@ build-v100/bench/ninfer_v100_corpus \
   --corpus profiles/bench/v100-code-512-p2p.ids --output-dir profiles/bench/p2p_capacity
 ```
 
+### TP4 (four V100s, NCCL)
+
+The engine runs tensor parallelism at widths 1, 2, and 4 through the same code. Cross-rank
+traffic is NCCL (one communicator per rank, grouped per-rank calls from the single engine
+thread), and every rank captures its own CUDA Graph with the collectives recorded as nodes in
+it. On four Tesla V100-SXM2 16 GB cards (CUDA 12.8 / SM70) NCCL uses the NVLink P2P fabric
+directly rather than the PCIe staging path, and the resident weights fall to **5.63 GiB/GPU**
+with 8.29 GiB free after startup at 65536 capacity — the capacity motive for TP4.
+
+The long-context comparison used the `qwen3.8-27b/nvfp4` identity at `max_context=65536`,
+`kv_capacity=65536`, `prefill_chunk=1024`, INT8 group-64 KV, greedy MTP3, one active request,
+`--max-new 200` on a ~60079-token prompt (the Q4_K_M artifact named by the product contract is
+absent in this checkout, so Q4_K_M acceptance was not measured here; the mechanism and sharding
+are identical across the two identities):
+
+| Parallelism | Transport | Decode tok/s | Draft acceptance | Prefill tok/s |
+|---|---|---:|---:|---:|
+| TP4 eager | NCCL / NVLink | **97.32** | 48.35% | 2512 |
+| TP4 captured | NCCL / NVLink | 85.33 | 48.35% | — |
+| TP2 eager | NCCL / NVLink | 69.38 | 51.28% | — |
+
+TP4 is ≈1.4× TP2 at this occupancy and clears the 50 tok/s target. At short context TP4 MTP3
+reaches ~164 tok/s eager / ~145 tok/s captured, and TP4 ordinary (no MTP) decode is 54.69 tok/s
+captured versus TP2 40.14. Graph/captured output is token-identical to eager for both TP2 and
+TP4, and TP2/TP4 greedy streams are identical on the same prompt.
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,2,3,4 GGML_CUDA_PDL=0 \
+  build-v100/apps/ninfer /media/zt/models/orcarouter/qwen3_8_27b_nvfp4.ninfer \
+  --tp 4 --devices 0,1,2,3 --max-context 65536 --kv-capacity 65536 --messages PROMPT.json \
+  --spec mtp --draft-tokens 3 --max-new 200 --greedy --print-token-ids
+```
+
 ### P2P disabled
 
 The same-input peer-off control uses a process-local `cudaDeviceCanAccessPeer` query shim to

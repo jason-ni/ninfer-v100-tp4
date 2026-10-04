@@ -122,7 +122,7 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--rope native|yarn] [--yarn-factor F] [--yarn-origin O]\n"
-           "       [--device N] [--tp 1|2|4] [--devices N,N]\n"
+           "       [--device N] [--tp 1|2|4] [--devices N,N,...]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -156,10 +156,10 @@ std::string usage_text(const char* argv0) {
            "--ignore-eos drops the checkpoint\'s own end-of-turn token ids from the request "
            "stop policy, so decode continues to --max-new or the remaining context capacity; "
            "--stop-token-id, --stop and --reasoning-stop still apply.\n"
-           "--cuda-graph captures one cross-device decode graph; --no-cuda-graph runs the same "
-           "multi-stream forward pass eagerly with cross-device event synchronization. The two "
+           "--cuda-graph captures one decode graph per rank, with the NCCL collectives recorded as "
+           "nodes in each rank's graph; --no-cuda-graph runs the same forward pass eagerly. The two "
            "produce the same tokens. Eager is the default at --tp > 1 because on this V100 target "
-           "the multi-device graph replays with GPU idle bubbles and is slower than eager; --tp 1 "
+           "the per-rank graph replays with GPU idle bubbles and is slower than eager; --tp 1 "
            "defaults to graphs.\n";
 }
 

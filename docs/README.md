@@ -47,6 +47,7 @@ Runtime and Op references:
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Dual-GPU (TP2) execution and YaRN 1M context](maintainer/tp2-yarn-1m.md)
+- [TP4: tensor parallelism over up to four V100s](maintainer/tp4-design.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
 
 Artifact and model references:

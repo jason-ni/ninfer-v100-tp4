@@ -746,34 +746,23 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // Definitions remain per execution profile, but only one executable is instantiated for
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
+        // Each rank now captures its OWN graph (DecodeGraphDefinition::capture is invoked once per
+        // rank, and NCCL collectives inside it are recorded as graph nodes on that rank's comm).
+        // The device-side footfall is therefore per-rank driver/module state for one executable per
+        // reachable node-topology class, plus that rank's slice of the NCCL kernel modules.
+        //
+        // Measured on 4x V100-SXM2 (sm_70), capacity 65536, max_concurrency 1, int8 KV, NVFP4 27B:
+        //   tp 2: 116 MiB ordinary / 122 MiB MTP on device 0
+        //   tp 4: 310 MiB ordinary / 314 MiB MTP on device 0
+        // The NCCL collective kernels dominate (a single tp2 rank graph was ~26 MiB under the old
+        // event-based bridge), and the figure is nearly capacity-independent because it is per-class
+        // executable state, not per-profile payload. Budgets below keep ~40% headroom over the
+        // measured maximum for the late module loads that land inside the measurement window. The
+        // tp 1 graph has no collectives (all four ops are no-ops at tp 1) and keeps its historical
+        // single-device budget.
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            // Per device, at every width. At tp 2 one cross-device graph replaces the tp 1 graph
-            // but holds BOTH devices' nodes (2.95x the tp 1 node count: each device's halved-width
-            // schedule, the extra un-fused GDN norm, and the collectives' cross-device copies), and
-            // instantiating it materializes driver state on each device it has nodes on. At tp 4 the
-            // single capture holds all FOUR devices' nodes (four quarter-width schedules and three
-            // peer edges folded in), so its driver-state footfall is larger again -- measured ~70
-            // MiB on device 0 at max_concurrency 1 versus 12 MiB at tp 1, hence the 80 MiB budget.
-            //
-            // Measured on 2x RTX 5090 at max_concurrency 8, 8192 context:
-            //   tp 1: 20 MiB on the one device        (2.5  MiB per concurrent request)
-            //   tp 2: 26 MiB rank 0, 24 MiB rank 1    (3.25 MiB and 3.0 MiB per request)
-            // The tp 2 multiplier is nevertheless raised from 12 to 20 MiB per request, and the
-            // reason is the LOW-concurrency end rather than the measured high end: at
-            // max_concurrency 1 the budget is one multiplier, and an observed one-shot overage of
-            // ~19.9 MiB against a 12 MiB budget on a SINGLE device -- attributed to a late module
-            // load -- is on record. tp 2 doubles that surface, so 12 MiB would be a budget the
-            // measured steady state fits inside and a known transient does not.
-            //
-            // THE MARGIN IS THINNEST AT max_concurrency 1, which is the likely 1M configuration:
-            // the tp 2 per-batch-size eager warm pass in prepare_graphs() only has batch sizes
-            // 2..max_concurrency to warm, so at max_concurrency 1 it does nothing and the sole
-            // code-warm pass carries all the module loading -- inside the measurement window. The
-            // budget there is one multiplier, 20 MiB, against a 0.3b-style worst case of ~19.9
-            // MiB: roughly 1 MiB of headroom. Raising this multiplier, not the warm pass, is the
-            // lever if that transient is ever observed at tp 2.
             const std::uint64_t per_batch =
-                impl->tp >= 4 ? 80ULL * kMiB : (impl->tp == 2 ? 20ULL * kMiB : 12ULL * kMiB);
+                impl->tp >= 4 ? 448ULL * kMiB : (impl->tp == 2 ? 192ULL * kMiB : 12ULL * kMiB);
             impl->graph_allowance_bytes =
                 checked_mul(per_batch, impl->max_concurrency, "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
@@ -784,9 +773,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    return (final_visible <= 4096 ? (impl->tp >= 4 ? 96ULL : 12ULL)
-                                                  : (impl->tp >= 4 ? 160ULL : 82ULL)) *
-                           kMiB;
+                    if (impl->tp >= 4) { return 448ULL * kMiB; }
+                    if (impl->tp == 2) { return 192ULL * kMiB; }
+                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
                 },
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
@@ -801,6 +790,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
                             impl->capacity,
                             static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
+                        if (impl->tp >= 4) { return 448ULL * kMiB; }
+                        if (impl->tp == 2) { return 192ULL * kMiB; }
                         return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
                     },
                     "DFlash graph allowance");

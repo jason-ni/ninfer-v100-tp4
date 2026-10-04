@@ -550,13 +550,13 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
 }
 
-// --- tp == 2 split leaves ----------------------------------------------------------------------
+// --- tp > 1 split leaves -----------------------------------------------------------------------
 //
 // Each of these is the tp1 leaf above with every per-rank argument taken as an array and the
-// matching `*_column_parallel` / `*_row_parallel` Op called ONCE for both ranks. The weight
-// variant (fused vs split storage) is resolved from rank 0 and required to agree on rank 1: both
-// ranks bind the same artifact objects through the same profile, so a disagreement is a loader
-// bug, not a supported configuration.
+// matching `*_column_parallel` / `*_row_parallel` Op called ONCE for every rank. The weight
+// variant (fused vs split storage) is resolved from rank 0 and required to agree on every other
+// rank: all ranks bind the same artifact objects through the same profile, so a disagreement is a
+// loader bug, not a supported configuration.
 
 namespace {
 
@@ -666,7 +666,7 @@ void Variant::attention_output_projection(const std::array<Tensor, kMaximumDevic
                                           const std::array<Tensor, kMaximumDevices>& residual,
                                           const std::array<Tensor, kMaximumDevices>& staging, qwen3_6::TextPhase,
                                           const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                                          const ExecutionContext& ec, const ops::PeerEvents& ev) {
+                                          const ExecutionContext& ec, const ops::CollectiveComms& ev) {
     ops::linear_add_row_parallel(attention, weight, residual, staging, text_policy(weight[0]),
                                  workspace, ec, ev);
 }
@@ -742,7 +742,7 @@ void Variant::gdn_output_projection(const std::array<Tensor, kMaximumDevices>& h
                                     const std::array<Tensor, kMaximumDevices>& residual,
                                     const std::array<Tensor, kMaximumDevices>& staging, qwen3_6::TextPhase,
                                     const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                                    const ExecutionContext& ec, const ops::PeerEvents& ev) {
+                                    const ExecutionContext& ec, const ops::CollectiveComms& ev) {
     if (weight[0].qtype == QType::GGML_K) {
         ops::ggml_k_gdn_output(hidden, weight, residual, staging, workspace, ec, ev);
         return;
@@ -791,7 +791,7 @@ void Variant::post_mixer(const std::array<Tensor, kMaximumDevices>& hidden,
                          const std::array<Tensor, kMaximumDevices>& residual,
                          const std::array<Tensor, kMaximumDevices>& staging, qwen3_6::TextPhase,
                          const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                         const ExecutionContext& ec, const ops::PeerEvents& ev) {
+                         const ExecutionContext& ec, const ops::CollectiveComms& ev) {
     // The activation width is this rank's own gate/up shard, read off the weight rather than
     // assumed: `gate_up` is [2 * intermediate_shard, hidden], so half its rows is the shard.
     const std::int32_t shard_intermediate = w[0]->gate_up.n / 2;
@@ -941,7 +941,7 @@ void Variant::mtp_post_mixer(const std::array<Tensor, kMaximumDevices>& hidden,
                              const std::array<Tensor, kMaximumDevices>& residual,
                              const std::array<Tensor, kMaximumDevices>& staging,
                              const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                             const ExecutionContext& ec, const ops::PeerEvents& ev) {
+                             const ExecutionContext& ec, const ops::CollectiveComms& ev) {
     // The MTP post-mixer is composed exactly the way the tp1 leaf above composes it -- separate
     // `linear` / `silu_mul` / `linear` / `residual_add`, NOT the fused linear_swiglu + linear_add
     // pair the text post-mixer uses. That is not a stylistic choice: neither

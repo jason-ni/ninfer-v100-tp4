@@ -2,7 +2,7 @@
 
 #include "targets/qwen3_6_35b_a3b/impl/config.h"
 #include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
-#include "ninfer/ops/allreduce.h" // ExecutionContext, ops::PeerEvents (tp2 leaf signatures)
+#include "ninfer/ops/allreduce.h" // ExecutionContext, ops::CollectiveComms (tp2 leaf signatures)
 #include <ninfer/targets/qwen3_6/runtime.h>
 
 #include <array>
@@ -63,7 +63,7 @@ struct Variant {
                                             const std::array<Tensor, kMaximumDevices>& staging,
                                             qwen3_6::TextPhase phase,
                                             const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                                            const ExecutionContext& ec, const ops::PeerEvents& ev);
+                                            const ExecutionContext& ec, const ops::CollectiveComms& ev);
     static void gdn_input_projection(const std::array<Tensor, kMaximumDevices>& hidden,
                                      const std::array<const GdnProjectionWeights*, kMaximumDevices>& w,
                                      const std::array<Tensor, kMaximumDevices>& qkv,
@@ -85,7 +85,7 @@ struct Variant {
                                       const std::array<Tensor, kMaximumDevices>& staging,
                                       qwen3_6::TextPhase phase,
                                       const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                                      const ExecutionContext& ec, const ops::PeerEvents& ev);
+                                      const ExecutionContext& ec, const ops::CollectiveComms& ev);
     static void gdn_control_projection(const std::array<Tensor, kMaximumDevices>& hidden,
                                        const std::array<const GdnProjectionWeights*, kMaximumDevices>& w,
                                        const std::array<Tensor, kMaximumDevices>& g,
@@ -97,7 +97,7 @@ struct Variant {
                            const std::array<Tensor, kMaximumDevices>& residual,
                            const std::array<Tensor, kMaximumDevices>& staging, qwen3_6::TextPhase phase,
                            const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                           const ExecutionContext& ec, const ops::PeerEvents& ev);
+                           const ExecutionContext& ec, const ops::CollectiveComms& ev);
     static void gdn_input_projection_record(
         const std::array<Tensor, kMaximumDevices>& hidden, const std::array<const GdnProjectionWeights*, kMaximumDevices>& w,
         const std::array<Tensor, kMaximumDevices>& conv_weight, const std::array<Tensor, kMaximumDevices>& conv_states,
@@ -131,7 +131,7 @@ struct Variant {
                                const std::array<Tensor, kMaximumDevices>& residual,
                                const std::array<Tensor, kMaximumDevices>& staging,
                                const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                               const ExecutionContext& ec, const ops::PeerEvents& ev);
+                               const ExecutionContext& ec, const ops::CollectiveComms& ev);
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);

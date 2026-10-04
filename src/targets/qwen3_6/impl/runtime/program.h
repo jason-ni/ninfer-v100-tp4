@@ -333,9 +333,7 @@ public:
     const std::uint32_t effective_max_context;
     const double yarn_mscale;
     std::array<std::optional<PeerRuntime>, kMaximumDevices> peer;
-    std::optional<ops::PeerEvents> peer_events;
-    // Created once at tp > 1 when graphs are on; forks every peer stream into rank 0's capture.
-    std::optional<DecodeGraphPeerBridge> graph_bridge;
+    std::optional<ops::CollectiveComms> collective_comms;
     std::array<std::optional<schedule::TpPeerCore>, kMaximumDevices> peer_core;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;

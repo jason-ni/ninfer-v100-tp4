@@ -253,7 +253,7 @@ struct HeadCase {
 // equality against the tp1 reference across the whole token sweep.
 // ---------------------------------------------------------------------------------------------
 int run_head_case(const HeadCase& test_case, const ExecutionContext& ec,
-                  const ops::PeerEvents& events) {
+                  const ops::CollectiveComms& events) {
     std::cout << test_case.label << " [" << kVocab << ',' << kHidden << "] -> [" << kHalf << ','
               << kHidden << "] (column-parallel / vocab-row split)\n";
     int failures = 0;
@@ -625,12 +625,8 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
-    const bool peer_access = ops::enable_peer_access(ec);
-    std::cout << "peer access: "
-              << (peer_access ? "enabled (direct P2P)"
-                              : "unavailable (verified CUDA UVA D2D staging)")
-              << '\n';
-    const ops::PeerEvents events(ec);
+    std::cout << "collective transport: NCCL over NVLink P2P\n";
+    const ops::CollectiveComms events(ec);
 
     failures += run_embedding_replication_case(ec);
 

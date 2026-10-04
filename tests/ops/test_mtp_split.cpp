@@ -635,7 +635,7 @@ NormSet make_norms(const ExecutionContext& ec, std::uint32_t seed) {
 
 // One MTP verify round. The tp1 leg runs the same op sequence on device 0 over whole weights; the
 // tp2 leg runs it across both devices over shard weights, and every stage is compared.
-int run_mtp_round(const ExecutionContext& ec, const ops::PeerEvents& events,
+int run_mtp_round(const ExecutionContext& ec, const ops::CollectiveComms& events,
                   const MtpDeviceModel& weights, const NormSet& norms, std::int32_t tokens,
                   std::int32_t base_keys, std::uint32_t seed) {
     const std::string head = "mtp round T=" + std::to_string(tokens) +
@@ -1114,7 +1114,7 @@ int run_mtp_round(const ExecutionContext& ec, const ops::PeerEvents& events,
     return failures;
 }
 
-int run_leg_a(const ExecutionContext& ec, const ops::PeerEvents& events) {
+int run_leg_a(const ExecutionContext& ec, const ops::CollectiveComms& events) {
     std::cout << "\n--- Leg A: MTP verify round (W8G32, op-level composition) ---\n";
     constexpr QType kW8 = QType::W8G32_F16S;
     int failures        = 0;
@@ -2143,7 +2143,7 @@ int run_leg_c(const ExecutionContext& ec) {
 // =================================================================================================
 namespace {
 
-int run_leg_d(const ExecutionContext& ec, const ops::PeerEvents& events) {
+int run_leg_d(const ExecutionContext& ec, const ops::CollectiveComms& events) {
     std::cout << "\n--- Leg D: draft head (Q4G64 vocab split + allgather + argmax + remap) ---\n";
     int failures = 0;
 
@@ -2489,12 +2489,8 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
-    const bool peer_access = ops::enable_peer_access(ec);
-    std::cout << "peer access: "
-              << (peer_access ? "enabled (direct P2P)"
-                              : "unavailable (verified CUDA UVA D2D staging)")
-              << '\n';
-    const ops::PeerEvents events(ec);
+    std::cout << "collective transport: NCCL over NVLink P2P\n";
+    const ops::CollectiveComms events(ec);
 
     failures += verify_rejections(ec);
     failures += verify_conv_channel_map();

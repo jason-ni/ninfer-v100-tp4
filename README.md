@@ -5,11 +5,13 @@
 Performance results are separated into [P2P enabled](#p2p-enabled) and
 [P2P disabled](#p2p-disabled); build and launch instructions are shared below.
 
-This fork is tuned for one-request Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB**
-(`sm_70`, CUDA 12.8). Its default profile uses the LM Studio Q4_K_M-derived `.ninfer` artifact,
-180,000-token context capacity, complete INT8 group-64 KV, TP2, CUDA Graphs, and MTP with up to
-three drafts (zero accepted drafts is valid). Context capacity is an allocation limit, not the
-number of prompt tokens in a benchmark.
+This fork is tuned for one-request Qwen3.8-27B inference on **Tesla V100-SXM2 16 GB**
+(`sm_70`, CUDA 12.8), at tensor-parallel width 2 or 4. Its default profile uses the LM Studio
+Q4_K_M-derived `.ninfer` artifact, 180,000-token context capacity, complete INT8 group-64 KV,
+TP2, CUDA Graphs, and MTP with up to three drafts (zero accepted drafts is valid). TP4 splits the
+same resident model across four cards, quartering the per-GPU weight footfall to free KV headroom;
+it uses NCCL collectives and one CUDA Graph per rank. Context capacity is an allocation limit, not
+the number of prompt tokens in a benchmark.
 
 The starting point combines the RTX 3060 TP2 work and the Volta implementation from
 [`geoffwatts/ninfer-v100`](https://github.com/geoffwatts/ninfer-v100), based on
@@ -41,11 +43,13 @@ intentionally omitted.
 - **GDN prefill:** long normalized inputs prepare each Q/K row once in FP32, avoiding repeated
   normalization across state tiles. The sequential FP32 state transition is unchanged. The
   3,072-token TP2 GDN scratch allocation is 24 MiB.
-- **TP2 transfers:** collectives use graph-capturable UVA device-to-device copies and two event
-  pairs. Startup checks exact transfer bytes in both directions. This host now uses direct
-  PCIe P2P after rebooting with `iommu=pt` and identity IOMMU domains. On translated `DMA`/`DMA-FQ`
-  domains, startup instead selects verified CUDA-managed staging. Neither path maintains a
-  second explicit pinned-host copy route; PCIe P2P is not NVLink.
+- **Cross-device collectives (NCCL):** row-parallel projections reduce with NCCL (`ncclAllReduce`,
+  plus `ncclAllGather` for the split output head and `ncclSend`/`ncclRecv` on the DFlash rank-0
+  paths), one communicator per rank, issued from the single engine thread inside
+  `ncclGroupStart`/`ncclGroupEnd`. Each rank records its own collectives into its own CUDA Graph,
+  so graph capture/replay is preserved. NCCL selects the fastest transport it can (NVLink where
+  present, otherwise PCIe P2P or shared memory); the earlier hand-rolled UVA device-to-device
+  copies and event pairs are gone.
 - **Volta TP2 residuals:** Q5 row shards now select executable SM70 SIMT, fused MMA, or CUTLASS
   routes with the actual peak workspace reserved. BF16 row shards use the SM70 CUTLASS route.
   Both paths pass their independent FP64 operator checks and the two-card composition tests.

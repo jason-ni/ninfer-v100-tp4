@@ -287,7 +287,7 @@ ReductionCriterion criterion_for(const Case& test_case, ops::LinearPolicy policy
 }
 
 // ---------------------------------------------------------------------------------------------
-int run_case(const Case& test_case, const ExecutionContext& ec, const ops::PeerEvents& events) {
+int run_case(const Case& test_case, const ExecutionContext& ec, const ops::CollectiveComms& events) {
     const bool dense      = test_case.qtype == QType::BF16_CTRL;
     const std::int32_t n  = test_case.n;
     const std::int32_t k  = test_case.k;
@@ -559,7 +559,7 @@ int verify_registry() {
 }
 
 // Rejection cases only the pair can see, mirroring test_linear_split.cpp's verify_split_rejections.
-int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& events) {
+int verify_split_rejections(const ExecutionContext& ec, const ops::CollectiveComms& events) {
     int failures            = 0;
     const auto expect_throw = [&](const char* what, auto&& body) {
         try {
@@ -673,12 +673,8 @@ int main() {
                    "cudaGetDeviceProperties");
     }
     const int compute_major = std::min(properties[0].major, properties[1].major);
-    const bool peer_access = ops::enable_peer_access(ec);
-    std::cout << "peer access: "
-              << (peer_access ? "enabled (direct P2P)"
-                              : "unavailable (verified CUDA UVA D2D staging)")
-              << '\n';
-    const ops::PeerEvents events(ec);
+    std::cout << "collective transport: NCCL over NVLink P2P\n";
+    const ops::CollectiveComms events(ec);
 
     failures += verify_split_rejections(ec, events);
 

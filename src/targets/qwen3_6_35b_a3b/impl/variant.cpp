@@ -346,7 +346,7 @@ void Variant::attention_output_projection(const std::array<Tensor, kMaximumDevic
                                           const std::array<Tensor, kMaximumDevices>&,
                                           const std::array<Tensor, kMaximumDevices>&, qwen3_6::TextPhase,
                                           const std::array<WorkspaceArena*, kMaximumDevices>&,
-                                          const ExecutionContext&, const ops::PeerEvents&) {
+                                          const ExecutionContext&, const ops::CollectiveComms&) {
     reject_tensor_parallel("attention_output_projection");
 }
 
@@ -370,7 +370,7 @@ void Variant::gdn_input_projection_snapshot(
 void Variant::gdn_output_projection(const std::array<Tensor, kMaximumDevices>&, const std::array<Weight, kMaximumDevices>&,
                                     const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
                                     qwen3_6::TextPhase, const std::array<WorkspaceArena*, kMaximumDevices>&,
-                                    const ExecutionContext&, const ops::PeerEvents&) {
+                                    const ExecutionContext&, const ops::CollectiveComms&) {
     reject_tensor_parallel("gdn_output_projection");
 }
 
@@ -386,7 +386,7 @@ void Variant::post_mixer(const std::array<Tensor, kMaximumDevices>&,
                          const std::array<const PostMixerWeights*, kMaximumDevices>&,
                          const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
                          qwen3_6::TextPhase, const std::array<WorkspaceArena*, kMaximumDevices>&,
-                         const ExecutionContext&, const ops::PeerEvents&) {
+                         const ExecutionContext&, const ops::CollectiveComms&) {
     reject_tensor_parallel("post_mixer");
 }
 
@@ -427,7 +427,7 @@ void Variant::mtp_post_mixer(const std::array<Tensor, kMaximumDevices>&,
                              const std::array<const MtpPostMixerWeights*, kMaximumDevices>&,
                              const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
                              const std::array<WorkspaceArena*, kMaximumDevices>&, const ExecutionContext&,
-                             const ops::PeerEvents&) {
+                             const ops::CollectiveComms&) {
     reject_tensor_parallel("mtp_post_mixer");
 }
 

@@ -1,83 +1,39 @@
 #pragma once
 
+#include "core/device.h"
+
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <functional>
 #include <span>
-#include <vector>
 
 namespace ninfer {
 
-// The events that enroll OTHER devices' streams in a capture that began on the first device's
-// stream, and that order a replay of the result. Tensor-parallel decode issues work on every
-// device's stream and orders them against each other with cross-device event edges; those edges
-// only become graph edges if every stream belongs to the SAME capture. Two independent captures
-// cannot be linked -- a cudaStreamWaitEvent across two live captures is rejected with
-// cudaErrorStreamCaptureMerge -- so a tensor-parallel decode program is ONE graph holding all
-// devices' nodes, not one graph per device.
+// Tensor-parallel decode captures ONE CUDA Graph PER PARTICIPATING RANK, all in a single capture
+// pass, and replays them concurrently on their own streams. This replaces the former
+// single-graph-holding-all-devices design: a single graph serializes the rank critical path and
+// starves the other GPUs (measured ~2.5x slower at tp4 on V100), whereas independent per-rank
+// graphs keep the ranks overlapped exactly as the eager path does.
 //
-//   record(fork[i]) on the origin stream  ->  wait(fork[i]) on peer i's stream   (peer joins)
-//   ...the whole multi-device decode body...
-//   record(join[i]) on peer i's stream     ->  wait(join[i]) on the origin stream (peer rejoins)
+// The properties that make this capture legal and deterministic:
 //
-// The join is mandatory: cudaStreamEndCapture fails with cudaErrorStreamCaptureUnjoined if any
-// forked stream is still outstanding. One gate event per peer serves gate_launch() below, which is
-// about replay rather than capture. All events are created once (cudaEventCreate is not
-// capturable) and one bridge instance serves an unbounded number of sequential captures/launches.
+//  1. Simultaneous capture needs cudaStreamCaptureModeThreadLocal. The single engine thread begins
+//     capture on every rank's stream, runs the body once (issuing each rank's work, and every
+//     collective as a grouped per-rank NCCL call), then ends capture on every stream. ThreadLocal
+//     keeps a capture on one stream from hijacking another stream's activation.
+//  2. Cross-rank ordering is NCCL's own, not cudaStreamWaitEvent. A wait on an event recorded
+//     inside a *different* live capture is rejected with cudaErrorStreamCaptureMerge, so any
+//     per-call event edge would make simultaneous capture impossible. Grouped NCCL collectives
+//     carry the ordering internally and capture cleanly.
+//  3. Each graph is instantiated with flags 0. Device-launchable graphs are single-device only.
+//  4. cudaGraphExecUpdate requires identical topology per rank; all profiles of a family are
+//     captured from the same body against the same DeviceContexts, so a profile swap updates each
+//     rank's executable in place.
 //
-// The one-peer form is exactly the original two-device topology; the N-peer form is the tp4 (and
-// general) extension. One implementation serves both.
-class DecodeGraphPeerBridge {
-public:
-    // `peer_devices` are the non-origin devices, in rank order; must all differ from the origin and
-    // from each other. The array is copied, so it need not outlive the constructor.
-    DecodeGraphPeerBridge(int origin_device, std::span<const int> peer_devices);
-    // Two-device convenience form.
-    DecodeGraphPeerBridge(int origin_device, int peer_device);
-    ~DecodeGraphPeerBridge();
-
-    DecodeGraphPeerBridge(const DecodeGraphPeerBridge&)            = delete;
-    DecodeGraphPeerBridge& operator=(const DecodeGraphPeerBridge&) = delete;
-    DecodeGraphPeerBridge(DecodeGraphPeerBridge&& other) noexcept;
-    DecodeGraphPeerBridge& operator=(DecodeGraphPeerBridge&& other) noexcept;
-
-    [[nodiscard]] int origin_device() const noexcept { return origin_device_; }
-    [[nodiscard]] int peer_count() const noexcept { return static_cast<int>(peer_devices_.size()); }
-    [[nodiscard]] int peer_device(int index) const { return peer_devices_.at(static_cast<std::size_t>(index)); }
-    [[nodiscard]] cudaEvent_t fork_event(int index) const { return fork_.at(static_cast<std::size_t>(index)); }
-    [[nodiscard]] cudaEvent_t join_event(int index) const { return join_.at(static_cast<std::size_t>(index)); }
-    [[nodiscard]] bool live() const noexcept;
-
-    // REPLAY-side ordering, not capture-side. A multi-device graph is launched on the ORIGIN
-    // device's stream; the graph's own edges then order its peer-device nodes after the graph
-    // root, but they say nothing about work the caller already enqueued on each peer device's own
-    // stream (at decode time: the mirrored KV page materialization). Eager execution gets that
-    // ordering for free because it issues the peer's kernels on that same stream; a graph launch
-    // does not, so the origin stream is explicitly ordered after every peer stream's outstanding
-    // work before each launch, which transitively orders the whole graph after it.
-    void gate_launch(const cudaStream_t* peer_streams, cudaStream_t origin_stream) const;
-    // One-peer convenience form.
-    void gate_launch(cudaStream_t peer_stream, cudaStream_t origin_stream) const;
-
-private:
-    void create_events();
-
-    int origin_device_ = 0;
-    std::vector<int> peer_devices_;
-    std::vector<cudaEvent_t> fork_;
-    std::vector<cudaEvent_t> join_;
-    std::vector<cudaEvent_t> gate_;
-};
-
-// The peer half of a multi-device capture: which streams to enroll, and the bridge that enrolls
-// them. `streams` holds one stream per bridge peer, in the same order as the bridge's peer devices.
-struct DecodeGraphPeerCapture {
-    const DecodeGraphPeerBridge* bridge = nullptr;
-    const cudaStream_t* streams         = nullptr;
-    int stream_count                    = 0;
-};
-
+// A DecodeGraphExecutable owns every rank's executable, device, and stream, so upload()/launch()
+// take no arguments; replay simply launches each rank's graph on its own stream.
 class DecodeGraphDefinition {
 public:
     DecodeGraphDefinition() = default;
@@ -88,22 +44,22 @@ public:
     DecodeGraphDefinition(DecodeGraphDefinition&& other) noexcept;
     DecodeGraphDefinition& operator=(DecodeGraphDefinition&& other) noexcept;
 
-    // Single-device capture: `stream` is both the origin and the only stream captured.
-    void capture(cudaStream_t stream, const std::function<void()>& body);
-    // Multi-device capture: `stream` is the origin (device 0) and `peer` names each peer device's
-    // stream, which is forked into the same capture for the duration of `body` and joined back
-    // before the capture ends. A null `peer.bridge` is the single-device form above.
-    void capture(cudaStream_t stream, const std::function<void()>& body,
-                 const DecodeGraphPeerCapture& peer);
+    // Capture one graph per rank. `devices[r]` is the CUDA device and `streams[r]` the stream for
+    // rank r; both spans must have the same, non-zero length (<= kMaximumDevices). `body` issues
+    // each rank's work on its stream and is invoked exactly once.
+    void capture(std::span<const int> devices, std::span<const cudaStream_t> streams,
+                 const std::function<void()>& body);
     [[nodiscard]] bool ready() const noexcept;
-    // Node count of the captured graph, 0 when empty. Cross-device event edges are edges, not
-    // nodes, so this counts real device work on BOTH devices.
+    [[nodiscard]] int rank_count() const noexcept;
+    // Total node count across every rank's graph; 0 when empty. NCCL collective edges are edges,
+    // not nodes, so this counts real device work.
     [[nodiscard]] std::size_t node_count() const;
     void reset() noexcept;
 
 private:
     friend class DecodeGraphExecutable;
-    cudaGraph_t graph_ = nullptr;
+    std::array<cudaGraph_t, kMaximumDevices> graphs_{};
+    int ranks_ = 0;
 };
 
 class DecodeGraphExecutable {
@@ -116,15 +72,21 @@ public:
     DecodeGraphExecutable(DecodeGraphExecutable&& other) noexcept;
     DecodeGraphExecutable& operator=(DecodeGraphExecutable&& other) noexcept;
 
-    void instantiate(const DecodeGraphDefinition& definition);
+    // Instantiate one executable per rank from the matching definition, remembering each rank's
+    // device and stream for later update/upload/launch.
+    void instantiate(const DecodeGraphDefinition& definition, std::span<const int> devices,
+                     std::span<const cudaStream_t> streams);
     void update(const DecodeGraphDefinition& definition);
-    void upload(cudaStream_t stream);
-    void launch(cudaStream_t stream);
+    void upload();
+    void launch();
     [[nodiscard]] bool ready() const noexcept;
     void reset() noexcept;
 
 private:
-    cudaGraphExec_t exec_ = nullptr;
+    std::array<cudaGraphExec_t, kMaximumDevices> execs_{};
+    std::array<int, kMaximumDevices> devices_{};
+    std::array<cudaStream_t, kMaximumDevices> streams_{};
+    int ranks_ = 0;
 };
 
 } // namespace ninfer

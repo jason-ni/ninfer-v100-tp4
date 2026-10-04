@@ -179,7 +179,7 @@ class VisionPrefillSession;
 // block tables match rank 0's by construction.
 struct TpExecution {
     const ExecutionContext* execution = nullptr;
-    const ops::PeerEvents* events     = nullptr;
+    const ops::CollectiveComms* events     = nullptr;
     DeviceContext* device             = nullptr;
     const LoadedModelData* weights    = nullptr;
     WorkspaceArena* work              = nullptr;
@@ -577,7 +577,7 @@ private:
 
     std::array<std::optional<TpExecution>, kMaximumDevices> tp_{};
     int tp_count_                   = 1;
-    const ops::PeerEvents* events_  = nullptr;
+    const ops::CollectiveComms* events_  = nullptr;
     std::array<const Tensor*, kMaximumDevices> peer_cache_positions_{};
     std::array<const Tensor*, kMaximumDevices> peer_rope_positions_{};
     std::array<const Tensor*, kMaximumDevices> peer_kv_table_rows_{};

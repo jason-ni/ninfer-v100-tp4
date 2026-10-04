@@ -1241,11 +1241,7 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
-    const bool peer_access = ops::enable_peer_access(ec);
-    std::cout << "peer access: "
-              << (peer_access ? "enabled (direct P2P)"
-                              : "unavailable (verified CUDA UVA D2D staging)")
-              << '\n';
+    std::cout << "collective transport: NCCL over NVLink P2P\n";
 
     failures += verify_split_rejections(ec);
     failures += run_fused_case(

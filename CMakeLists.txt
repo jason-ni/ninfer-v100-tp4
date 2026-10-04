@@ -122,6 +122,14 @@ else()
 endif()
 find_package(Threads REQUIRED)
 
+# NCCL carries the tensor-parallel collectives. It is a hard dependency: every tp > 1 run needs it,
+# and its header is part of the public in-tree op interface (include/ninfer/ops/allreduce.h).
+find_library(NINFER_NCCL_LIBRARY NAMES nccl REQUIRED)
+find_path(NINFER_NCCL_INCLUDE_DIR NAMES nccl.h REQUIRED)
+add_library(ninfer_nccl INTERFACE)
+target_include_directories(ninfer_nccl INTERFACE ${NINFER_NCCL_INCLUDE_DIR})
+target_link_libraries(ninfer_nccl INTERFACE ${NINFER_NCCL_LIBRARY})
+
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)

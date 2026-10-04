@@ -315,7 +315,7 @@ void linear_column_parallel(const std::array<Tensor, kMaximumDevices>& x, const 
 void linear_row_parallel(const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& w,
                          const std::array<Tensor, kMaximumDevices>& out, const std::array<Tensor, kMaximumDevices>& staging,
                          LinearPolicy policy, const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                         const ExecutionContext& ec, const PeerEvents& events) {
+                         const ExecutionContext& ec, const CollectiveComms& events) {
     validate_split_pair(x, w, ec, /*column_parallel=*/false);
     std::array<Tensor, kMaximumDevices> destination = validated_outputs(x, w, out, policy, ec.tp);
     validate_split_residency(x, w, out, ec);
@@ -335,7 +335,7 @@ void linear_row_parallel(const std::array<Tensor, kMaximumDevices>& x, const std
 
 void linear_row_parallel(const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& w,
                          const std::array<Tensor, kMaximumDevices>& out, const std::array<Tensor, kMaximumDevices>& staging,
-                         const ExecutionContext& ec, const PeerEvents& events) {
+                         const ExecutionContext& ec, const CollectiveComms& events) {
     linear_row_parallel(x, w, out, staging, LinearPolicy::A16Only, {nullptr, nullptr}, ec, events);
 }
 

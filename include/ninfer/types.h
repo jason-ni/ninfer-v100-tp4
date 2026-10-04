@@ -477,17 +477,16 @@ struct MemorySummary {
     // be divided across ranks.
     std::size_t cuda_graph_observed_bytes         = 0;
     // Graph residency measured on the first peer rank (rank 1), and 0 at tp == 1. Retained for the
-    // serving schema; the per-rank figures are in `cuda_graph_device_bytes`. A tensor-parallel decode
-    // program is a single cross-device graph, but instantiating it materializes driver and module
-    // state on every device, so each device carries its own cost against the same allowance.
+    // serving schema; the per-rank figures are in `cuda_graph_device_bytes`. Each rank captures its
+    // OWN graph (the NCCL collectives are recorded as nodes in that rank's graph), and every rank
+    // materializes the same per-class driver and NCCL module state against the same allowance.
     std::size_t cuda_graph_peer_observed_bytes    = 0;
     // Per-rank graph residency, indexed by rank; entries at or beyond `tp` are 0. This is the
     // authoritative per-device figure the load-summary table reports.
     std::array<std::size_t, 4> cuda_graph_device_bytes{};
-    // Node count of one captured decode graph, 0 when graphs are disabled. At tp > 1 a single graph
-    // holds ALL devices' nodes plus the collectives' cross-device copies (the event edges between
-    // them are edges, not nodes), so this is roughly `tp` times the tp 1 count and is the direct
-    // measurement of whether every peer's half of the schedule was captured.
+    // Node count of one captured decode graph, 0 when graphs are disabled. Each rank captures its
+    // own graph holding that rank's schedule plus its NCCL collective nodes, so this is the tp 1
+    // node count plus the collective nodes, not a sum over ranks.
     std::size_t cuda_graph_node_count             = 0;
     std::size_t kv_payload_bytes                  = 0;
     // GDN (linear-attention) recurrent + convolution state for THIS device. At tp > 1 the head split

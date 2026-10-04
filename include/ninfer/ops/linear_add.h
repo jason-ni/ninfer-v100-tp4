@@ -4,7 +4,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
-#include "ninfer/ops/allreduce.h" // ExecutionContext, PeerEvents (tp2 split form)
+#include "ninfer/ops/allreduce.h" // ExecutionContext, CollectiveComms (tp2 split form)
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
@@ -90,7 +90,7 @@ void ggml_k_gdn_output(const std::array<Tensor, kMaximumDevices>& x, const std::
                        const std::array<Tensor, kMaximumDevices>& staging,
                        const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
                        const ExecutionContext& ec,
-                       const PeerEvents& events);
+                       const CollectiveComms& events);
 
 // --- Tensor-parallel split form (tp == 2) -----------------------------------------------------
 //
@@ -139,12 +139,12 @@ void linear_add_row_parallel(const std::array<Tensor, kMaximumDevices>& x, const
                              const std::array<Tensor, kMaximumDevices>& residual,
                              const std::array<Tensor, kMaximumDevices>& staging, LinearPolicy policy,
                              const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                             const ExecutionContext& ec, const PeerEvents& events);
+                             const ExecutionContext& ec, const CollectiveComms& events);
 
 /// A16-only convenience form for profiles whose queried transient workspace is zero.
 void linear_add_row_parallel(const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& w,
                              const std::array<Tensor, kMaximumDevices>& residual,
                              const std::array<Tensor, kMaximumDevices>& staging, const ExecutionContext& ec,
-                             const PeerEvents& events);
+                             const CollectiveComms& events);
 
 } // namespace ninfer::ops

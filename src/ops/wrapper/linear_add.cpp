@@ -402,7 +402,7 @@ void linear_add_row_parallel(const std::array<Tensor, kMaximumDevices>& x, const
                              const std::array<Tensor, kMaximumDevices>& residual,
                              const std::array<Tensor, kMaximumDevices>& staging, LinearPolicy policy,
                              const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                             const ExecutionContext& ec, const PeerEvents& events) {
+                             const ExecutionContext& ec, const CollectiveComms& events) {
     validate_policy(policy);
     validate_add_split_pair(x, w, ec);
     validate_add_split_residency(x, w, residual, ec);
@@ -429,7 +429,7 @@ void linear_add_row_parallel(const std::array<Tensor, kMaximumDevices>& x, const
 void linear_add_row_parallel(const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& w,
                              const std::array<Tensor, kMaximumDevices>& residual,
                              const std::array<Tensor, kMaximumDevices>& staging, const ExecutionContext& ec,
-                             const PeerEvents& events) {
+                             const CollectiveComms& events) {
     linear_add_row_parallel(x, w, residual, staging, LinearPolicy::A16Only, {}, ec,
                             events);
 }
@@ -444,7 +444,7 @@ void ggml_k_gdn_output(const std::array<Tensor, kMaximumDevices>& x, const std::
                        const std::array<Tensor, kMaximumDevices>& staging,
                        const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
                        const ExecutionContext& ec,
-                       const PeerEvents& events) {
+                       const CollectiveComms& events) {
     validate_add_split_pair(x, w, ec);
     validate_add_split_residency(x, w, residual, ec);
     detail::for_each_rank(ec, [&](int rank) {

@@ -1484,7 +1484,7 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData&
 // STREAMS AND EVENTS. There is no host synchronization anywhere inside the layer loop. Rank r's
 // work is enqueued on `ec.dev[r]->stream`; the collectives' own four-event choreography
 // (`inputs_ready` / `pull_done`, include/ninfer/ops/allreduce.h) is what orders the two streams
-// against each other, both within a call and across calls. The single `PeerEvents` instance lives
+// against each other, both within a call and across calls. The single `CollectiveComms` instance lives
 // in the Program, is created once, and is reused by every collective of every layer. Kernel
 // launches go to the CURRENT device, so every per-rank issue runs inside `for_each_rank`, which
 // sets and restores it.

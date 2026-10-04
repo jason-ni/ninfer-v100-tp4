@@ -60,7 +60,7 @@ void for_each_rank(const ExecutionContext& ec, Body&& body) {
 // is populated and every schedule entry point below behaves exactly as it always has.
 struct TpPeerCore {
     const ExecutionContext* execution          = nullptr;
-    const ops::PeerEvents* events              = nullptr;
+    const ops::CollectiveComms* events              = nullptr;
     DeviceContext* device                      = nullptr;
     const LoadedModelData* model               = nullptr;
     WorkspaceArena* work                       = nullptr;
@@ -96,11 +96,9 @@ struct ExecutionCore {
     // bit-for-bit, which is why the default value is the pre-YaRN behavior.
     std::array<ops::RopeFrequencyOverride, kMaximumDevices> rope_frequency{};
     // Non-origin rank bundles, indexed by rank. [0] is unused (rank 0 is the references above);
-    // [1, tp) are set, and [tp, kMaximumDevices) stay null. One bridge enrolls every peer stream
-    // in rank 0's capture; null when graphs are disabled, in which case the eager path never reads
-    // it.
+    // [1, tp) are set, and [tp, kMaximumDevices) stay null. Each rank captures and replays its own
+    // graph on its own stream, so no cross-device capture descriptor is needed here.
     std::array<const TpPeerCore*, kMaximumDevices> peers{};
-    const DecodeGraphPeerBridge* graph_bridge = nullptr;
     int tp = 1;
 };
 

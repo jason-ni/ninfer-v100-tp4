@@ -158,7 +158,8 @@ DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGr
 }
 
 template <class Prepare, class Synchronize>
-void instantiate_graph_family(DecodeGraphFamily& family, const char* label, DeviceContext& device,
+void instantiate_graph_family(DecodeGraphFamily& family, const char* label,
+                              std::span<const int> devices, std::span<const cudaStream_t> streams,
                               Prepare&& prepare, Synchronize&& synchronize_all) {
     if (family.profiles.empty()) {
         throw std::logic_error(std::string(label) + " CUDA Graph family has no profiles");
@@ -179,7 +180,7 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
         family.topologies.emplace_back();
         DecodeGraphTopology& topology = family.topologies.back();
         topology.topology_class       = profile.topology_class;
-        topology.executable.instantiate(profile.definition);
+        topology.executable.instantiate(profile.definition, devices, streams);
         topology.installed_profile = i;
     }
 
@@ -189,9 +190,9 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
             topology.executable.update(profile.definition);
             topology.installed_profile = profile_index;
         }
-        // A dual-device executable uploads and launches from rank 0's stream as one unit; the
-        // synchronize covers both devices because the graph's rank-1 nodes retire on rank 1.
-        topology.executable.upload(device.stream);
+        // Each rank owns its graph and uploads/launches it on that rank's own stream; the
+        // synchronize covers every device because every rank's nodes retire on its own stream.
+        topology.executable.upload();
         synchronize_all();
     };
 
@@ -206,7 +207,7 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
                     DecodeGraphProfile& profile = family.profiles[i];
                     prepare(profile.min_execution_frontier, profile.batch_size);
                     synchronize_all();
-                    topology.executable.launch(device.stream);
+                    topology.executable.launch();
                     synchronize_all();
                     continue;
                 }
@@ -314,19 +315,7 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
             }
         }
         CUDA_CHECK(cudaSetDevice(previous));
-        (void)ops::enable_peer_access(execution);
-        peer_events.emplace(execution);
-        if (plan.use_cuda_graph) {
-            // Created once, here, for the same reason PeerEvents is: cudaEventCreate is not
-            // capturable, and the fork/join pair must outlive every capture.
-            std::array<int, kMaximumDevices> peer_devices{};
-            int peer_count = 0;
-            for (int rank = 1; rank < tp; ++rank) {
-                peer_devices[peer_count++] = execution.dev[rank]->device;
-            }
-            graph_bridge.emplace(execution.dev[0]->device,
-                                 std::span<const int>(peer_devices.data(), peer_count));
-        }
+        collective_comms.emplace(execution);
     }
     if (rope_mode == RopeMode::Yarn) {
         // ONE resident 32-float corrected inverse-frequency table PER DEVICE, uploaded once, here.
@@ -483,7 +472,7 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
             PeerRuntime& p  = *peer[slot];
             peer_core[slot].emplace(schedule::TpPeerCore{
                 .execution        = &execution,
-                .events           = &*peer_events,
+                .events           = &*collective_comms,
                 .device           = &p.device,
                 .model            = &p.model,
                 .work             = &p.work,
@@ -1771,7 +1760,6 @@ void ProgramImplCore::prepare_graphs() {
                                        proposal_head,
                                        rope_frequency,
                                        peer_ptrs(),
-                                       graph_bridge ? &*graph_bridge : nullptr,
                                        tp};
     };
 
@@ -1946,17 +1934,31 @@ void ProgramImplCore::prepare_graphs() {
         }
     }
 
+    std::array<int, kMaximumDevices> graph_devices{};
+    std::array<cudaStream_t, kMaximumDevices> graph_streams{};
+    graph_devices[0] = device.device;
+    graph_streams[0] = device.stream;
+    for (int rank = 1; rank < tp; ++rank) {
+        const DeviceContext& rank_device = *peer_core[static_cast<std::size_t>(rank)]->device;
+        graph_devices[rank] = rank_device.device;
+        graph_streams[rank] = rank_device.stream;
+    }
+    const std::span<const int> graph_device_span(graph_devices.data(),
+                                                 static_cast<std::size_t>(tp));
+    const std::span<const cudaStream_t> graph_stream_span(graph_streams.data(),
+                                                          static_cast<std::size_t>(tp));
+
     if (!ordinary_graphs.profiles.empty()) {
-        instantiate_graph_family(ordinary_graphs, "ordinary", device, prepare_representative,
-                                 synchronize_all);
+        instantiate_graph_family(ordinary_graphs, "ordinary", graph_device_span, graph_stream_span,
+                                 prepare_representative, synchronize_all);
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative,
-                                 synchronize_all);
+        instantiate_graph_family(mtp_graphs, "MTP", graph_device_span, graph_stream_span,
+                                 prepare_representative, synchronize_all);
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative,
-                                 synchronize_all);
+        instantiate_graph_family(dflash_graphs, "DFlash", graph_device_span, graph_stream_span,
+                                 prepare_representative, synchronize_all);
     }
 
     ordered_reset(sequence);
@@ -2327,7 +2329,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, rope_frequency, peer_ptrs(), graph_bridge ? &*graph_bridge : nullptr, tp},
+             proposal_head, rope_frequency, peer_ptrs(), tp},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             mtp_kv_view_peer(sequence),
@@ -2598,7 +2600,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, rope_frequency, peer_ptrs(), graph_bridge ? &*graph_bridge : nullptr, tp},
+             proposal_head, rope_frequency, peer_ptrs(), tp},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -2735,7 +2737,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                   replay_records ? &*replay_records : nullptr, io,
                                                   prefill_hidden, prefill_chunk, proposal_head,
                                                   rope_frequency, peer_ptrs(),
-                                                  graph_bridge ? &*graph_bridge : nullptr, tp},
+                                                  tp},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -2913,7 +2915,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
                                                      proposal_head,                                                      rope_frequency, peer_ptrs(),
-                                                     graph_bridge ? &*graph_bridge : nullptr, tp},
+                                                     tp},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,

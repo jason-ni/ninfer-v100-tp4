@@ -175,7 +175,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--rope native|yarn] [--yarn-factor F] [--yarn-origin O] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2|4] "
-           "[--devices N,N] "
+           "[--devices N,N,...] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
@@ -229,11 +229,11 @@ std::string serve_usage_text(const char* argv0) {
            "1048576); --yarn-origin must equal the artifact\'s registered native capacity (262144) "
            "and defaults to it, --yarn-factor defaults to 4.0. YaRN works at either --tp width and "
            "is rejected with --vision or --spec dflash.\n"
-           "       --cuda-graph captures one cross-device decode graph; --no-cuda-graph runs the "
-           "same multi-stream forward pass eagerly with cross-device event synchronization. The two "
-           "produce the same tokens. Eager is the default at --tp > 1 because on this V100 target "
-           "the multi-device graph replays with GPU idle bubbles and is slower than eager; --tp 1 "
-           "defaults to graphs.\n";
+            "       --cuda-graph captures one decode graph per rank, with the NCCL collectives "
+            "recorded as nodes in each rank's graph; --no-cuda-graph runs the same forward pass "
+            "eagerly. The two produce the same tokens. Eager is the default at --tp > 1 because on "
+            "this V100 target the per-rank graph replays with GPU idle bubbles and is slower than "
+            "eager; --tp 1 defaults to graphs.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {

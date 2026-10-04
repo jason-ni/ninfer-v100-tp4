@@ -227,10 +227,10 @@ complete state on every device. The HTTP server enables reuse by default; separa
 not share a cache.
 
 The load summary reports weights, KV pool, GDN state, sequence, workspace, CUDA Graph and reserved
-bytes per device, plus a free/total row for each. `--cuda-graph` captures one cross-device decode
-graph and `--no-cuda-graph` runs the same multi-stream forward pass eagerly with cross-device event
-synchronization; the tokens are identical. Graphs default off at `--tp > 1` because on this V100
-target the multi-device graph replays with GPU idle bubbles and is slower than eager, and on at
+bytes per device, plus a free/total row for each. `--cuda-graph` captures one decode graph per rank,
+with the NCCL collectives recorded as nodes in each rank's graph, and `--no-cuda-graph` runs the same
+forward pass eagerly; the tokens are identical. Graphs default off at `--tp > 1` because on this V100
+target the per-rank graph replays with GPU idle bubbles and is slower than eager, and on at
 `--tp 1`. `--tp 1` is bit-identical to single-device execution.
 
 Speculative decoding at `--tp > 1` is output-equivalent to non-speculative decoding rather than

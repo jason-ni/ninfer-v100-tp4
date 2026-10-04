@@ -365,7 +365,7 @@ ReductionCriterion criterion_for(const Case& test_case, ops::LinearPolicy policy
 // One case: build the whole weight and the two shards, run tp1 on device 0 and the split form on
 // both, compare.
 // ---------------------------------------------------------------------------------------------
-int run_case(const Case& test_case, const ExecutionContext& ec, const ops::PeerEvents& events) {
+int run_case(const Case& test_case, const ExecutionContext& ec, const ops::CollectiveComms& events) {
     const bool column      = test_case.axis == SplitAxis::Column;
     const bool dense       = test_case.qtype == QType::BF16_CTRL;
     const std::int32_t n   = test_case.n;
@@ -659,7 +659,7 @@ int verify_registry() {
 }
 
 // Rejection cases the split forms own: only the pair can see them.
-int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& events) {
+int verify_split_rejections(const ExecutionContext& ec, const ops::CollectiveComms& events) {
     int failures            = 0;
     const auto expect_throw = [&](const char* what, auto&& body) {
         try {
@@ -767,12 +767,8 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
-    const bool peer_access = ops::enable_peer_access(ec);
-    std::cout << "peer access: "
-              << (peer_access ? "enabled (direct P2P)"
-                              : "unavailable (verified CUDA UVA D2D staging)")
-              << '\n';
-    const ops::PeerEvents events(ec);
+    std::cout << "collective transport: NCCL over NVLink P2P\n";
+    const ops::CollectiveComms events(ec);
 
     failures += verify_split_rejections(ec, events);
 

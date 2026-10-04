@@ -2,7 +2,7 @@
 
 #include "targets/qwen3_6_27b/impl/config.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
-#include "ninfer/ops/allreduce.h" // ExecutionContext, ops::PeerEvents (tp2 split forms)
+#include "ninfer/ops/allreduce.h" // ExecutionContext, ops::CollectiveComms (tp2 split forms)
 #include <ninfer/targets/qwen3_6/runtime.h>
 
 #include <array>
@@ -126,9 +126,9 @@ struct Variant {
     [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                                              std::int32_t last);
 
-    // --- tp == 2 split forms -------------------------------------------------------------------
+    // --- tp > 1 split forms --------------------------------------------------------------------
     //
-    // One call drives BOTH ranks: every argument is an array indexed by rank, holding that rank's
+    // One call drives EVERY rank: every argument is an array indexed by rank, holding that rank's
     // own shard-shaped tensor/weight resident on `ec.dev[rank]` and issued on that rank's stream.
     // The three column-parallel leaves need no communication at all; the two row-parallel leaves
     // (`attention_output_projection`, `gdn_output_projection`, and `post_mixer`'s trailing `down`)
@@ -151,7 +151,7 @@ struct Variant {
                                             const std::array<Tensor, kMaximumDevices>& staging,
                                             qwen3_6::TextPhase phase,
                                             const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                                            const ExecutionContext& ec, const ops::PeerEvents& ev);
+                                            const ExecutionContext& ec, const ops::CollectiveComms& ev);
     static void gdn_input_projection(const std::array<Tensor, kMaximumDevices>& hidden,
                                      const std::array<const GdnProjectionWeights*, kMaximumDevices>& w,
                                      const std::array<Tensor, kMaximumDevices>& qkv,
@@ -182,7 +182,7 @@ struct Variant {
                                       const std::array<Tensor, kMaximumDevices>& staging,
                                       qwen3_6::TextPhase phase,
                                       const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                                      const ExecutionContext& ec, const ops::PeerEvents& ev);
+                                      const ExecutionContext& ec, const ops::CollectiveComms& ev);
     // MTP split leaves. `mtp_attention_projection` is column-parallel over the packed
     // [14336, 5120] parent (shard [7168, 5120], whose row order is q | k | gate | v at the
     // per-rank section widths) and then splits each rank's own packed block in place;
@@ -215,7 +215,7 @@ struct Variant {
                                const std::array<Tensor, kMaximumDevices>& residual,
                                const std::array<Tensor, kMaximumDevices>& staging,
                                const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                               const ExecutionContext& ec, const ops::PeerEvents& ev);
+                               const ExecutionContext& ec, const ops::CollectiveComms& ev);
     static void gdn_control_projection(const std::array<Tensor, kMaximumDevices>& hidden,
                                        const std::array<const GdnProjectionWeights*, kMaximumDevices>& w,
                                        const std::array<Tensor, kMaximumDevices>& g,
@@ -227,7 +227,7 @@ struct Variant {
                            const std::array<Tensor, kMaximumDevices>& residual,
                            const std::array<Tensor, kMaximumDevices>& staging, qwen3_6::TextPhase phase,
                            const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
-                           const ExecutionContext& ec, const ops::PeerEvents& ev);
+                           const ExecutionContext& ec, const ops::CollectiveComms& ev);
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);

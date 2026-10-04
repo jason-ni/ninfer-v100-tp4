@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <span>
 
 namespace {
 
@@ -47,32 +48,37 @@ int main() {
         CUDA_CHECK(cudaMemsetAsync(storage.base(), 0x33, sizeof(std::uint32_t), device.stream));
         device.synchronize();
 
+        const int devices[1]        = {0};
+        const cudaStream_t streams[1] = {device.stream};
+        const std::span<const int> device_span(devices, 1);
+        const std::span<const cudaStream_t> stream_span(streams, 1);
+
         ninfer::DecodeGraphDefinition first;
-        first.capture(device.stream, [&] {
+        first.capture(device_span, stream_span, [&] {
             CUDA_CHECK(cudaMemsetAsync(storage.base(), 0x11, sizeof(std::uint32_t), device.stream));
         });
         ninfer::DecodeGraphDefinition second;
-        second.capture(device.stream, [&] {
+        second.capture(device_span, stream_span, [&] {
             CUDA_CHECK(cudaMemsetAsync(storage.base(), 0x22, sizeof(std::uint32_t), device.stream));
         });
 
         int failures = 0;
         ninfer::DecodeGraphExecutable executable;
-        executable.instantiate(first);
-        executable.upload(device.stream);
+        executable.instantiate(first, device_span, stream_span);
+        executable.upload();
         device.synchronize();
         failures += expect_value(storage.base(), 0x33333333U, "initial graph upload");
 
-        executable.launch(device.stream);
+        executable.launch();
         device.synchronize();
         failures += expect_value(storage.base(), 0x11111111U, "first graph launch");
 
         executable.update(second);
-        executable.upload(device.stream);
+        executable.upload();
         device.synchronize();
         failures += expect_value(storage.base(), 0x11111111U, "updated graph upload");
 
-        executable.launch(device.stream);
+        executable.launch();
         device.synchronize();
         failures += expect_value(storage.base(), 0x22222222U, "updated graph launch");
         return failures == 0 ? 0 : 1;

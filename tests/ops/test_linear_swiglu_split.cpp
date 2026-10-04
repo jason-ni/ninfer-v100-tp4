@@ -490,7 +490,7 @@ struct PipelineCase {
 };
 
 int run_pipeline_case(const PipelineCase& test_case, const ExecutionContext& ec,
-                      const ops::PeerEvents& events) {
+                      const ops::CollectiveComms& events) {
     constexpr std::int32_t kDownRows = 5120; // o_proj/gdn/output width; mlp/down [5120,17408]
     const std::int32_t tokens        = test_case.tokens;
     const std::string head           = test_case.label;
@@ -897,12 +897,8 @@ int main() {
                    "cudaGetDeviceProperties");
     }
     const int compute_major = std::min(properties[0].major, properties[1].major);
-    const bool peer_access = ops::enable_peer_access(ec);
-    std::cout << "peer access: "
-              << (peer_access ? "enabled (direct P2P)"
-                              : "unavailable (verified CUDA UVA D2D staging)")
-              << '\n';
-    const ops::PeerEvents events(ec);
+    std::cout << "collective transport: NCCL over NVLink P2P\n";
+    const ops::CollectiveComms events(ec);
 
     failures += verify_split_rejections(ec);
 

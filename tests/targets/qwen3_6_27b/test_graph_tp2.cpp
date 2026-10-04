@@ -1,27 +1,23 @@
 // Opt-in dual-device CUDA Graph test for the tensor-parallel decode path.
 //
-// A tensor-parallel decode round issues work on BOTH devices' streams and orders them against each
-// other with the collectives' cross-device events. Capturing that is only possible as ONE graph
-// holding both devices' nodes -- rank 1's stream is forked into rank 0's capture and joined back
-// before it ends -- because CUDA rejects an event wait that would link two separate live captures.
-// This test is the durable evidence that the resulting graph is a faithful recording:
+// Each rank now captures its OWN graph. The rank's stream runs that rank's slice of the layer
+// schedule, and the row-parallel collectives are NCCL calls recorded as nodes into the same graph
+// (one communicator per rank, issued from the single engine thread inside ncclGroupStart/End). No
+// graph is shared across devices, and there is no fork/join of a peer stream. This test is the
+// durable evidence that the resulting per-rank graph is a faithful recording:
 //
 //   1. IDENTITY. Over 128 greedy decode steps the captured-and-replayed path must produce EXACTLY
 //      the tokens the eager path produces. Greedy decoding is a hard equality test on every logit
-//      argmax, so a graph that lost one device's contribution, replayed a stale address, or raced
-//      the two streams diverges within a few tokens instead of degrading gracefully.
+//      argmax, so a graph that lost a rank's contribution, replayed a stale address, or failed to
+//      record a collective diverges within a few tokens instead of degrading gracefully. This is
+//      also what proves every rank's stream was actually captured: a dropped rank computes a wrong
+//      all-reduce and the tokens change.
 //   2. REPRODUCIBILITY. Two graph runs in the same engine must be bit-identical. The tp2-specific
 //      hazard is a stream race, and a stable repeat is what rules it out.
-//   3. BOTH DEVICES ARE IN THE GRAPH. One captured tp2 decode graph must hold more nodes than one
-//      captured tp1 decode graph of the same model. tp2 runs the same per-layer schedule on each
-//      of two devices and adds the collectives' cross-device copies, so its single graph is
-//      roughly twice the size; a graph that had silently captured only rank 0's stream would come
-//      out at or below the tp1 count. This is measured against the tp1 engine rather than a magic
-//      constant, and it is granularity-free -- unlike the per-device byte figures, which
-//      cudaMemGetInfo quantizes to 2 MiB and which are therefore reported but not asserted on.
-//
-// Legs 1 and 3 are complementary: 3 says the peer's nodes are IN the graph, 1 says the whole thing
-// computes the right answer when replayed.
+//   3. GRAPH RESOURCES ARE REAL. The graphs engine must plan a nonzero per-device allowance and
+//      keep each device under it, and the eager engine must reserve nothing. cudaMemGetInfo
+//      quantizes the measured residency to 2 MiB, so the byte figures are reported and bounded by
+//      the allowance rather than asserted to a constant.
 //
 // Skipped (exit 77) unless NINFER_QWEN3_8_27B_WEIGHTS names an artifact AND at least two CUDA
 // devices are visible, so it costs nothing in a default `ctest` run.
@@ -47,7 +43,7 @@ constexpr std::uint32_t kOutputTokens = 128;
 // cudaGraphExec, which means the crossing makes the round call cudaGraphExecUpdate to swap the
 // installed profile -- on a graph whose nodes live on two devices. A prompt that stayed inside one
 // profile would never exercise that, and it is exactly the operation most likely to reject a
-// cross-device topology.
+// capture that has NCCL collective nodes in it.
 constexpr std::size_t kPromptTokens = 460;
 
 // The crossing is the point of those two constants, so it is pinned rather than left to a comment
@@ -66,25 +62,17 @@ static_assert(kEndFrontier > kProfileBoundary,
 static_assert(kEndFrontier < kMaxContext, "the run must fit the engine's context");
 static_assert(kOutputTokens >= 100, "the required floor is 100 captured decode steps");
 
-ninfer::EngineOptions engine_options(const char* artifact, int tp, bool graphs) {
+ninfer::EngineOptions tp2_options(const char* artifact, bool graphs) {
     ninfer::EngineOptions options;
     options.artifact_path  = artifact;
     options.max_context    = kMaxContext;
     options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(kMaxContext);
     options.prefill_chunk  = kPrefillChunk;
     options.kv_cache       = ninfer::KvCacheStorage::Int8Group64;
-    options.tp             = tp;
-    if (tp == 2) {
-        options.devices = {0, 1};
-    } else {
-        options.device = 0;
-    }
+    options.tp             = 2;
+    options.devices        = {0, 1};
     options.use_cuda_graph = graphs;
     return options;
-}
-
-ninfer::EngineOptions tp2_options(const char* artifact, bool graphs) {
-    return engine_options(artifact, 2, graphs);
 }
 
 std::vector<ninfer::TokenId> synthetic_prompt(std::size_t tokens) {
@@ -118,7 +106,7 @@ std::size_t first_divergence(const std::vector<ninfer::TokenId>& a,
 // asserted to be nonzero, because cudaMemGetInfo quantizes to 2 MiB and one decode graph for this
 // model costs less than that once the modules are already resident. What is asserted is the part
 // that is exact: the eager engine plans and consumes nothing, and neither device exceeds the
-// planned per-device allowance. Leg 3 (node counts) is what proves the peer's work was captured.
+// planned per-device allowance.
 int verify_graph_memory(const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
                         bool graphs) {
     if (load.tp != 2) {
@@ -142,6 +130,10 @@ int verify_graph_memory(const ninfer::LoadSummary& load, const ninfer::MemorySum
         std::cerr << "the graphs engine planned a zero graph allowance\n";
         return 1;
     }
+    if (memory.cuda_graph_node_count == 0) {
+        std::cerr << "the graphs engine captured no nodes -- no decode graph was recorded\n";
+        return 1;
+    }
     if (rank0 > memory.cuda_graph_allowance_bytes || rank1 > memory.cuda_graph_allowance_bytes) {
         std::cerr << "per-device graph residency (" << rank0 << " / " << rank1
                   << " B) exceeds the planned per-device allowance of "
@@ -150,38 +142,6 @@ int verify_graph_memory(const ninfer::LoadSummary& load, const ninfer::MemorySum
     }
     std::cout << "tp2 graph memory: rank0 " << rank0 << " B, rank1 " << rank1
               << " B, per-device allowance " << memory.cuda_graph_allowance_bytes << " B\n";
-    return 0;
-}
-
-// Leg 3: one tp2 decode graph must hold substantially more nodes than one tp1 decode graph of the
-// same model.
-//
-// The threshold is 1.5x, not "more than". tp2 runs the same per-layer schedule on EACH of two
-// devices, so the honest expectation is ~2x plus the collectives' copies (measured 2.95x: 2x640
-// for both devices, +512 for 128 all-reduces x 4 nodes, +4 for the gather, +96 for the tp2-only
-// un-fused GDN norm). A bare "greater than" would still pass if only rank 0's stream had been
-// captured and a handful of stray nodes made up the difference -- which is precisely the failure
-// this leg exists to catch. 1.5x is comfortably below the real 2.95x and comfortably above
-// anything a single-device capture could reach.
-constexpr double kMinNodeRatio = 1.5;
-
-int verify_both_devices_captured(std::size_t tp1_nodes, std::size_t tp2_nodes) {
-    if (tp1_nodes == 0) {
-        std::cerr << "the tp1 graphs engine captured no nodes -- the reference is missing\n";
-        return 1;
-    }
-    const double ratio = static_cast<double>(tp2_nodes) / static_cast<double>(tp1_nodes);
-    if (ratio < kMinNodeRatio) {
-        std::cerr << "one tp2 decode graph holds " << tp2_nodes << " nodes against tp1's "
-                  << tp1_nodes << " (" << ratio << "x, require at least " << kMinNodeRatio
-                  << "x): a capture of both devices' schedules plus 128 cross-device collectives "
-                     "cannot be this close to the one-device count, so the peer's half of the "
-                     "schedule is missing from the graph\n";
-        return 1;
-    }
-    std::cout << "tp2 decode graph nodes: " << tp2_nodes << " vs tp1's " << tp1_nodes << " ("
-              << ratio << "x, require >= " << kMinNodeRatio
-              << "x; both devices' work plus the collectives' copies)\n";
     return 0;
 }
 
@@ -205,7 +165,6 @@ int exercise(const char* artifact) {
 
     std::vector<ninfer::TokenId> captured;
     std::vector<ninfer::TokenId> replayed;
-    std::size_t tp2_nodes = 0;
     {
         ninfer::Engine engine(tp2_options(artifact, true));
         if (const int result =
@@ -213,17 +172,8 @@ int exercise(const char* artifact) {
             result != 0) {
             return result;
         }
-        tp2_nodes = engine.memory_summary().cuda_graph_node_count;
         captured  = generate_greedy(engine, prompt);
         replayed  = generate_greedy(engine, prompt);
-    }
-    std::size_t tp1_nodes = 0;
-    {
-        ninfer::Engine engine(engine_options(artifact, 1, true));
-        tp1_nodes = engine.memory_summary().cuda_graph_node_count;
-    }
-    if (const int result = verify_both_devices_captured(tp1_nodes, tp2_nodes); result != 0) {
-        return result;
     }
     if (captured.size() != kOutputTokens) {
         std::cerr << "the tp2 graphs engine did not generate " << kOutputTokens << " tokens\n";
