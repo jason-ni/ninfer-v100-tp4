@@ -49,3 +49,6 @@ profiles/
 
 models/
 *.ninfer
+
+# Local run outputs / packaged serve binary
+dist/
