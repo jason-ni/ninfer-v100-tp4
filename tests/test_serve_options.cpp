@@ -185,12 +185,96 @@ int main() {
         check(!resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "request preserve-thinking override did not win");
 
+    // --chat-template-kwargs: server-level chat-template defaults parsed from a JSON object.
+    const ServeOptions template_kwargs = parse(
+        {"ninfer-serve", "model.ninfer",
+         "--chat-template-kwargs", R"({"preserve_thinking": true, "reasoning_effort": "low"})"});
+    failures += check(template_kwargs.preserve_thinking &&
+                          template_kwargs.reasoning_effort_default == RequestedReasoningEffort::Low,
+                      "--chat-template-kwargs did not apply preserve_thinking/reasoning_effort");
+
+    const ServeOptions template_enable_off = parse(
+        {"ninfer-serve", "model.ninfer",
+         "--chat-template-kwargs", R"({"enable_thinking": false})"});
+    failures += check(!template_enable_off.enable_thinking,
+                      "--chat-template-kwargs enable_thinking=false did not disable thinking");
+
+    const ServeOptions template_none = parse(
+        {"ninfer-serve", "model.ninfer",
+         "--chat-template-kwargs", R"({"reasoning_effort": "none"})"});
+    failures += check(template_none.reasoning_effort_default == RequestedReasoningEffort::None,
+                      "--chat-template-kwargs reasoning_effort=none did not resolve to None");
+
+    bool unknown_key_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--chat-template-kwargs", R"({"foo": 1})"});
+    } catch (const std::invalid_argument&) { unknown_key_rejected = true; }
+    failures += check(unknown_key_rejected, "unknown --chat-template-kwargs key was accepted");
+
+    bool bad_json_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--chat-template-kwargs", "{not json"});
+    } catch (const std::invalid_argument&) { bad_json_rejected = true; }
+    failures += check(bad_json_rejected, "non-object --chat-template-kwargs JSON was accepted");
+
+    bool non_object_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--chat-template-kwargs", "[1, 2]"});
+    } catch (const std::invalid_argument&) { non_object_rejected = true; }
+    failures += check(non_object_rejected, "non-object --chat-template-kwargs JSON was accepted");
+
+    bool enable_conflict_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--no-thinking",
+                     "--chat-template-kwargs", R"({"enable_thinking": true})"});
+    } catch (const std::invalid_argument&) { enable_conflict_rejected = true; }
+    failures += check(enable_conflict_rejected,
+                      "--no-thinking conflicted with enable_thinking=true");
+
+    bool preserve_conflict_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--preserve-thinking",
+                     "--chat-template-kwargs", R"({"preserve_thinking": false})"});
+    } catch (const std::invalid_argument&) { preserve_conflict_rejected = true; }
+    failures += check(preserve_conflict_rejected,
+                      "--preserve-thinking conflicted with preserve_thinking=false");
+
+    bool effort_no_thinking_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--chat-template-kwargs",
+                     R"({"reasoning_effort": "low", "enable_thinking": false})"});
+    } catch (const std::invalid_argument&) { effort_no_thinking_rejected = true; }
+    failures += check(effort_no_thinking_rejected,
+                      "--chat-template-kwargs reasoning_effort was accepted with thinking off");
+
+    // The server default reasoning_effort applies when a request omits it and is resolved exactly
+    // like a per-request field (capability and enable_thinking checks).
+    ninfer::PromptCapabilities effort_capabilities;
+    effort_capabilities.enable_thinking = true;
+    effort_capabilities.reasoning_effort.low = true;
+    GenerationRequest effort_request;
+    effort_request.max_tokens = 1;
+    failures += check(
+        resolve_prompt_semantics(effort_request, template_kwargs, effort_capabilities)
+            .reasoning_effort == ninfer::ReasoningEffort::Low,
+        "server reasoning_effort default was not resolved for a request that omits it");
+    effort_request.reasoning_effort = RequestedReasoningEffort::Medium;
+    bool request_medium_rejected = false;
+    try {
+        (void)resolve_prompt_semantics(effort_request, template_kwargs, effort_capabilities);
+    } catch (const ApiException&) { request_medium_rejected = true; }
+    failures += check(request_medium_rejected,
+                      "request reasoning_effort=medium was not rejected when unsupported");
+
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");
+    failures += check(serve_usage_text("ninfer-serve").find("--chat-template-kwargs") !=
+                          std::string::npos,
+                      "serve help omits --chat-template-kwargs");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
     failures +=

@@ -93,13 +93,15 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 }
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
-    // ONE device's persistent state. At tp == 2 this device owns half the attention KV heads, half
-    // the GDN value heads and half the GDN conv channels -- the exact halving the per-GPU memory
-    // budget assumes. The PAGE geometry is deliberately NOT divided: every device carries the
+    // ONE device's persistent state. At tp > 1 this device owns 1/tp of the attention KV heads,
+    // 1/tp of the GDN value heads and 1/tp of the GDN conv channels -- the exact split the per-GPU
+    // memory budget assumes. The PAGE geometry is deliberately NOT divided: every device carries the
     // same page count and the same block tables, which is what makes one shared KV capacity plan
     // legal.
     const std::int32_t tp = plan.tp;
-    if (tp != 1 && tp != 2) { throw std::invalid_argument("sequence plan tp must be 1 or 2"); }
+    if (tp != 1 && tp != 2 && tp != 4) {
+        throw std::invalid_argument("sequence plan tp must be 1, 2, or 4");
+    }
     const std::int32_t linear_state_slots =
         LinearStateSlots::state_slot_count(plan.max_concurrency);
     const auto effective_prefill_chunk =
@@ -686,13 +688,17 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
         }
         break;
     }
-    if (options.tp != 1 && options.tp != 2) {
-        throw std::invalid_argument("tensor-parallel width must be 1 or 2");
+    if (options.tp != 1 && options.tp != 2 && options.tp != 4) {
+        throw std::invalid_argument("tensor-parallel width must be 1, 2, or 4");
     }
-    if (options.tp == 2) {
-        // MTP and DFlash2 have explicit split schedules. Vision remains single-device.
+    if (options.tp > 1) {
+        // MTP has an explicit split schedule. Vision remains single-device, and the DFlash split
+        // schedule is defined for exactly two ranks.
         if (options.enable_vision) {
-            throw std::invalid_argument("--tp 2 does not support Vision in this build");
+            throw std::invalid_argument("--tp > 1 does not support Vision in this build");
+        }
+        if (options.speculative.backend == SpeculativeBackend::DFlash && options.tp != 2) {
+            throw std::invalid_argument("--spec dflash supports --tp 1 or --tp 2 only");
         }
     }
     if (device.sm() != 70 && device.sm() != 86 && device.sm() != 89 && device.sm() != 120) {
@@ -741,10 +747,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            // Per device, at both widths. At tp 2 one cross-device graph replaces the tp 1 graph
+            // Per device, at every width. At tp 2 one cross-device graph replaces the tp 1 graph
             // but holds BOTH devices' nodes (2.95x the tp 1 node count: each device's halved-width
             // schedule, the extra un-fused GDN norm, and the collectives' cross-device copies), and
-            // instantiating it materializes driver state on each device it has nodes on.
+            // instantiating it materializes driver state on each device it has nodes on. At tp 4 the
+            // single capture holds all FOUR devices' nodes (four quarter-width schedules and three
+            // peer edges folded in), so its driver-state footfall is larger again -- measured ~70
+            // MiB on device 0 at max_concurrency 1 versus 12 MiB at tp 1, hence the 80 MiB budget.
             //
             // Measured on 2x RTX 5090 at max_concurrency 8, 8192 context:
             //   tp 1: 20 MiB on the one device        (2.5  MiB per concurrent request)
@@ -763,7 +772,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             // budget there is one multiplier, 20 MiB, against a 0.3b-style worst case of ~19.9
             // MiB: roughly 1 MiB of headroom. Raising this multiplier, not the warm pass, is the
             // lever if that transient is ever observed at tp 2.
-            const std::uint64_t per_batch = impl->tp == 2 ? 20ULL * kMiB : 12ULL * kMiB;
+            const std::uint64_t per_batch =
+                impl->tp >= 4 ? 80ULL * kMiB : (impl->tp == 2 ? 20ULL * kMiB : 12ULL * kMiB);
             impl->graph_allowance_bytes =
                 checked_mul(per_batch, impl->max_concurrency, "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
@@ -774,7 +784,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+                    return (final_visible <= 4096 ? (impl->tp >= 4 ? 96ULL : 12ULL)
+                                                  : (impl->tp >= 4 ? 160ULL : 82ULL)) *
+                           kMiB;
                 },
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,

@@ -72,6 +72,12 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
     case Fp8Problem::Residual17408Tp2Row:
         launch_problem<Fp8Residual17408Tp2RowGeometry>(weight, residual, scratch, x.ne[1], stream);
         return;
+    case Fp8Problem::Residual6144Tp4Row:
+        launch_problem<Fp8Residual6144Tp4RowGeometry>(weight, residual, scratch, x.ne[1], stream);
+        return;
+    case Fp8Problem::Residual17408Tp4Row:
+        launch_problem<Fp8Residual17408Tp4RowGeometry>(weight, residual, scratch, x.ne[1], stream);
+        return;
     case Fp8Problem::AttnInput:
     case Fp8Problem::GdnInput:
     case Fp8Problem::MlpGateUp:
@@ -80,6 +86,10 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
     case Fp8Problem::GdnInputTp2Column:
     case Fp8Problem::MlpGateUpTp2Column:
     case Fp8Problem::AttnInputTp2Column:
+    case Fp8Problem::VocabularyTp4Column:
+    case Fp8Problem::GdnInputTp4Column:
+    case Fp8Problem::MlpGateUpTp4Column:
+    case Fp8Problem::AttnInputTp4Column:
         break;
     }
     throw std::invalid_argument("fp8 linear_add: unsupported problem");

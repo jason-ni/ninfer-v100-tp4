@@ -24,7 +24,8 @@ Binder::Binder(const Reader& reader, int device_count)
     : reader_(reader), consumed_(reader.objects().size(), false),
       planned_(reader.objects().size(), false) {
     if (device_count < 1 || device_count > static_cast<int>(kMaximumDevices)) {
-        throw ArtifactError("materialization device count must be 1 or 2");
+        throw ArtifactError("materialization device count must be 1 to " +
+                            std::to_string(kMaximumDevices));
     }
     materialization_.object_count = reader.objects().size();
     materialization_.device_count = device_count;

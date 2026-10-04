@@ -63,4 +63,26 @@ template <>
 struct Fp8LinearA8ProductionSchedule<Fp8AttnInputTp2ColumnGeometry>
     : Fp8LinearA8ProductionSchedule<Fp8AttnInputGeometry> {};
 
+// The tp4 shards likewise inherit their tp1 parent's measured A8 schedule: BlockRows=128 divides
+// every shard's own kOutputRows (column shards 3584/62080/8704/4096, row shards keep 5120).
+template <>
+struct Fp8LinearA8ProductionSchedule<Fp8GdnInputTp4ColumnGeometry>
+    : Fp8LinearA8ProductionSchedule<Fp8GdnInputGeometry> {};
+
+template <>
+struct Fp8LinearA8ProductionSchedule<Fp8Residual6144Tp4RowGeometry>
+    : Fp8LinearA8ProductionSchedule<Fp8Residual6144Geometry> {};
+
+template <>
+struct Fp8LinearA8ProductionSchedule<Fp8Residual17408Tp4RowGeometry>
+    : Fp8LinearA8ProductionSchedule<Fp8Residual17408Geometry> {};
+
+template <>
+struct Fp8LinearA8ProductionSchedule<Fp8MlpGateUpTp4ColumnGeometry>
+    : Fp8LinearA8ProductionSchedule<Fp8MlpGateUpGeometry> {};
+
+template <>
+struct Fp8LinearA8ProductionSchedule<Fp8AttnInputTp4ColumnGeometry>
+    : Fp8LinearA8ProductionSchedule<Fp8AttnInputGeometry> {};
+
 } // namespace ninfer::ops::detail

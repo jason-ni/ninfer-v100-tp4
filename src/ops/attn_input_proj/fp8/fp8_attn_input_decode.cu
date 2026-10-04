@@ -34,9 +34,15 @@ void fp8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor&
     launch<Fp8AttnInputGeometry, Fp8AttentionInputOutput>(x, weight, q, gate, k, v, stream);
 }
 
-// The tp2 column shard.
+// The tp2/tp4 column shards.
 void fp8_attn_input_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& q,
                                         Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (weight.n == Fp8AttnInputTp4ColumnGeometry::kOutputRows) {
+        launch<Fp8AttnInputTp4ColumnGeometry,
+               Fp8AttentionInputShardOutput<Fp8AttnInputTp4ColumnGeometry>>(x, weight, q, gate, k, v,
+                                                                           stream);
+        return;
+    }
     launch<Fp8AttnInputTp2ColumnGeometry, Fp8AttentionInputShardOutput<Fp8AttnInputTp2ColumnGeometry>>(
         x, weight, q, gate, k, v, stream);
 }

@@ -89,10 +89,10 @@ struct LoadProgress {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device = 0;
-    // Tensor-parallel degree: 1 (default, single device) or 2. `tp == 2` splits the resident
-    // model across two CUDA devices and requires `devices` to name exactly two distinct ids of
-    // the same compute capability. It is supported by the 27B execution package (`qwen3.6-27b`,
-    // `qwen3.8-27b`) with `SpeculativeBackend::None` or `Mtp`; `qwen3.6-35b-a3b`,
+    // Tensor-parallel degree: 1 (default, single device), 2, or 4. `tp > 1` splits the resident
+    // model across that many CUDA devices and requires `devices` to name exactly `tp` distinct
+    // ids of the same compute capability. It is supported by the 27B execution package
+    // (`qwen3.6-27b`, `qwen3.8-27b`) with `SpeculativeBackend::None` or `Mtp`; `qwen3.6-35b-a3b`,
     // `SpeculativeBackend::DFlash`, and `enable_vision` are rejected at construction. `tp == 1`
     // is bit-identical to the single-device path.
     int tp = 1;
@@ -120,6 +120,10 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // CUDA Graph capture for decode. The CLI and server default this off when `tp > 1` because the
+    // multi-device graph replays with GPU idle bubbles and is slower than eager on the V100
+    // target, and on when `tp == 1`; both modes produce the same tokens. Set explicitly to
+    // override either default.
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
 };
@@ -468,21 +472,27 @@ struct MemorySummary {
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
-    // Graph residency measured on THIS device (rank 0). The allowance above is a per-device
-    // budget, so both figures are per-device and neither is a total to be divided.
+    // Graph residency measured on the primary rank, and per rank in `cuda_graph_device_bytes`. The
+    // allowance above is a per-device budget, so every figure is per-device and none is a total to
+    // be divided across ranks.
     std::size_t cuda_graph_observed_bytes         = 0;
-    // Graph residency measured on rank 1, and 0 at tp == 1. A tensor-parallel decode program is a
-    // single cross-device graph, but instantiating it materializes driver and module state on both
-    // devices, so the second device carries its own cost against the same allowance.
+    // Graph residency measured on the first peer rank (rank 1), and 0 at tp == 1. Retained for the
+    // serving schema; the per-rank figures are in `cuda_graph_device_bytes`. A tensor-parallel decode
+    // program is a single cross-device graph, but instantiating it materializes driver and module
+    // state on every device, so each device carries its own cost against the same allowance.
     std::size_t cuda_graph_peer_observed_bytes    = 0;
-    // Node count of one captured decode graph, 0 when graphs are disabled. At tp 2 a single graph
-    // holds BOTH devices' nodes plus the collectives' cross-device copies (the event edges between
-    // them are edges, not nodes), so this is roughly twice the tp 1 count and is the direct
-    // measurement of whether the peer's half of the schedule was captured.
+    // Per-rank graph residency, indexed by rank; entries at or beyond `tp` are 0. This is the
+    // authoritative per-device figure the load-summary table reports.
+    std::array<std::size_t, 4> cuda_graph_device_bytes{};
+    // Node count of one captured decode graph, 0 when graphs are disabled. At tp > 1 a single graph
+    // holds ALL devices' nodes plus the collectives' cross-device copies (the event edges between
+    // them are edges, not nodes), so this is roughly `tp` times the tp 1 count and is the direct
+    // measurement of whether every peer's half of the schedule was captured.
     std::size_t cuda_graph_node_count             = 0;
     std::size_t kv_payload_bytes                  = 0;
-    // GDN (linear-attention) recurrent + convolution state for THIS device. At tp 2 the head split
-    // halves it, so it is reported separately from the rest of the sequence arena.
+    // GDN (linear-attention) recurrent + convolution state for THIS device. At tp > 1 the head split
+    // divides it by the tensor-parallel width, so it is reported separately from the rest of the
+    // sequence arena.
     std::size_t gdn_state_bytes = 0;
 };
 
@@ -520,7 +530,7 @@ struct RuntimeStats {
 
 struct LoadSummary {
     int tp = 1;
-    std::array<DeviceMemoryReport, 2> devices{};
+    std::array<DeviceMemoryReport, 4> devices{};
     // Rotary regime resolved at construction. `effective_max_context` is the ceiling `max_context`
     // was validated against (the variant's native capacity under `RopeMode::Native`,
     // `yarn_origin * yarn_factor` under `RopeMode::Yarn`); `yarn_mscale` is the rotary cos/sin

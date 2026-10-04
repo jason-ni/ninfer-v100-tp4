@@ -58,6 +58,12 @@ static_assert(
 static_assert(
     (Fp8GdnInputShardOutput<Fp8GdnInputTp2ColumnGeometry>::kZRows %
      Fp8LinearA8ProductionSchedule<Fp8GdnInputTp2ColumnGeometry>::Type::kBlockRows) == 0);
+static_assert(
+    (Fp8GdnInputShardOutput<Fp8GdnInputTp4ColumnGeometry>::kQkvRows %
+     Fp8LinearA8ProductionSchedule<Fp8GdnInputTp4ColumnGeometry>::Type::kBlockRows) == 0);
+static_assert(
+    (Fp8GdnInputShardOutput<Fp8GdnInputTp4ColumnGeometry>::kZRows %
+     Fp8LinearA8ProductionSchedule<Fp8GdnInputTp4ColumnGeometry>::Type::kBlockRows) == 0);
 
 } // namespace
 
@@ -66,9 +72,14 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
     launch_a8<Fp8GdnInputGeometry, Fp8GdnInputOutput>(x, weight, qkv, z, workspace, stream);
 }
 
-// The tp2 column shard.
+// The tp2/tp4 column shards.
 void fp8_gdn_input_a8_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                    Fp8A8Workspace workspace, cudaStream_t stream) {
+    if (weight.n == Fp8GdnInputTp4ColumnGeometry::kOutputRows) {
+        launch_a8<Fp8GdnInputTp4ColumnGeometry, Fp8GdnInputShardOutput<Fp8GdnInputTp4ColumnGeometry>>(
+            x, weight, qkv, z, workspace, stream);
+        return;
+    }
     launch_a8<Fp8GdnInputTp2ColumnGeometry, Fp8GdnInputShardOutput<Fp8GdnInputTp2ColumnGeometry>>(
         x, weight, qkv, z, workspace, stream);
 }

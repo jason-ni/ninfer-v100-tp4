@@ -18,6 +18,12 @@ void launch_fp8_gdn_input_volta_qpn(const Tensor& x, const Weight& weight, Tenso
 
 void launch_fp8_gdn_input_volta_qpn_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
                                           Tensor& z, cudaStream_t stream) {
+    if (weight.n == Fp8GdnInputTp4ColumnGeometry::kOutputRows) {
+        const Fp8GdnInputShardOutput<Fp8GdnInputTp4ColumnGeometry> output{
+            static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
+        launch_fp8_volta_qpn_with_output(x, weight, output, weight.n, stream);
+        return;
+    }
     const Fp8GdnInputShardOutput<Fp8GdnInputTp2ColumnGeometry> output{
         static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
     launch_fp8_volta_qpn_with_output(x, weight, output, weight.n, stream);

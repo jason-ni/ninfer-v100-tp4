@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "core/device.h"
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -202,10 +203,9 @@ private:
     std::unique_ptr<detail::ProgramImpl<Variant>> impl_;
 
     template <class V>
-    friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
-                                                      const typename V::ModelView*,
-                                                      typename V::WeightsProfile, SequencePlan<V>&&,
-                                                      ExecutionContext&);
+    friend std::unique_ptr<Program<V>>
+    create_program(const std::array<const typename V::ModelView*, kMaximumDevices>&,
+                   typename V::WeightsProfile, SequencePlan<V>&&, ExecutionContext&);
 };
 
 template <class Variant>
@@ -213,13 +213,13 @@ template <class Variant>
 make_sequence_planner(DeviceContext& device, const EngineOptions& options,
                       typename Variant::WeightsProfile weights_profile);
 
-// `peer_model` is rank 1's own model view at tp == 2 and nullptr at tp == 1; `execution` supplies
-// the device contexts (one or two). The two must agree: a non-null peer view with a tp1 execution
-// context, or the reverse, is rejected.
+// `models` holds one view per rank: `models[0]` is the origin rank and `models[rank]`
+// (1 <= rank < execution.tp) the other ranks' own sharded views; entries [tp, kMaximumDevices)
+// are null. `execution` supplies the device contexts. The two must agree: a populated peer view
+// with a tp1 execution context, or the reverse, is rejected.
 template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
-create_program(const typename Variant::ModelView& model,
-               const typename Variant::ModelView* peer_model,
+create_program(const std::array<const typename Variant::ModelView*, kMaximumDevices>& models,
                typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
                ExecutionContext& execution);
 

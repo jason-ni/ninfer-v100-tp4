@@ -5,6 +5,7 @@
 
 #include <ninfer/targets/qwen3_6_27b/package.h>
 
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
@@ -186,8 +187,9 @@ int verify_profile_mismatch_rejection() {
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;
     try {
+        const std::array<const RuntimeModelView*, ninfer::kMaximumDevices> models{&empty_model};
         (void)ninfer::targets::qwen3_6::create_program<Variant>(
-            empty_model, nullptr, WeightsProfile::Qwen36Nvfp4, std::move(sequence), execution);
+            models, WeightsProfile::Qwen36Nvfp4, std::move(sequence), execution);
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }
     }

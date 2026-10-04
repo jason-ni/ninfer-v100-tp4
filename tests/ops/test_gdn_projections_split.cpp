@@ -449,16 +449,16 @@ int run_fused_case(const ExecutionContext& ec, QType qtype,
                 arena[slot].emplace(std::max<std::size_t>(split_capacity, 1));
             }
 
-            const std::array<Tensor, 2> x{Tensor(shard_x[0].p, DType::BF16, {kInputRows, tokens}),
+            const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(shard_x[0].p, DType::BF16, {kInputRows, tokens}),
                                           Tensor(shard_x[1].p, DType::BF16, {kInputRows, tokens})};
-            const std::array<Weight, 2> w{shard_device[0].weight, shard_device[1].weight};
-            const std::array<Tensor, 2> qkv_out{
+            const std::array<Weight, ninfer::kMaximumDevices> w{shard_device[0].weight, shard_device[1].weight};
+            const std::array<Tensor, ninfer::kMaximumDevices> qkv_out{
                 Tensor(split_qkv[0]->data(), DType::BF16, {kShardQkvRows, tokens}),
                 Tensor(split_qkv[1]->data(), DType::BF16, {kShardQkvRows, tokens})};
-            const std::array<Tensor, 2> z_out{
+            const std::array<Tensor, ninfer::kMaximumDevices> z_out{
                 Tensor(split_z[0]->data(), DType::BF16, {kShardValueRows, tokens}),
                 Tensor(split_z[1]->data(), DType::BF16, {kShardValueRows, tokens})};
-            const std::array<ninfer::WorkspaceArena*, 2> workspace{&*arena[0], &*arena[1]};
+            const std::array<ninfer::WorkspaceArena*, ninfer::kMaximumDevices> workspace{&*arena[0], &*arena[1]};
 
             retire_staging(ec);
             ops::gdn_input_proj_column_parallel(x, w, qkv_out, z_out, policy, workspace, ec);
@@ -658,14 +658,14 @@ int run_split_storage_case(const ExecutionContext& ec, std::uint32_t seed) {
             split_z[slot]->fill(0xff);
         }
 
-        const std::array<Tensor, 2> x{Tensor(shard_x[0].p, DType::BF16, {kInputRows, tokens}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(shard_x[0].p, DType::BF16, {kInputRows, tokens}),
                                       Tensor(shard_x[1].p, DType::BF16, {kInputRows, tokens})};
-        const std::array<Weight, 2> qk_weight{qk_device[0].weight, qk_device[1].weight};
-        const std::array<Weight, 2> vz_weight{vz_device[0].weight, vz_device[1].weight};
-        const std::array<Tensor, 2> qkv_out{
+        const std::array<Weight, ninfer::kMaximumDevices> qk_weight{qk_device[0].weight, qk_device[1].weight};
+        const std::array<Weight, ninfer::kMaximumDevices> vz_weight{vz_device[0].weight, vz_device[1].weight};
+        const std::array<Tensor, ninfer::kMaximumDevices> qkv_out{
             Tensor(split_qkv[0]->data(), DType::BF16, {kShardQkvRows, tokens}),
             Tensor(split_qkv[1]->data(), DType::BF16, {kShardQkvRows, tokens})};
-        const std::array<Tensor, 2> z_out{Tensor(split_z[0]->data(), DType::BF16, {kShardValueRows, tokens}),
+        const std::array<Tensor, ninfer::kMaximumDevices> z_out{Tensor(split_z[0]->data(), DType::BF16, {kShardValueRows, tokens}),
                                           Tensor(split_z[1]->data(), DType::BF16, {kShardValueRows, tokens})};
 
         retire_staging(ec);
@@ -873,27 +873,27 @@ int run_gating_case(const ExecutionContext& ec, std::uint32_t seed) {
             arena[slot].emplace(std::max<std::size_t>(split_ws, 1));
         }
 
-        const std::array<Tensor, 2> x{Tensor(shard_x[0].p, DType::BF16, {kGatingHidden, tokens}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(shard_x[0].p, DType::BF16, {kGatingHidden, tokens}),
                                       Tensor(shard_x[1].p, DType::BF16, {kGatingHidden, tokens})};
-        const std::array<Weight, 2> a_weight{
+        const std::array<Weight, ninfer::kMaximumDevices> a_weight{
             bf16_weight_view(shard_a_device[0], kGatingShardHeads, kGatingHidden),
             bf16_weight_view(shard_a_device[1], kGatingShardHeads, kGatingHidden)};
-        const std::array<Weight, 2> b_weight{
+        const std::array<Weight, ninfer::kMaximumDevices> b_weight{
             bf16_weight_view(shard_b_device[0], kGatingShardHeads, kGatingHidden),
             bf16_weight_view(shard_b_device[1], kGatingShardHeads, kGatingHidden)};
-        const std::array<Tensor, 2> a_log{
+        const std::array<Tensor, ninfer::kMaximumDevices> a_log{
             Tensor(shard_a_log_device[0].p, DType::FP32, {kGatingShardHeads}),
             Tensor(shard_a_log_device[1].p, DType::FP32, {kGatingShardHeads})};
-        const std::array<Tensor, 2> dt_bias{
+        const std::array<Tensor, ninfer::kMaximumDevices> dt_bias{
             Tensor(shard_dt_bias_device[0].p, DType::FP32, {kGatingShardHeads}),
             Tensor(shard_dt_bias_device[1].p, DType::FP32, {kGatingShardHeads})};
-        const std::array<Tensor, 2> g_out{
+        const std::array<Tensor, ninfer::kMaximumDevices> g_out{
             Tensor(split_g[0]->data(), DType::FP32, {kGatingShardHeads, tokens}),
             Tensor(split_g[1]->data(), DType::FP32, {kGatingShardHeads, tokens})};
-        const std::array<Tensor, 2> beta_out{
+        const std::array<Tensor, ninfer::kMaximumDevices> beta_out{
             Tensor(split_beta[0]->data(), DType::FP32, {kGatingShardHeads, tokens}),
             Tensor(split_beta[1]->data(), DType::FP32, {kGatingShardHeads, tokens})};
-        const std::array<ninfer::WorkspaceArena*, 2> workspace{&*arena[0], &*arena[1]};
+        const std::array<ninfer::WorkspaceArena*, ninfer::kMaximumDevices> workspace{&*arena[0], &*arena[1]};
 
         retire_staging(ec);
         ops::gdn_gating_proj_column_parallel(x, a_weight, b_weight, a_log, dt_bias, workspace, g_out,
@@ -1043,22 +1043,22 @@ int run_gating_fused_case(const ExecutionContext& ec, std::uint32_t seed, std::i
         arena[slot].emplace(std::max<std::size_t>(split_ws, 1));
     }
 
-    const std::array<Tensor, 2> x{Tensor(shard_x[0].p, DType::BF16, {kGatingHidden, tokens}),
+    const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(shard_x[0].p, DType::BF16, {kGatingHidden, tokens}),
                                   Tensor(shard_x[1].p, DType::BF16, {kGatingHidden, tokens})};
-    const std::array<Weight, 2> ab_weight{
+    const std::array<Weight, ninfer::kMaximumDevices> ab_weight{
         bf16_weight_view(shard_ab_device[0], 2 * kGatingShardHeads, kGatingHidden),
         bf16_weight_view(shard_ab_device[1], 2 * kGatingShardHeads, kGatingHidden)};
-    const std::array<Tensor, 2> a_log{Tensor(shard_a_log_device[0].p, DType::FP32, {kGatingShardHeads}),
+    const std::array<Tensor, ninfer::kMaximumDevices> a_log{Tensor(shard_a_log_device[0].p, DType::FP32, {kGatingShardHeads}),
                                       Tensor(shard_a_log_device[1].p, DType::FP32, {kGatingShardHeads})};
-    const std::array<Tensor, 2> dt_bias{
+    const std::array<Tensor, ninfer::kMaximumDevices> dt_bias{
         Tensor(shard_dt_bias_device[0].p, DType::FP32, {kGatingShardHeads}),
         Tensor(shard_dt_bias_device[1].p, DType::FP32, {kGatingShardHeads})};
-    const std::array<Tensor, 2> g_out{Tensor(split_g[0]->data(), DType::FP32, {kGatingShardHeads, tokens}),
+    const std::array<Tensor, ninfer::kMaximumDevices> g_out{Tensor(split_g[0]->data(), DType::FP32, {kGatingShardHeads, tokens}),
                                       Tensor(split_g[1]->data(), DType::FP32, {kGatingShardHeads, tokens})};
-    const std::array<Tensor, 2> beta_out{
+    const std::array<Tensor, ninfer::kMaximumDevices> beta_out{
         Tensor(split_beta[0]->data(), DType::FP32, {kGatingShardHeads, tokens}),
         Tensor(split_beta[1]->data(), DType::FP32, {kGatingShardHeads, tokens})};
-    const std::array<ninfer::WorkspaceArena*, 2> workspace{&*arena[0], &*arena[1]};
+    const std::array<ninfer::WorkspaceArena*, ninfer::kMaximumDevices> workspace{&*arena[0], &*arena[1]};
 
     retire_staging(ec);
     ops::gdn_gating_proj_column_parallel(x, ab_weight, a_log, dt_bias, workspace, g_out, beta_out, ec);
@@ -1183,36 +1183,36 @@ int verify_split_rejections(const ExecutionContext& ec) {
     fake.k     = kInputRows;
 
     expect_throw("token count", [&] {
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kInputRows, 2}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(x0.p, DType::BF16, {kInputRows, 2}),
                                       Tensor(x1.p, DType::BF16, {kInputRows, 1})};
-        const std::array<Tensor, 2> qkv{Tensor(qkv0.p, DType::BF16, {kShardQkvRows, 2}),
+        const std::array<Tensor, ninfer::kMaximumDevices> qkv{Tensor(qkv0.p, DType::BF16, {kShardQkvRows, 2}),
                                         Tensor(qkv1.p, DType::BF16, {kShardQkvRows, 1})};
-        const std::array<Tensor, 2> z{Tensor(z0.p, DType::BF16, {kShardValueRows, 2}),
+        const std::array<Tensor, ninfer::kMaximumDevices> z{Tensor(z0.p, DType::BF16, {kShardValueRows, 2}),
                                       Tensor(z1.p, DType::BF16, {kShardValueRows, 1})};
-        ops::gdn_input_proj_column_parallel(x, {fake, fake}, qkv, z, ec);
+        ops::gdn_input_proj_column_parallel(x, std::array<Weight, ninfer::kMaximumDevices>{fake, fake}, qkv, z, ec);
     });
 
     expect_throw("column K", [&] {
         Weight other = fake;
         other.k      = kInputRows / 2;
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kInputRows, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(x0.p, DType::BF16, {kInputRows, 1}),
                                       Tensor(x1.p, DType::BF16, {kInputRows / 2, 1})};
-        const std::array<Tensor, 2> qkv{Tensor(qkv0.p, DType::BF16, {kShardQkvRows, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> qkv{Tensor(qkv0.p, DType::BF16, {kShardQkvRows, 1}),
                                         Tensor(qkv1.p, DType::BF16, {kShardQkvRows, 1})};
-        const std::array<Tensor, 2> z{Tensor(z0.p, DType::BF16, {kShardValueRows, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> z{Tensor(z0.p, DType::BF16, {kShardValueRows, 1}),
                                       Tensor(z1.p, DType::BF16, {kShardValueRows, 1})};
-        ops::gdn_input_proj_column_parallel(x, {fake, other}, qkv, z, ec);
+        ops::gdn_input_proj_column_parallel(x, std::array<Weight, ninfer::kMaximumDevices>{fake, other}, qkv, z, ec);
     });
 
     expect_throw("tp1 context", [&] {
         const ExecutionContext single({0});
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kInputRows, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(x0.p, DType::BF16, {kInputRows, 1}),
                                       Tensor(x1.p, DType::BF16, {kInputRows, 1})};
-        const std::array<Tensor, 2> qkv{Tensor(qkv0.p, DType::BF16, {kShardQkvRows, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> qkv{Tensor(qkv0.p, DType::BF16, {kShardQkvRows, 1}),
                                         Tensor(qkv1.p, DType::BF16, {kShardQkvRows, 1})};
-        const std::array<Tensor, 2> z{Tensor(z0.p, DType::BF16, {kShardValueRows, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> z{Tensor(z0.p, DType::BF16, {kShardValueRows, 1}),
                                       Tensor(z1.p, DType::BF16, {kShardValueRows, 1})};
-        ops::gdn_input_proj_column_parallel(x, {fake, fake}, qkv, z, single);
+        ops::gdn_input_proj_column_parallel(x, std::array<Weight, ninfer::kMaximumDevices>{fake, fake}, qkv, z, single);
     });
 
     std::cout << (failures ? "FAIL" : "OK") << " split rejections\n";

@@ -98,7 +98,7 @@
 //     (`ProgramImplCore::advance_prefill`), which is NOT part of the CUDA-graph-capturable decode
 //     path (prefill is never captured, at tp1 or tp2), so it cannot disturb decode-graph capture,
 //     node counts, or `use_cuda_graph` behaviour. `io.logits` is rank 0's persistent window at BOTH
-//     tp1 and tp2 (`logits_tp2` gathers into the same destination `copy_round_token()` reads
+//     tp1 and tp2 (`logits_parallel` gathers into the same destination `copy_round_token()` reads
 //     `io.token` from), so no tp-specific code is needed.
 //   - `PreparedPrompt::debug_token_ids()` -- the chat-templated raw token ids behind a prepared
 //     prompt, so this tool can build "prompt ++ forced continuation" contexts through the public

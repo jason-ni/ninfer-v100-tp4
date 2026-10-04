@@ -72,6 +72,17 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
         return tokens == 1 || tokens >= 5 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
     case Fp8Problem::AttnInputTp2Column:
         return tokens >= 12 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    case Fp8Problem::GdnInputTp4Column:
+        return tokens >= 11 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    case Fp8Problem::VocabularyTp4Column:
+        return Fp8LinearRoute::A16;
+    case Fp8Problem::Residual6144Tp4Row:
+    case Fp8Problem::Residual17408Tp4Row:
+        return tokens >= 25 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    case Fp8Problem::MlpGateUpTp4Column:
+        return tokens == 1 || tokens >= 5 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    case Fp8Problem::AttnInputTp4Column:
+        return tokens >= 12 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
     }
     throw std::logic_error("unreachable FP8 linear problem");
 }
@@ -147,6 +158,17 @@ bool interval_uses_a8(Fp8Problem problem, LinearPolicy policy, std::int32_t min_
     case Fp8Problem::MlpGateUpTp2Column:
         return min_tokens == 1 || max_tokens >= 5;
     case Fp8Problem::AttnInputTp2Column:
+        return max_tokens >= 12;
+    case Fp8Problem::GdnInputTp4Column:
+        return max_tokens >= 11;
+    case Fp8Problem::VocabularyTp4Column:
+        return false;
+    case Fp8Problem::Residual6144Tp4Row:
+    case Fp8Problem::Residual17408Tp4Row:
+        return max_tokens >= 25;
+    case Fp8Problem::MlpGateUpTp4Column:
+        return min_tokens == 1 || max_tokens >= 5;
+    case Fp8Problem::AttnInputTp4Column:
         return max_tokens >= 12;
     }
     throw std::logic_error("unreachable FP8 linear problem");

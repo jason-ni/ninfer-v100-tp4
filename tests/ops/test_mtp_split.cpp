@@ -5,7 +5,7 @@
 //
 // This is an OP-LEVEL suite. It proves that every op the MTP verify round touches is split-capable
 // and that those ops compose; it does not exercise the runtime's own tp2 MTP plumbing
-// (`TextContext::mtp_forward_stem_tp2` in src/targets/qwen3_6/impl/runtime/text_context_impl.h,
+// (`TextContext::mtp_forward_stem_parallel` in src/targets/qwen3_6/impl/runtime/text_context_impl.h,
 // `Variant::mtp_post_mixer` / `Variant::mtp_attention_projection` in
 // src/targets/qwen3_6_27b/impl/variant.cpp), which is covered end to end on real weights by
 // tests/targets/qwen3_6_27b/test_engine_mtp_tp2_real.cpp.
@@ -817,25 +817,25 @@ int run_mtp_round(const ExecutionContext& ec, const ops::PeerEvents& events,
 
     const auto tensor2 = [](std::array<std::optional<DeviceBuffer>, 2>& buffers, DType dtype,
                             std::initializer_list<std::int32_t> shape) {
-        return std::array<Tensor, 2>{Tensor(buffers[0]->p, dtype, shape),
+        return std::array<Tensor, ninfer::kMaximumDevices>{Tensor(buffers[0]->p, dtype, shape),
                                      Tensor(buffers[1]->p, dtype, shape)};
     };
 
-    const std::array<Tensor, 2> t_e  = tensor2(e_d, DType::BF16, {kHidden, tokens});
-    const std::array<Tensor, 2> t_h  = tensor2(h_d, DType::BF16, {kHidden, tokens});
-    const std::array<Tensor, 2> t_x  = tensor2(x_d, DType::BF16, {kHidden, tokens});
-    const std::array<Tensor, 2> t_ah = tensor2(ah_d, DType::BF16, {kHidden, tokens});
-    const std::array<Tensor, 2> t_packed =
+    const std::array<Tensor, ninfer::kMaximumDevices> t_e  = tensor2(e_d, DType::BF16, {kHidden, tokens});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_h  = tensor2(h_d, DType::BF16, {kHidden, tokens});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_x  = tensor2(x_d, DType::BF16, {kHidden, tokens});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_ah = tensor2(ah_d, DType::BF16, {kHidden, tokens});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_packed =
         tensor2(packed_d, DType::BF16, {kAttnShardRows, tokens});
-    const std::array<Tensor, 2> t_o       = tensor2(o_d, DType::BF16, {kHidden, tokens});
-    const std::array<Tensor, 2> t_mh      = tensor2(mh_d, DType::BF16, {kHidden, tokens});
-    const std::array<Tensor, 2> t_gate_up =
+    const std::array<Tensor, ninfer::kMaximumDevices> t_o       = tensor2(o_d, DType::BF16, {kHidden, tokens});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_mh      = tensor2(mh_d, DType::BF16, {kHidden, tokens});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_gate_up =
         tensor2(gate_up_d, DType::BF16, {kGateUpShardRows, tokens});
-    const std::array<Tensor, 2> t_act =
+    const std::array<Tensor, ninfer::kMaximumDevices> t_act =
         tensor2(act_d, DType::BF16, {kShardIntermediate, tokens});
-    const std::array<Tensor, 2> t_delta   = tensor2(delta_d, DType::BF16, {kHidden, tokens});
-    const std::array<Tensor, 2> t_hidden  = tensor2(hidden_d, DType::BF16, {kHidden, tokens});
-    const std::array<Tensor, 2> t_staging = tensor2(staging_d, DType::BF16, {kHidden, tokens});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_delta   = tensor2(delta_d, DType::BF16, {kHidden, tokens});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_hidden  = tensor2(hidden_d, DType::BF16, {kHidden, tokens});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_staging = tensor2(staging_d, DType::BF16, {kHidden, tokens});
 
     // -- stage 1: norms (replicated) then the ROW-PARALLEL fc. No pack: rank 0 feeds `e`
     //    (packed rows [0,5120)) and rank 1 feeds `h` (rows [5120,10240)) -- see mtp_pack.h.
@@ -853,8 +853,8 @@ int run_mtp_round(const ExecutionContext& ec, const ops::PeerEvents& events,
     }
     synchronize_both(ec);
     {
-        const std::array<Tensor, 2> fc_input{t_e[0], t_h[1]};
-        const std::array<Weight, 2> fc_w{weights.fc.shard[0].weight, weights.fc.shard[1].weight};
+        const std::array<Tensor, ninfer::kMaximumDevices> fc_input{t_e[0], t_h[1]};
+        const std::array<Weight, ninfer::kMaximumDevices> fc_w{weights.fc.shard[0].weight, weights.fc.shard[1].weight};
         ops::linear_row_parallel(fc_input, fc_w, t_x, t_staging, ec, events);
     }
     synchronize_both(ec);
@@ -895,7 +895,7 @@ int run_mtp_round(const ExecutionContext& ec, const ops::PeerEvents& events,
 
     // -- stage 3: COLUMN-PARALLEL fused attention projection, then the shard split_attn_in.
     {
-        const std::array<Weight, 2> w{weights.attn.shard[0].weight, weights.attn.shard[1].weight};
+        const std::array<Weight, ninfer::kMaximumDevices> w{weights.attn.shard[0].weight, weights.attn.shard[1].weight};
         ops::linear_column_parallel(t_ah, w, t_packed, ec);
     }
     synchronize_both(ec);
@@ -984,10 +984,10 @@ int run_mtp_round(const ExecutionContext& ec, const ops::PeerEvents& events,
 
     // -- stage 5: ROW-PARALLEL o_proj, then the replicated residual add.
     {
-        const std::array<Tensor, 2> attn_flat{
+        const std::array<Tensor, ninfer::kMaximumDevices> attn_flat{
             Tensor(attn_d[0]->p, DType::BF16, {kOProjShardK, tokens}),
             Tensor(attn_d[1]->p, DType::BF16, {kOProjShardK, tokens})};
-        const std::array<Weight, 2> w{weights.o_proj.shard[0].weight,
+        const std::array<Weight, ninfer::kMaximumDevices> w{weights.o_proj.shard[0].weight,
                                       weights.o_proj.shard[1].weight};
         ops::linear_row_parallel(attn_flat, w, t_o, t_staging, ec, events);
     }
@@ -1018,7 +1018,7 @@ int run_mtp_round(const ExecutionContext& ec, const ops::PeerEvents& events,
 
     // -- stage 6: COLUMN-PARALLEL gate_up + local silu_mul over the shard's own halves.
     {
-        const std::array<Weight, 2> w{weights.gate_up.shard[0].weight,
+        const std::array<Weight, ninfer::kMaximumDevices> w{weights.gate_up.shard[0].weight,
                                       weights.gate_up.shard[1].weight};
         ops::linear_column_parallel(t_mh, w, t_gate_up, ec);
     }
@@ -1083,7 +1083,7 @@ int run_mtp_round(const ExecutionContext& ec, const ops::PeerEvents& events,
 
     // -- stage 8: ROW-PARALLEL down + residual, then the final norm.
     {
-        const std::array<Weight, 2> w{weights.down.shard[0].weight, weights.down.shard[1].weight};
+        const std::array<Weight, ninfer::kMaximumDevices> w{weights.down.shard[0].weight, weights.down.shard[1].weight};
         ops::linear_row_parallel(t_act, w, t_delta, t_staging, ec, events);
     }
     synchronize_both(ec);
@@ -1964,31 +1964,31 @@ int run_conv_case(const ExecutionContext& ec, const ConvCase& test_case) {
 
     const auto make_pair = [](std::array<std::optional<DeviceBuffer>, 2>& buffers, DType dtype,
                               std::initializer_list<std::int32_t> shape) {
-        return std::array<Tensor, 2>{Tensor(buffers[0]->p, dtype, shape),
+        return std::array<Tensor, ninfer::kMaximumDevices>{Tensor(buffers[0]->p, dtype, shape),
                                      Tensor(buffers[1]->p, dtype, shape)};
     };
 
-    const std::array<Weight, 2> weights{shard_w[0]->weight, shard_w[1]->weight};
-    const std::array<Weight, 2> value_z_weights{
+    const std::array<Weight, ninfer::kMaximumDevices> weights{shard_w[0]->weight, shard_w[1]->weight};
+    const std::array<Weight, ninfer::kMaximumDevices> value_z_weights{
         split_storage ? shard_vz[0]->weight : Weight{},
         split_storage ? shard_vz[1]->weight : Weight{}};
-    const std::array<Tensor, 2> t_x = make_pair(x_d, DType::BF16, {kHidden, width, batch});
-    const std::array<Tensor, 2> t_conv_w =
+    const std::array<Tensor, ninfer::kMaximumDevices> t_x = make_pair(x_d, DType::BF16, {kHidden, width, batch});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_conv_w =
         make_pair(conv_w_d, DType::BF16, {kShardConvChannels, 4});
-    const std::array<Tensor, 2> t_states =
+    const std::array<Tensor, ninfer::kMaximumDevices> t_states =
         make_pair(states_d, DType::BF16, {kShardConvChannels, 3, slots});
-    const std::array<Tensor, 2> t_initial = make_pair(initial_d, DType::I32, {batch});
-    const std::array<Tensor, 2> t_base    = make_pair(base_d, DType::I32, {batch});
-    const std::array<Tensor, 2> t_valid =
+    const std::array<Tensor, ninfer::kMaximumDevices> t_initial = make_pair(initial_d, DType::I32, {batch});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_base    = make_pair(base_d, DType::I32, {batch});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_valid =
         test_case.mixed_widths ? make_pair(valid_d, DType::I32, {batch})
-                               : std::array<Tensor, 2>{Tensor{}, Tensor{}};
-    const std::array<Tensor, 2> t_query = make_pair(query_d, DType::BF16, {1024, width, batch});
-    const std::array<Tensor, 2> t_key   = make_pair(key_d, DType::BF16, {1024, width, batch});
-    const std::array<Tensor, 2> t_value = make_pair(value_d, DType::BF16, {3072, width, batch});
-    const std::array<Tensor, 2> t_z     = make_pair(z_d, DType::BF16, {3072, width, batch});
-    const std::array<Tensor, 2> t_record =
+                               : std::array<Tensor, ninfer::kMaximumDevices>{Tensor{}, Tensor{}};
+    const std::array<Tensor, ninfer::kMaximumDevices> t_query = make_pair(query_d, DType::BF16, {1024, width, batch});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_key   = make_pair(key_d, DType::BF16, {1024, width, batch});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_value = make_pair(value_d, DType::BF16, {3072, width, batch});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_z     = make_pair(z_d, DType::BF16, {3072, width, batch});
+    const std::array<Tensor, ninfer::kMaximumDevices> t_record =
         make_pair(record_d, DType::BF16, {kShardConvChannels, width, batch});
-    const std::array<WorkspaceArena*, 2> workspace{&*arena[0], &*arena[1]};
+    const std::array<WorkspaceArena*, ninfer::kMaximumDevices> workspace{&*arena[0], &*arena[1]};
 
     retire_staging(ec);
     if (split_storage) {
@@ -2204,10 +2204,10 @@ int run_leg_d(const ExecutionContext& ec, const ops::PeerEvents& events) {
             half[slot].emplace(half_elements * sizeof(std::uint16_t));
             half[slot]->fill(0xff);
         }
-        const std::array<Tensor, 2> x{Tensor(x_d[0]->p, DType::BF16, {kHidden, tokens}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(x_d[0]->p, DType::BF16, {kHidden, tokens}),
                                       Tensor(x_d[1]->p, DType::BF16, {kHidden, tokens})};
-        const std::array<Weight, 2> w{shard[0]->weight, shard[1]->weight};
-        const std::array<Tensor, 2> out{
+        const std::array<Weight, ninfer::kMaximumDevices> w{shard[0]->weight, shard[1]->weight};
+        const std::array<Tensor, ninfer::kMaximumDevices> out{
             Tensor(half[0]->data(), DType::BF16, {kDraftShardRows, tokens}),
             Tensor(half[1]->data(), DType::BF16, {kDraftShardRows, tokens})};
         retire_staging(ec);
@@ -2238,14 +2238,14 @@ int run_leg_d(const ExecutionContext& ec, const ops::PeerEvents& events) {
         }
         retire_staging(ec);
         for (std::int32_t token = 0; token < tokens; ++token) {
-            const std::array<Tensor, 2> part{
+            const std::array<Tensor, ninfer::kMaximumDevices> part{
                 Tensor(byte_offset(half[0]->data(), static_cast<std::size_t>(token) * kDraftShardRows,
                                    sizeof(std::uint16_t)),
                        DType::BF16, {1, kDraftShardRows}),
                 Tensor(byte_offset(half[1]->data(), static_cast<std::size_t>(token) * kDraftShardRows,
                                    sizeof(std::uint16_t)),
                        DType::BF16, {1, kDraftShardRows})};
-            const std::array<Tensor, 2> destination{
+            const std::array<Tensor, ninfer::kMaximumDevices> destination{
                 Tensor(byte_offset(full[0]->data(), static_cast<std::size_t>(token) * kDraftRows,
                                    sizeof(std::uint16_t)),
                        DType::BF16, {1, kDraftRows}),

@@ -26,6 +26,12 @@ struct CutlassSections<Fp8GdnInputTp2ColumnGeometry> {
     static constexpr std::int32_t kZRows   = 3072;
 };
 
+template <>
+struct CutlassSections<Fp8GdnInputTp4ColumnGeometry> {
+    static constexpr std::int32_t kQkvRows = 2560;
+    static constexpr std::int32_t kZRows   = 1536;
+};
+
 template <class Geometry, class Allocator>
 Tensor allocate_projected(Allocator& allocator, int tokens) {
     return allocator.alloc(DType::BF16, {Geometry::kOutputRows, tokens});
@@ -87,6 +93,10 @@ void fp8_gdn_input_cutlass_sm70_launch(const Tensor& x, const Weight& weight, Te
 void fp8_gdn_input_cutlass_sm70_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
                                              Tensor& z, WorkspaceArena& workspace,
                                              cudaStream_t stream) {
+    if (weight.n == Fp8GdnInputTp4ColumnGeometry::kOutputRows) {
+        launch<Fp8GdnInputTp4ColumnGeometry>(x, weight, qkv, z, workspace, stream);
+        return;
+    }
     launch<Fp8GdnInputTp2ColumnGeometry>(x, weight, qkv, z, workspace, stream);
 }
 

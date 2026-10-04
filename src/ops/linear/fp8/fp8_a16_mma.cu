@@ -62,6 +62,12 @@ void launch_fp8_vocabulary_a16_mma(const Tensor& x, const Weight& weight, Tensor
         launchers<Fp8VocabularyTp2ColumnGeometry>()[index](x, weight, out, stream);
         return;
     }
+    // TP4 column shard: the same kernel and schedule at a quarter of the vocabulary rows.
+    if (weight.n == Fp8VocabularyTp4ColumnGeometry::kOutputRows &&
+        weight.k == Fp8VocabularyTp4ColumnGeometry::kInputRows) {
+        launchers<Fp8VocabularyTp4ColumnGeometry>()[index](x, weight, out, stream);
+        return;
+    }
     throw std::invalid_argument("fp8 vocabulary A16 MMA: invalid exact problem");
 }
 

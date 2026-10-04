@@ -28,9 +28,14 @@ void fp8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& 
     launch<Fp8GdnInputGeometry, Fp8GdnInputOutput>(x, weight, qkv, z, stream);
 }
 
-// The tp2 column shard.
+// The tp2/tp4 column shards.
 void fp8_gdn_input_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
                                        Tensor& z, cudaStream_t stream) {
+    if (weight.n == Fp8GdnInputTp4ColumnGeometry::kOutputRows) {
+        launch<Fp8GdnInputTp4ColumnGeometry, Fp8GdnInputShardOutput<Fp8GdnInputTp4ColumnGeometry>>(
+            x, weight, qkv, z, stream);
+        return;
+    }
     launch<Fp8GdnInputTp2ColumnGeometry, Fp8GdnInputShardOutput<Fp8GdnInputTp2ColumnGeometry>>(
         x, weight, qkv, z, stream);
 }

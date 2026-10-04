@@ -1,6 +1,8 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
 
+#include <nlohmann/json.hpp>
+
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -74,8 +76,9 @@ KvCacheStorage parse_kv_dtype(const char* text) {
 
 int parse_tp(const char* text) {
     const int value = parse_nonnegative_int(text, "tp");
-    if (value != 1 && value != 2) {
-        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1 or 2)");
+    if (value != 1 && value != 2 && value != 4) {
+        throw std::invalid_argument(std::string("invalid tp: ") + text +
+                                    " (must be 1, 2, or 4)");
     }
     return value;
 }
@@ -93,8 +96,8 @@ std::vector<int> parse_devices(const char* text) {
         if (comma == std::string_view::npos) { break; }
         start = comma + 1;
     }
-    if (result.empty() || result.size() > 2) {
-        throw std::invalid_argument("--devices must list 1 or 2 device ids");
+    if (result.empty() || result.size() > 4) {
+        throw std::invalid_argument("--devices must list 1 to 4 device ids");
     }
     return result;
 }
@@ -106,6 +109,63 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
     return KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(value));
 }
 
+// Applies a --chat-template-kwargs JSON object as server-level chat-template defaults. Only the
+// closed set of options the loaded templates expose is accepted; unknown keys are rejected, mirroring
+// the request-body chat_template_kwargs contract. For the keys it names the JSON value overrides the
+// individual flags (a flag/JSON disagreement is a startup error).
+void apply_chat_template_kwargs(const std::string& text, ServeOptions& options,
+                                bool preserve_thinking_explicit, bool enable_thinking_explicit) {
+    nlohmann::json parsed;
+    try {
+        parsed = nlohmann::json::parse(text);
+    } catch (const std::exception&) {
+        throw std::invalid_argument("--chat-template-kwargs is not valid JSON: " + text);
+    }
+    if (!parsed.is_object()) {
+        throw std::invalid_argument("--chat-template-kwargs must be a JSON object");
+    }
+    for (auto it = parsed.begin(); it != parsed.end(); ++it) {
+        const std::string key = it.key();
+        if (key == "preserve_thinking") {
+            if (!it.value().is_boolean()) {
+                throw std::invalid_argument(
+                    "--chat-template-kwargs.preserve_thinking must be a boolean");
+            }
+            const bool value = it.value().get<bool>();
+            if (preserve_thinking_explicit && options.preserve_thinking != value) {
+                throw std::invalid_argument("--preserve-thinking conflicts with "
+                                            "--chat-template-kwargs.preserve_thinking");
+            }
+            options.preserve_thinking = value;
+        } else if (key == "enable_thinking") {
+            if (!it.value().is_boolean()) {
+                throw std::invalid_argument(
+                    "--chat-template-kwargs.enable_thinking must be a boolean");
+            }
+            const bool value = it.value().get<bool>();
+            if (enable_thinking_explicit && options.enable_thinking != value) {
+                throw std::invalid_argument("--no-thinking conflicts with "
+                                            "--chat-template-kwargs.enable_thinking");
+            }
+            options.enable_thinking = value;
+        } else if (key == "reasoning_effort") {
+            if (!it.value().is_string()) {
+                throw std::invalid_argument(
+                    "--chat-template-kwargs.reasoning_effort must be a string");
+            }
+            const auto effort = parse_requested_reasoning_effort(it.value().get<std::string>());
+            if (!effort) {
+                throw std::invalid_argument(
+                    "--chat-template-kwargs.reasoning_effort must be one of none, minimal, low, "
+                    "medium, high, xhigh, or max");
+            }
+            options.reasoning_effort_default = *effort;
+        } else {
+            throw std::invalid_argument("--chat-template-kwargs." + key + " is not supported");
+        }
+    }
+}
+
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
@@ -114,7 +174,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--rope native|yarn] [--yarn-factor F] [--yarn-origin O] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2] "
+           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2|4] "
            "[--devices N,N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -122,8 +182,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
-           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
+           "[--vision] [--cuda-graph|--no-cuda-graph] [--no-prefix-reuse] "
+            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+            "[--chat-template-kwargs JSON] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
@@ -147,13 +208,18 @@ std::string serve_usage_text(const char* argv0) {
            "       Prefix reuse supports --tp 2 with --spec mtp, including exact prompt hits.\n"
            "       Reuse resumes a retained frontier or complete turn/response checkpoint;\n"
            "       an arbitrary matching token prefix is not a reusable checkpoint.\n"
-           "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
-           "       sampler defaults come from the loaded model and resolved thinking mode; "
+            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+            "       --chat-template-kwargs sets default chat-template options as a JSON object, e.g.\n"
+            "       '{\"preserve_thinking\": true, \"reasoning_effort\": \"low\"}'. Supported keys are\n"
+            "       preserve_thinking (bool), enable_thinking (bool), and reasoning_effort\n"
+            "       (none|minimal|low|medium|high|xhigh|max). It overrides --no-thinking and\n"
+            "--preserve-thinking for the keys it names; requests may still override each field.\n"
+            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n"
-           "       --tp selects the tensor-parallel degree (default 1); --tp 2 splits the model "
-           "across two GPUs and requires --devices; it supports --spec mtp and --spec dflash, "
-           "but not --vision.\n"
+           "       --tp selects the tensor-parallel degree (default 1); --tp 2 or --tp 4 splits "
+           "the model across that many GPUs and requires --devices; it supports --spec mtp, "
+           "and --spec dflash at --tp 2, but not --vision.\n"
            "       --devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
            "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
            "primary device.\n"
@@ -163,10 +229,11 @@ std::string serve_usage_text(const char* argv0) {
            "1048576); --yarn-origin must equal the artifact\'s registered native capacity (262144) "
            "and defaults to it, --yarn-factor defaults to 4.0. YaRN works at either --tp width and "
            "is rejected with --vision or --spec dflash.\n"
-           "       --no-cuda-graph runs decode eagerly. At --tp 2 that is the same two-stream "
-           "forward pass with cross-device event synchronization, in place of one captured "
-           "cross-device graph; it is the escape hatch if capture ever misbehaves, and it "
-           "produces the same tokens.\n";
+           "       --cuda-graph captures one cross-device decode graph; --no-cuda-graph runs the "
+           "same multi-stream forward pass eagerly with cross-device event synchronization. The two "
+           "produce the same tokens. Eager is the default at --tp > 1 because on this V100 target "
+           "the multi-device graph replays with GPU idle bubbles and is slower than eager; --tp 1 "
+           "defaults to graphs.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -186,6 +253,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool kv_capacity_explicit        = false;
     bool device_explicit             = false;
     bool devices_explicit            = false;
+    bool preserve_thinking_explicit  = false;
+    bool enable_thinking_explicit    = false;
+    bool cuda_graph_explicit         = false;
+    std::string chat_template_kwargs;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -306,16 +377,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             default_max_tokens_explicit = true;
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--cuda-graph") {
+            options.use_cuda_graph = true;
+            cuda_graph_explicit    = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+            cuda_graph_explicit    = true;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
-            options.enable_thinking = false;
+            options.enable_thinking      = false;
+            enable_thinking_explicit     = true;
         } else if (arg == "--preserve-thinking") {
-            options.preserve_thinking = true;
+            options.preserve_thinking    = true;
+            preserve_thinking_explicit   = true;
+        } else if (arg == "--chat-template-kwargs") {
+            chat_template_kwargs = require_value("--chat-template-kwargs");
+            if (chat_template_kwargs.empty()) {
+                throw std::invalid_argument("--chat-template-kwargs must not be empty");
+            }
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--temperature") {
@@ -344,6 +426,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + arg);
         }
     }
+    if (!chat_template_kwargs.empty()) {
+        apply_chat_template_kwargs(chat_template_kwargs, options, preserve_thinking_explicit,
+                                   enable_thinking_explicit);
+    }
+    if (options.reasoning_effort_default &&
+        *options.reasoning_effort_default != RequestedReasoningEffort::None &&
+        !options.enable_thinking) {
+        throw std::invalid_argument(
+            "--chat-template-kwargs reasoning_effort cannot be combined with disabled thinking "
+            "(--no-thinking / enable_thinking=false)");
+    }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
@@ -358,6 +451,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     } else if (options.tp == 1) {
         options.devices = {options.device};
     }
+    if (!cuda_graph_explicit) { options.use_cuda_graph = options.tp <= 1; }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }

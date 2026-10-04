@@ -129,7 +129,7 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     return qwen3_6::make_frontend(model.impl_->data.frontend,
                                   qwen3_6::FrontendOptions{
-                                      .vision_enabled = model.impl_->data.runtime.features.vision,
+                                      .vision_enabled = model.impl_->data.view(0).features.vision,
                                       .max_context    = options.max_context,
                                       .media_cache_bytes        = options.media_cache_bytes,
                                       .media_live_bytes         = options.media_live_bytes,
@@ -152,11 +152,12 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan,
         throw std::invalid_argument(
             "loaded model shard width does not match the execution context");
     }
-    const detail::RuntimeModelView* peer =
-        data.runtime_peer.has_value() ? &*data.runtime_peer : nullptr;
-    return qwen3_6::create_program<detail::Variant>(data.runtime, peer,
-                                                   model.impl_->weights_profile, std::move(plan),
-                                                   execution);
+    std::array<const detail::RuntimeModelView*, artifact::kMaximumDevices> models{};
+    for (int rank = 0; rank < execution.tp; ++rank) {
+        models[static_cast<std::size_t>(rank)] = &data.view(rank);
+    }
+    return qwen3_6::create_program<detail::Variant>(models, model.impl_->weights_profile,
+                                                   std::move(plan), execution);
 }
 
 } // namespace ninfer::targets::qwen3_6_27b

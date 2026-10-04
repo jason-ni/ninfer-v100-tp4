@@ -56,14 +56,17 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
     std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end) {
-    std::optional<TpExecution> tp = tp_execution(state.execution);
-    if (tp) {
+    auto tp = tp_execution(state.execution);
+    if (state.execution.tp > 1) {
         // The per-sequence MTP KV window is request state, so it comes from the PrefillContext
         // rather than from the process-lifetime peer core: the MTP prefill appends and reads
         // through the execution view, unlike the text prefill, which drives the batch cache.
-        tp->mtp_kv = state.mtp_kv_peer;
-        if (tp->mtp_kv.valid() != state.mtp_kv.valid()) {
-            throw std::logic_error("tensor-parallel MTP KV windows disagree between ranks");
+        for (int rank = 1; rank < state.execution.tp; ++rank) {
+            TpExecution& peer = *tp[rank];
+            peer.mtp_kv = state.mtp_kv_peer[rank];
+            if (peer.mtp_kv.valid() != state.mtp_kv.valid()) {
+                throw std::logic_error("tensor-parallel MTP KV windows disagree between ranks");
+            }
         }
     }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
@@ -71,7 +74,7 @@ PrefillChunkResult prefill_text_chunk(
                      state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                     tp ? &*tp : nullptr);
+                     state.execution.tp > 1 ? &tp : nullptr);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
@@ -148,25 +151,20 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
                            bridge.rope_position, false, composed_embedding);
 }
 
-std::array<Tensor, 2> resume_hidden(ExecutionCore& execution, const Tensor& hidden) {
+std::array<Tensor, kMaximumDevices> resume_hidden(ExecutionCore& execution, const Tensor& hidden) {
     if (hidden.dtype != DType::BF16 || hidden.ne[0] != TextConfig::hidden || hidden.ne[1] != 1 ||
         hidden.ne[2] != 1 || hidden.ne[3] != 1 || hidden.data == nullptr) {
         throw std::invalid_argument("prefix resume requires BF16 [hidden,1]");
     }
-    std::array<Tensor, 2> result{hidden, {}};
-    if (execution.peer == nullptr) { return result; }
-    const auto& peer = *execution.peer;
-    result[1] = peer.prefill_hidden->slice(1, 0, 1);
-    const CurrentDevice restore;
-    CUDA_CHECK(cudaSetDevice(execution.device.device));
-    CUDA_CHECK(cudaEventRecord(peer.events->inputs_ready(0), execution.device.stream));
-    CUDA_CHECK(cudaSetDevice(peer.device->device));
-    CUDA_CHECK(cudaStreamWaitEvent(peer.device->stream, peer.events->inputs_ready(0), 0));
-    CUDA_CHECK(cudaMemcpyAsync(result[1].data, hidden.data, hidden.bytes(),
-                               cudaMemcpyDeviceToDevice, peer.device->stream));
-    CUDA_CHECK(cudaEventRecord(peer.events->pull_done(1), peer.device->stream));
-    CUDA_CHECK(cudaSetDevice(execution.device.device));
-    CUDA_CHECK(cudaStreamWaitEvent(execution.device.stream, peer.events->pull_done(1), 0));
+    std::array<Tensor, kMaximumDevices> result{};
+    result[0] = hidden;
+    if (execution.tp <= 1) { return result; }
+    for (int rank = 1; rank < execution.tp; ++rank) {
+        result[rank] = execution.peers[rank]->prefill_hidden->slice(1, 0, 1);
+    }
+    // Rank 0's retained hidden is authoritative: broadcast it to every peer's prefill scratch.
+    ops::broadcast_rank0(hidden, result, *execution.peers[1]->execution,
+                         *execution.peers[1]->events);
     return result;
 }
 
@@ -175,18 +173,26 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     const auto restored = resume_hidden(state.execution, hidden);
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
-    std::optional<TpExecution> tp = tp_execution(state.execution);
-    if (tp) {
-        tp->work->reset();
+    auto tp = tp_execution(state.execution);
+    for (int rank = 1; rank < state.execution.tp; ++rank) {
+        state.execution.peers[rank]->work->reset();
+    }
+    if (state.execution.tp > 1) {
         TextContext card(state.execution.device, state.execution.model, state.execution.work,
                          state.execution.rope_frequency, state.text_kv,
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk,
-                         state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache, &*tp);
-        card.target_logits(restored, {logits, tp->io->logits.slice(1, 0, 1)});
+                         state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                         &tp);
+        std::array<Tensor, kMaximumDevices> logit_slices{};
+        logit_slices[0] = logits;
+        for (int rank = 1; rank < state.execution.tp; ++rank) {
+            logit_slices[rank] = state.execution.peers[rank]->io->logits.slice(1, 0, 1);
+        }
+        card.target_logits(restored, logit_slices);
     } else {
         ops::linear(hidden, state.execution.model.output_head, logits,
-                     state.execution.device.stream);
+                    state.execution.device.stream);
     }
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
@@ -195,7 +201,9 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
     state.execution.work.reset();
-    if (tp) { tp->work->reset(); }
+    for (int rank = 1; rank < state.execution.tp; ++rank) {
+        state.execution.peers[rank]->work->reset();
+    }
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

@@ -80,6 +80,30 @@ void launch_fp8_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     case Fp8Problem::AttnInputTp2Column:
         launch_exact<Fp8AttnInputTp2ColumnGeometry>(x, weight, out, stream);
         return;
+    case Fp8Problem::VocabularyTp4Column:
+#ifdef NINFER_VOLTA_BUILD
+        launch_exact<Fp8VocabularyTp4ColumnGeometry>(x, weight, out, stream);
+        return;
+#else
+        break;
+#endif
+    // linear_add's tp4 row shards and gdn_input_proj's tp4 column shard, wired here for the same
+    // reasons as their tp2 counterparts above.
+    case Fp8Problem::Residual6144Tp4Row:
+        launch_exact<Fp8Residual6144Tp4RowGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Residual17408Tp4Row:
+        launch_exact<Fp8Residual17408Tp4RowGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::GdnInputTp4Column:
+        launch_exact<Fp8GdnInputTp4ColumnGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::MlpGateUpTp4Column:
+        launch_exact<Fp8MlpGateUpTp4ColumnGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::AttnInputTp4Column:
+        launch_exact<Fp8AttnInputTp4ColumnGeometry>(x, weight, out, stream);
+        return;
     }
     throw std::logic_error("FP8 vocabulary decode uses its A16 MMA route");
 }

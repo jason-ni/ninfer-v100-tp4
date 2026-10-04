@@ -146,12 +146,25 @@ using Nvfp4MlpGateUpTp2ColumnGeometry     = Nvfp4GemvGeometry<17408, 5120>;
 using Nvfp4Residual6144Tp2RowGeometry     = Nvfp4GemvGeometry<5120, 3072>;
 using Nvfp4Residual17408Tp2RowGeometry    = Nvfp4GemvGeometry<5120, 8704>;
 
+// --- TP4 shard geometries ---------------------------------------------------------------------
+//
+// The same four axes quartered: column-parallel output rows N/4 and row-parallel reduction K/4.
+// Divisibility holds for the registered 27B geometry (14336/4=3584, 16384/4=4096, 34816/4=8704,
+// 6144/4=1536, 17408/4=4352), all inside Nvfp4GemvGeometry's own 128-row / 64-column asserts.
+using Nvfp4AttnInputTp4ColumnGeometry  = Nvfp4GemvGeometry<3584, 5120>;
+using Nvfp4GdnInputTp4ColumnGeometry   = Nvfp4GemvGeometry<4096, 5120>;
+using Nvfp4MlpGateUpTp4ColumnGeometry  = Nvfp4GemvGeometry<8704, 5120>;
+using Nvfp4Residual6144Tp4RowGeometry  = Nvfp4GemvGeometry<5120, 1536>;
+using Nvfp4Residual17408Tp4RowGeometry = Nvfp4GemvGeometry<5120, 4352>;
+
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
 // Row-parallel activation halves: a rank quantizes only its own K block.
 using Nvfp4Activation3072Geometry = Nvfp4ActivationGeometry<3072>;
 using Nvfp4Activation8704Geometry = Nvfp4ActivationGeometry<8704>;
+using Nvfp4Activation1536Geometry = Nvfp4ActivationGeometry<1536>;
+using Nvfp4Activation4352Geometry = Nvfp4ActivationGeometry<4352>;
 
 enum class Nvfp4Problem : std::uint8_t {
     AttnInput,
@@ -169,6 +182,12 @@ enum class Nvfp4Problem : std::uint8_t {
     MlpGateUpTp2Column,
     Residual6144Tp2Row,
     Residual17408Tp2Row,
+    // TP4 shards. Appended for the same encoding-stability reason as the tp2 block above.
+    AttnInputTp4Column,
+    GdnInputTp4Column,
+    MlpGateUpTp4Column,
+    Residual6144Tp4Row,
+    Residual17408Tp4Row,
 };
 
 // The parent geometry a shard problem was split from, and the axis it was split on. Route
@@ -186,6 +205,16 @@ inline constexpr Nvfp4Problem nvfp4_parent_problem(Nvfp4Problem problem) {
     case Nvfp4Problem::Residual6144Tp2Row:
         return Nvfp4Problem::Residual6144;
     case Nvfp4Problem::Residual17408Tp2Row:
+        return Nvfp4Problem::Residual17408;
+    case Nvfp4Problem::AttnInputTp4Column:
+        return Nvfp4Problem::AttnInput;
+    case Nvfp4Problem::GdnInputTp4Column:
+        return Nvfp4Problem::GdnInput;
+    case Nvfp4Problem::MlpGateUpTp4Column:
+        return Nvfp4Problem::MlpGateUp;
+    case Nvfp4Problem::Residual6144Tp4Row:
+        return Nvfp4Problem::Residual6144;
+    case Nvfp4Problem::Residual17408Tp4Row:
         return Nvfp4Problem::Residual17408;
     case Nvfp4Problem::AttnInput:
     case Nvfp4Problem::GdnInput:
@@ -224,6 +253,26 @@ template <>
 struct Nvfp4ParentGeometry<Nvfp4Residual17408Tp2RowGeometry> {
     using Type = Nvfp4Residual17408Geometry;
 };
+template <>
+struct Nvfp4ParentGeometry<Nvfp4AttnInputTp4ColumnGeometry> {
+    using Type = Nvfp4AttnInputGeometry;
+};
+template <>
+struct Nvfp4ParentGeometry<Nvfp4GdnInputTp4ColumnGeometry> {
+    using Type = Nvfp4GdnInputGeometry;
+};
+template <>
+struct Nvfp4ParentGeometry<Nvfp4MlpGateUpTp4ColumnGeometry> {
+    using Type = Nvfp4MlpGateUpGeometry;
+};
+template <>
+struct Nvfp4ParentGeometry<Nvfp4Residual6144Tp4RowGeometry> {
+    using Type = Nvfp4Residual6144Geometry;
+};
+template <>
+struct Nvfp4ParentGeometry<Nvfp4Residual17408Tp4RowGeometry> {
+    using Type = Nvfp4Residual17408Geometry;
+};
 
 template <class Geometry>
 using Nvfp4ParentGeometryType = typename Nvfp4ParentGeometry<Geometry>::Type;
@@ -240,7 +289,12 @@ using Nvfp4ParentGeometryType = typename Nvfp4ParentGeometry<Geometry>::Type;
     X(GdnInputTp2Column, Nvfp4GdnInputTp2ColumnGeometry)                                           \
     X(MlpGateUpTp2Column, Nvfp4MlpGateUpTp2ColumnGeometry)                                         \
     X(Residual6144Tp2Row, Nvfp4Residual6144Tp2RowGeometry)                                         \
-    X(Residual17408Tp2Row, Nvfp4Residual17408Tp2RowGeometry)
+    X(Residual17408Tp2Row, Nvfp4Residual17408Tp2RowGeometry)                                         \
+    X(AttnInputTp4Column, Nvfp4AttnInputTp4ColumnGeometry)                                           \
+    X(GdnInputTp4Column, Nvfp4GdnInputTp4ColumnGeometry)                                             \
+    X(MlpGateUpTp4Column, Nvfp4MlpGateUpTp4ColumnGeometry)                                           \
+    X(Residual6144Tp4Row, Nvfp4Residual6144Tp4RowGeometry)                                           \
+    X(Residual17408Tp4Row, Nvfp4Residual17408Tp4RowGeometry)
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
 #define NINFER_NVFP4_MATCH(name, geometry)                                                         \
@@ -267,6 +321,14 @@ template <class Geometry>
 struct Nvfp4LinearDecodeProductionSchedule {
     using Type =
         Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+};
+
+// The tp4 residual-17408 row shard quarters K to 4352 = 2^8*17; the generic ValuesPerLane=16
+// (32*16 = 512-value phase) does not divide it, so pin ValuesPerLane=8 (256 -> 17 phases).
+template <>
+struct Nvfp4LinearDecodeProductionSchedule<Nvfp4Residual17408Tp4RowGeometry> {
+    using Type =
+        Nvfp4GemvSchedule<8, 2, 8, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
 };
 
 inline constexpr std::int32_t kNvfp4FirstSmallT = 2;
@@ -382,5 +444,37 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Tp2RowGeometry, Acti
 template <int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Tp2RowGeometry, ActiveTokens>
     : Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTokens> {};
+
+// Every tp4 shard inherits its parent's measured small-T schedule, like the tp2 shards above --
+// except the 17408 row shard, whose quartered K=4352=2^8*17 cannot take the parent's 16-value
+// (512) phase at every T; it is pinned to ValuesPerLane=8 so the 256-value phase divides it into 17.
+template <int ActiveTokens>
+struct Nvfp4LinearSmallTProductionSchedule<Nvfp4GdnInputTp4ColumnGeometry, ActiveTokens>
+    : Nvfp4LinearSmallTProductionSchedule<Nvfp4GdnInputGeometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Tp4RowGeometry, ActiveTokens>
+    : Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Geometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Nvfp4LinearSmallTProductionSchedule<Nvfp4AttnInputTp4ColumnGeometry, ActiveTokens>
+    : Nvfp4LinearSmallTProductionSchedule<Nvfp4AttnInputGeometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Nvfp4LinearSmallTProductionSchedule<Nvfp4MlpGateUpTp4ColumnGeometry, ActiveTokens>
+    : Nvfp4LinearSmallTProductionSchedule<Nvfp4MlpGateUpGeometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Tp4RowGeometry, ActiveTokens> {
+    static_assert(ActiveTokens >= kNvfp4FirstSmallT);
+    static_assert(ActiveTokens <= kNvfp4LastSmallT);
+    static constexpr int kWarpsPerCta       = ActiveTokens <= 13 ? (ActiveTokens <= 3 ? 16 : 4) : 4;
+    static constexpr int kValuesPerLane     = 8;
+    static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
+    using Type =
+        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
+                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+};
 
 } // namespace ninfer::ops::detail

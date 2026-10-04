@@ -429,13 +429,13 @@ int run_case(const Case& test_case, const ExecutionContext& ec) {
                 arena[slot].emplace(workspace_bytes);
             }
 
-            const std::array<Tensor, 2> x{Tensor(shard_x[0].p, DType::BF16, {kInputRows, tokens}),
+            const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(shard_x[0].p, DType::BF16, {kInputRows, tokens}),
                                           Tensor(shard_x[1].p, DType::BF16, {kInputRows, tokens})};
-            const std::array<Weight, 2> w{shard_device[0].weight, shard_device[1].weight};
-            const std::array<Tensor, 2> out{
+            const std::array<Weight, ninfer::kMaximumDevices> w{shard_device[0].weight, shard_device[1].weight};
+            const std::array<Tensor, ninfer::kMaximumDevices> out{
                 Tensor(split_out[0]->data(), DType::BF16, {kShardHalf, tokens}),
                 Tensor(split_out[1]->data(), DType::BF16, {kShardHalf, tokens})};
-            const std::array<ninfer::WorkspaceArena*, 2> workspace{&*arena[0], &*arena[1]};
+            const std::array<ninfer::WorkspaceArena*, ninfer::kMaximumDevices> workspace{&*arena[0], &*arena[1]};
 
             retire_staging(ec);
             ops::linear_swiglu_column_parallel(x, w, out, policy, workspace, ec);
@@ -620,14 +620,14 @@ int run_pipeline_case(const PipelineCase& test_case, const ExecutionContext& ec,
             swiglu_workspace_bytes(test_case.gate_up_qtype, test_case.policy, tokens), 1));
     }
     {
-        const std::array<Tensor, 2> x{Tensor(shard_x[0].p, DType::BF16, {kInputRows, tokens}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(shard_x[0].p, DType::BF16, {kInputRows, tokens}),
                                       Tensor(shard_x[1].p, DType::BF16, {kInputRows, tokens})};
-        const std::array<Weight, 2> w{gate_up_shard_device[0].weight,
+        const std::array<Weight, ninfer::kMaximumDevices> w{gate_up_shard_device[0].weight,
                                       gate_up_shard_device[1].weight};
-        const std::array<Tensor, 2> out{
+        const std::array<Tensor, ninfer::kMaximumDevices> out{
             Tensor(split_activation[0]->p, DType::BF16, {kShardHalf, tokens}),
             Tensor(split_activation[1]->p, DType::BF16, {kShardHalf, tokens})};
-        const std::array<ninfer::WorkspaceArena*, 2> workspace{&*swiglu_arena[0],
+        const std::array<ninfer::WorkspaceArena*, ninfer::kMaximumDevices> workspace{&*swiglu_arena[0],
                                                                 &*swiglu_arena[1]};
         retire_staging(ec);
         ops::linear_swiglu_column_parallel(x, w, out, test_case.policy, workspace, ec);
@@ -650,17 +650,17 @@ int run_pipeline_case(const PipelineCase& test_case, const ExecutionContext& ec,
             1));
     }
     {
-        const std::array<Tensor, 2> x{
+        const std::array<Tensor, ninfer::kMaximumDevices> x{
             Tensor(split_activation[0]->p, DType::BF16, {kShardHalf, tokens}),
             Tensor(split_activation[1]->p, DType::BF16, {kShardHalf, tokens})};
-        const std::array<Weight, 2> w{down_shard_device[0].weight, down_shard_device[1].weight};
-        const std::array<Tensor, 2> residual{
+        const std::array<Weight, ninfer::kMaximumDevices> w{down_shard_device[0].weight, down_shard_device[1].weight};
+        const std::array<Tensor, ninfer::kMaximumDevices> residual{
             Tensor(split_residual[0]->data(), DType::BF16, {kDownRows, tokens}),
             Tensor(split_residual[1]->data(), DType::BF16, {kDownRows, tokens})};
-        const std::array<Tensor, 2> staging_view{
+        const std::array<Tensor, ninfer::kMaximumDevices> staging_view{
             Tensor(staging[0]->p, DType::BF16, {kDownRows, tokens}),
             Tensor(staging[1]->p, DType::BF16, {kDownRows, tokens})};
-        const std::array<ninfer::WorkspaceArena*, 2> workspace{&*add_arena[0], &*add_arena[1]};
+        const std::array<ninfer::WorkspaceArena*, ninfer::kMaximumDevices> workspace{&*add_arena[0], &*add_arena[1]};
         retire_staging(ec);
         ops::linear_add_row_parallel(x, w, residual, staging_view, test_case.policy, workspace, ec,
                                     events);
@@ -829,40 +829,40 @@ int verify_split_rejections(const ExecutionContext& ec) {
     fake.padded_shape[1] = kInputRows;
 
     expect_throw("token count", [&] {
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kInputRows, 2}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(x0.p, DType::BF16, {kInputRows, 2}),
                                       Tensor(x1.p, DType::BF16, {kInputRows, 1})};
-        const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kShardHalf, 2}),
+        const std::array<Tensor, ninfer::kMaximumDevices> out{Tensor(out0.p, DType::BF16, {kShardHalf, 2}),
                                         Tensor(out1.p, DType::BF16, {kShardHalf, 1})};
-        ops::linear_swiglu_column_parallel(x, {fake, fake}, out, ec);
+        ops::linear_swiglu_column_parallel(x, std::array<Weight, ninfer::kMaximumDevices>{fake, fake}, out, ec);
     });
 
     expect_throw("column K", [&] {
         Weight other = fake;
         other.k      = kInputRows / 2;
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kInputRows, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(x0.p, DType::BF16, {kInputRows, 1}),
                                       Tensor(x1.p, DType::BF16, {kInputRows / 2, 1})};
-        const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kShardHalf, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> out{Tensor(out0.p, DType::BF16, {kShardHalf, 1}),
                                         Tensor(out1.p, DType::BF16, {kShardHalf, 1})};
-        ops::linear_swiglu_column_parallel(x, {fake, other}, out, ec);
+        ops::linear_swiglu_column_parallel(x, std::array<Weight, ninfer::kMaximumDevices>{fake, other}, out, ec);
     });
 
     expect_throw("tp1 context", [&] {
         const ExecutionContext single({0});
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kInputRows, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(x0.p, DType::BF16, {kInputRows, 1}),
                                       Tensor(x1.p, DType::BF16, {kInputRows, 1})};
-        const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kShardHalf, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> out{Tensor(out0.p, DType::BF16, {kShardHalf, 1}),
                                         Tensor(out1.p, DType::BF16, {kShardHalf, 1})};
-        ops::linear_swiglu_column_parallel(x, {fake, fake}, out, single);
+        ops::linear_swiglu_column_parallel(x, std::array<Weight, ninfer::kMaximumDevices>{fake, fake}, out, single);
     });
 
     expect_throw("unsupported format", [&] {
         Weight w8 = fake;
         w8.qtype  = QType::W8G32_F16S;
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kInputRows, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(x0.p, DType::BF16, {kInputRows, 1}),
                                       Tensor(x1.p, DType::BF16, {kInputRows, 1})};
-        const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kShardHalf, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> out{Tensor(out0.p, DType::BF16, {kShardHalf, 1}),
                                         Tensor(out1.p, DType::BF16, {kShardHalf, 1})};
-        ops::linear_swiglu_column_parallel(x, {w8, w8}, out, ec);
+        ops::linear_swiglu_column_parallel(x, std::array<Weight, ninfer::kMaximumDevices>{w8, w8}, out, ec);
     });
 
     std::cout << (failures ? "FAIL" : "OK") << " split rejections\n";

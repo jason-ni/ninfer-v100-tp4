@@ -175,7 +175,6 @@ namespace {
 
 constexpr std::int32_t kShardGateUpRows   = 17408;
 constexpr std::int32_t kShardInputRows    = 5120;
-constexpr std::int32_t kShardIntermediate = kShardGateUpRows / 2; // 8704
 
 void validate_swiglu_column_rank_semantics(const Tensor& x, const Weight& w, const Tensor& out,
                                            LinearPolicy policy) {
@@ -185,9 +184,8 @@ void validate_swiglu_column_rank_semantics(const Tensor& x, const Weight& w, con
     }
     const std::int32_t t = x.ne[1];
     const bool shard_shape =
-        x.ne[0] == kShardInputRows && out.ne[0] == kShardIntermediate &&
-        w.n == kShardGateUpRows && w.k == kShardInputRows &&
-        w.padded_shape[0] == kShardGateUpRows && w.padded_shape[1] == kShardInputRows;
+        x.ne[0] == kShardInputRows && w.k == kShardInputRows && w.n % 2 == 0 &&
+        out.ne[0] == w.n / 2 && w.padded_shape[0] == w.n && w.padded_shape[1] == w.k;
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
         out.ne[3] != 1 || !shard_shape) {
         throw std::invalid_argument("linear_swiglu column-parallel: invalid tensor shape");
@@ -239,21 +237,24 @@ void validate_swiglu_column_rank_semantics(const Tensor& x, const Weight& w, con
 // Cross-rank agreement only a pair can check; every per-rank invariant is validated separately by
 // validate_swiglu_column_rank_semantics. Mirrors linear.h's own validate_split_pair
 // (src/ops/linear/linear.cpp) for the column-parallel case.
-void validate_swiglu_split_pair(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+void validate_swiglu_split_pair(const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& w,
                                 const ExecutionContext& ec) {
     detail::require_split_context(
-        ec, "linear_swiglu column-parallel: requires an ExecutionContext with two distinct devices");
-    if (x[0].ne[1] != x[1].ne[1]) {
-        throw std::invalid_argument(
-            "linear_swiglu column-parallel: both ranks must carry the same token count");
-    }
-    if (w[0].qtype != w[1].qtype || w[0].layout != w[1].layout) {
-        throw std::invalid_argument(
-            "linear_swiglu column-parallel: both ranks must carry the same weight format");
-    }
-    if (w[0].k != w[1].k) {
-        throw std::invalid_argument(
-            "linear_swiglu column-parallel: both ranks must consume the same input extent K");
+        ec, "linear_swiglu column-parallel: requires an ExecutionContext with 2..4 distinct "
+            "devices");
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        if (x[rank].ne[1] != x[0].ne[1]) {
+            throw std::invalid_argument(
+                "linear_swiglu column-parallel: every rank must carry the same token count");
+        }
+        if (w[rank].qtype != w[0].qtype || w[rank].layout != w[0].layout) {
+            throw std::invalid_argument(
+                "linear_swiglu column-parallel: every rank must carry the same weight format");
+        }
+        if (w[rank].k != w[0].k) {
+            throw std::invalid_argument(
+                "linear_swiglu column-parallel: every rank must consume the same input extent K");
+        }
     }
 }
 
@@ -291,9 +292,9 @@ std::size_t q4_column_parallel_workspace_bytes(QType qtype, std::int32_t max_tok
     return layout.peak_bytes(1);
 }
 
-void issue_swiglu_column_rank(int rank, const std::array<Tensor, 2>& x,
-                              const std::array<Weight, 2>& w, std::array<Tensor, 2>& out,
-                              LinearPolicy policy, const std::array<WorkspaceArena*, 2>& workspace,
+void issue_swiglu_column_rank(int rank, const std::array<Tensor, kMaximumDevices>& x,
+                              const std::array<Weight, kMaximumDevices>& w, std::array<Tensor, kMaximumDevices>& out,
+                              LinearPolicy policy, const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
                               const ExecutionContext& ec) {
     const auto slot = static_cast<std::size_t>(rank);
     if (w[slot].qtype == QType::NVFP4) {
@@ -335,17 +336,17 @@ std::size_t linear_swiglu_column_parallel_workspace_capacity_bytes(QType qtype, 
     throw std::invalid_argument("linear_swiglu column-parallel workspace: unsupported weight format");
 }
 
-void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                                   const std::array<Tensor, 2>& out, LinearPolicy policy,
-                                   const std::array<WorkspaceArena*, 2>& workspace,
+void linear_swiglu_column_parallel(const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& w,
+                                   const std::array<Tensor, kMaximumDevices>& out, LinearPolicy policy,
+                                   const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
                                    const ExecutionContext& ec) {
     validate_swiglu_split_pair(x, w, ec);
     // Validate both ranks before issuing either, so a rejected pair enqueues nothing.
-    std::array<Tensor, 2> destination{out[0], out[1]};
-    for (std::size_t slot = 0; slot < 2; ++slot) {
+    std::array<Tensor, kMaximumDevices> destination = out;
+    for (std::size_t slot = 0; slot < static_cast<std::size_t>(ec.tp); ++slot) {
         validate_swiglu_column_rank_semantics(x[slot], w[slot], destination[slot], policy);
     }
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, w[slot].payload, out[slot].data,
@@ -357,8 +358,8 @@ void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::ar
     });
 }
 
-void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                                   const std::array<Tensor, 2>& out, const ExecutionContext& ec) {
+void linear_swiglu_column_parallel(const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& w,
+                                   const std::array<Tensor, kMaximumDevices>& out, const ExecutionContext& ec) {
     linear_swiglu_column_parallel(x, w, out, LinearPolicy::A16Only, {nullptr, nullptr}, ec);
 }
 

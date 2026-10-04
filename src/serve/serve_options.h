@@ -1,5 +1,6 @@
 #pragma once
 
+#include "serve/request.h"
 #include "ninfer/types.h"
 
 #include <cstddef>
@@ -57,6 +58,10 @@ struct ServeOptions {
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
+    // Server-level reasoning-effort default from --chat-template-kwargs. When a request omits
+    // reasoning_effort this value is resolved exactly like a per-request field (capability and
+    // enable_thinking checks included). Unset => the loaded template's own default applies.
+    std::optional<RequestedReasoningEffort> reasoning_effort_default;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // Process-level explicit overrides layered between registered model/mode defaults and request

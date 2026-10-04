@@ -100,6 +100,29 @@ void launch_fp8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cuda
     case Fp8Problem::AttnInputTp2Column:
         launch_registered<Fp8AttnInputTp2ColumnGeometry>(x, weight, out, stream);
         return;
+    case Fp8Problem::VocabularyTp4Column:
+#ifdef NINFER_VOLTA_BUILD
+        launch_registered<Fp8VocabularyTp4ColumnGeometry>(x, weight, out, stream);
+        return;
+#else
+        break;
+#endif
+    // See fp8_gemv.cu's identical tp4 additions.
+    case Fp8Problem::Residual6144Tp4Row:
+        launch_registered<Fp8Residual6144Tp4RowGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Residual17408Tp4Row:
+        launch_registered<Fp8Residual17408Tp4RowGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::GdnInputTp4Column:
+        launch_registered<Fp8GdnInputTp4ColumnGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::MlpGateUpTp4Column:
+        launch_registered<Fp8MlpGateUpTp4ColumnGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::AttnInputTp4Column:
+        launch_registered<Fp8AttnInputTp4ColumnGeometry>(x, weight, out, stream);
+        return;
     }
     throw std::logic_error("FP8 vocabulary small-T uses its A16 MMA route");
 }

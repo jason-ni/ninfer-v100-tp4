@@ -256,16 +256,17 @@ SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
 
 template <>
 std::unique_ptr<Program<Variant>>
-create_program<Variant>(const Variant::ModelView& model, const Variant::ModelView* peer_model,
+create_program<Variant>(const std::array<const Variant::ModelView*, kMaximumDevices>& models,
                         Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
                         ExecutionContext& execution) {
+    if (models[0] == nullptr) { throw std::invalid_argument("rank 0 model view is null"); }
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->weights_profile != weights_profile) {
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
     }
     auto impl =
-        std::make_unique<detail::ProgramImpl<Variant>>(model, peer_model, *plan.impl_, execution);
+        std::make_unique<detail::ProgramImpl<Variant>>(models, *plan.impl_, execution);
     plan.impl_.reset();
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }

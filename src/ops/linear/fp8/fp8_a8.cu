@@ -137,6 +137,13 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
     case Fp8Activation8704Geometry::kInputRows:
         launch_quantize_exact<Fp8Activation8704Geometry>(x, workspace, stream);
         return;
+    // ... and quarter K (6144->1536, 17408->4352) for the tp4 row shards.
+    case Fp8Activation1536Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation1536Geometry>(x, workspace, stream);
+        return;
+    case Fp8Activation4352Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation4352Geometry>(x, workspace, stream);
+        return;
     default:
         throw std::invalid_argument("fp8 A8 quantize: unsupported K");
     }
@@ -174,9 +181,21 @@ void launch_fp8_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Work
     case Fp8Problem::GdnInputTp2Column:
         launch_problem<Fp8GdnInputTp2ColumnGeometry>(weight, out, workspace, tokens, stream);
         return;
+    case Fp8Problem::Residual6144Tp4Row:
+        launch_problem<Fp8Residual6144Tp4RowGeometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Residual17408Tp4Row:
+        launch_problem<Fp8Residual17408Tp4RowGeometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::GdnInputTp4Column:
+        launch_problem<Fp8GdnInputTp4ColumnGeometry>(weight, out, workspace, tokens, stream);
+        return;
     case Fp8Problem::VocabularyTp2Column:
     case Fp8Problem::MlpGateUpTp2Column:
     case Fp8Problem::AttnInputTp2Column:
+    case Fp8Problem::VocabularyTp4Column:
+    case Fp8Problem::MlpGateUpTp4Column:
+    case Fp8Problem::AttnInputTp4Column:
         break;
     }
     throw std::logic_error("FP8 vocabulary has no A8 route");

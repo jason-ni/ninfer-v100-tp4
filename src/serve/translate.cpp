@@ -109,9 +109,13 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         .reasoning_effort  = std::nullopt,
         .preserve_thinking = request.preserve_thinking.value_or(server.preserve_thinking),
     };
-    if (!request.reasoning_effort) { return result; }
+    // A request-level reasoning_effort overrides the server default set by --chat-template-kwargs;
+    // when the request omits it, the server default applies if one was configured.
+    const std::optional<RequestedReasoningEffort> effective =
+        request.reasoning_effort ? request.reasoning_effort : server.reasoning_effort_default;
+    if (!effective) { return result; }
 
-    const RequestedReasoningEffort requested = *request.reasoning_effort;
+    const RequestedReasoningEffort requested = *effective;
     const bool enables_thinking              = requested != RequestedReasoningEffort::None;
     if (request.enable_thinking && *request.enable_thinking != enables_thinking) {
         invalid_prompt_option("reasoning effort conflicts with enable_thinking",

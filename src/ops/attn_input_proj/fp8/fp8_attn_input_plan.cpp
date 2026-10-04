@@ -117,24 +117,28 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
     fp8_attn_input_a8_launch(x, weight, q, gate, k, v, scratch, stream);
 }
 
-// The tp2 column shard -- halved row counts (Fp8AttnInputTp2ColumnGeometry's own
-// q=3072, k=512, gate=3072, v=512).
+// The tp2/tp4 column shards -- halved/quartered row counts (tp2's own q=3072, k=512,
+// gate=3072, v=512; tp4's own q=1536, k=256, gate=1536, v=256).
 namespace {
 
 void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                       Tensor& v, WorkspaceArena* workspace, cudaStream_t stream) {
-    constexpr std::int32_t kQRows  = 3072;
-    constexpr std::int32_t kKvRows = 512;
+    const bool tp4             = weight.n == Fp8AttnInputTp4ColumnGeometry::kOutputRows;
+    const std::int32_t kQRows  = tp4 ? 1536 : 3072;
+    const std::int32_t kKvRows = tp4 ? 256 : 512;
 #ifdef NINFER_VOLTA_BUILD
     if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
         fp8_attn_input_cutlass_sm70_launch_shard(x, weight, q, gate, k, v, *workspace, stream);
         return;
     }
-    const std::int32_t kChunk = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens)
-                                    ? kFp8VoltaQpnMaxTokens
-                                    : kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry>;
+    const std::int32_t kChunk =
+        fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens)
+            ? kFp8VoltaQpnMaxTokens
+            : (tp4 ? kFp8LinearSmallTMax<Fp8AttnInputTp4ColumnGeometry>
+                   : kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry>);
 #else
-    constexpr std::int32_t kChunk = kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry>;
+    const std::int32_t kChunk = tp4 ? kFp8LinearSmallTMax<Fp8AttnInputTp4ColumnGeometry>
+                                    : kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry>;
 #endif
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);

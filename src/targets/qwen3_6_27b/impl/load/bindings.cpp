@@ -885,8 +885,8 @@ ShardPlan plan_for(std::string_view object, int tp, const TextConfig& config,
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features, int tp) {
-    if (tp < 1 || tp > static_cast<int>(artifact::kMaximumDevices)) {
-        throw std::invalid_argument("qwen3_6_27b: tp must be 1 or 2");
+    if (tp != 1 && tp != 2 && tp != 4) {
+        throw std::invalid_argument("qwen3_6_27b: tp must be 1, 2, or 4");
     }
     // The binder's arena count and the shard map's device count are two halves of one decision.
     // If they disagree, nothing downstream notices: a tp2 map on a one-device binder would place
@@ -1060,14 +1060,20 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
                                  int tensor_parallel)
     : backing(std::move(materialized)), tp(tensor_parallel) {
-    if (tp != 1 && tp != 2) { throw std::invalid_argument("qwen3_6_27b: tp must be 1 or 2"); }
+    if (tp != 1 && tp != 2 && tp != 4) {
+        throw std::invalid_argument("qwen3_6_27b: tp must be 1, 2, or 4");
+    }
     if (tp > backing.device_count()) {
         throw std::invalid_argument("qwen3_6_27b: tp exceeds the materialized device count");
     }
+    if (static_cast<std::size_t>(tp) > artifact::kMaximumDevices) {
+        throw std::invalid_argument("qwen3_6_27b: tp exceeds the maximum device count");
+    }
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
-    build_device_view(plan, 0, runtime);
-    if (tp == 2) { build_device_view(plan, 1, runtime_peer.emplace()); }
+    for (int device = 0; device < tp; ++device) {
+        build_device_view(plan, device, runtime[static_cast<std::size_t>(device)].emplace());
+    }
 }
 
 // Builds `device`'s own model view. At tp == 1 this is the whole model on device 0; at tp == 2

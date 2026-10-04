@@ -32,16 +32,18 @@ struct DeviceContext {
     void synchronize() const;
 };
 
-// One process, up to two CUDA devices. dev[0..tp-1] hold constructed DeviceContext instances;
-// the remaining slots stay empty. tp == 1 unless the caller opts into `--tp 2`, which runs the
-// tensor-parallel program across both devices.
+// One process, up to four CUDA devices. dev[0..tp-1] hold constructed DeviceContext instances;
+// the remaining slots stay empty. tp == 1 unless the caller opts into `--tp 2` or `--tp 4`, which
+// runs the tensor-parallel program across all named devices.
+inline constexpr std::size_t kMaximumDevices = 4;
+
 struct ExecutionContext {
-    std::array<std::optional<DeviceContext>, 2> dev;
+    std::array<std::optional<DeviceContext>, kMaximumDevices> dev;
     int tp = 1;
 
-    // device_ids.size() must be 1 or 2 and becomes tp. Every id is validated to exist by
-    // DeviceContext's own constructor; when two ids are given they must additionally share the
-    // same compute capability (sm major.minor), since nothing downstream can reconcile mismatched
+    // device_ids.size() must be in [1, kMaximumDevices] and becomes tp. Every id is validated to
+    // exist by DeviceContext's own constructor; all ids must additionally share the same compute
+    // capability (sm major.minor), since nothing downstream can reconcile mismatched
     // architectures.
     explicit ExecutionContext(const std::vector<int>& device_ids);
 

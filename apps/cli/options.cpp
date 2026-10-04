@@ -43,8 +43,9 @@ int parse_device(const char* text) {
 
 int parse_tp(const char* text) {
     const std::uint64_t value = parse_u64(text, "tp");
-    if (value != 1 && value != 2) {
-        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1 or 2)");
+    if (value != 1 && value != 2 && value != 4) {
+        throw std::invalid_argument(std::string("invalid tp: ") + text +
+                                    " (must be 1, 2, or 4)");
     }
     return static_cast<int>(value);
 }
@@ -62,8 +63,8 @@ std::vector<int> parse_devices(const char* text) {
         if (comma == std::string_view::npos) { break; }
         start = comma + 1;
     }
-    if (result.empty() || result.size() > 2) {
-        throw std::invalid_argument("--devices must list 1 or 2 device ids");
+    if (result.empty() || result.size() > 4) {
+        throw std::invalid_argument("--devices must list 1 to 4 device ids");
     }
     return result;
 }
@@ -121,7 +122,7 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--rope native|yarn] [--yarn-factor F] [--yarn-origin O]\n"
-           "       [--device N] [--tp 1|2] [--devices N,N]\n"
+           "       [--device N] [--tp 1|2|4] [--devices N,N]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -129,7 +130,7 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--ignore-eos]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
-           "       [--no-cuda-graph]\n"
+           "       [--cuda-graph|--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
@@ -140,9 +141,9 @@ std::string usage_text(const char* argv0) {
            " MiB of sizing headroom.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n"
-           "--tp selects the tensor-parallel degree (default 1); --tp 2 splits the model across "
-           "two GPUs and requires --devices; it supports --spec mtp and --spec dflash, but "
-           "not --vision.\n"
+           "--tp selects the tensor-parallel degree (default 1); --tp 2 or --tp 4 splits the "
+           "model across that many GPUs and requires --devices; it supports --spec mtp, and "
+           "--spec dflash at --tp 2, but not --vision.\n"
            "--devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
            "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
            "primary device.\n"
@@ -155,10 +156,11 @@ std::string usage_text(const char* argv0) {
            "--ignore-eos drops the checkpoint\'s own end-of-turn token ids from the request "
            "stop policy, so decode continues to --max-new or the remaining context capacity; "
            "--stop-token-id, --stop and --reasoning-stop still apply.\n"
-           "--no-cuda-graph runs decode eagerly. At --tp 2 that is the same two-stream forward "
-           "pass with cross-device event synchronization, in place of one captured cross-device "
-           "graph; it is the escape hatch if capture ever misbehaves, and it produces the same "
-           "tokens.\n";
+           "--cuda-graph captures one cross-device decode graph; --no-cuda-graph runs the same "
+           "multi-stream forward pass eagerly with cross-device event synchronization. The two "
+           "produce the same tokens. Eager is the default at --tp > 1 because on this V100 target "
+           "the multi-device graph replays with GPU idle bubbles and is slower than eager; --tp 1 "
+           "defaults to graphs.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -172,6 +174,7 @@ Options parse_options(int argc, char** argv) {
     bool kv_capacity_explicit = false;
     bool device_explicit      = false;
     bool devices_explicit     = false;
+    bool cuda_graph_explicit  = false;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -227,8 +230,12 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--cuda-graph") {
+            options.use_cuda_graph = true;
+            cuda_graph_explicit    = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+            cuda_graph_explicit    = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
@@ -286,6 +293,8 @@ Options parse_options(int argc, char** argv) {
     } else if (options.tp == 1) {
         options.devices = {options.device};
     }
+
+    if (!cuda_graph_explicit) { options.use_cuda_graph = options.tp <= 1; }
 
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();

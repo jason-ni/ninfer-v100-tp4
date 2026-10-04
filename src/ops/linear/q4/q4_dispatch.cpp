@@ -1,23 +1,38 @@
 #include "ops/linear/q4/q4_dispatch.h"
 
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
 
-// TP2 shard geometries. See the block comment in q5_dispatch.cpp for the two rules every
-// groupwise family follows here: shard entries are additive and never collide with a tp1 extent,
-// and a shard uses the family's generic runtime-dimension launchers rather than the parent's
-// compile-time exact instantiations (Q4's draft-head small-T table is exact in both N and K).
-// Returns nullptr when (n, k) is not a registered shard extent.
-Q4Launch select_q4_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    const bool column_shard = (k == 5120 && (n == 512 ||    // 1024  / 2
-                                             n == 2048 ||   // 4096  / 2 (gdn/query_key)
-                                             n == 3072 ||   // 6144  / 2
-                                             n == 3584 ||   // 7168  / 2 (attention/query_key)
-                                             n == 17408 ||  // 34816 / 2 (mlp/gate_up)
-                                             n == 65536))|| // 131072/ 2 (draft_head)
-                              (k == 2048 && n == 65536);    // 131072/ 2 (draft_head, short K)
+// Shard geometries for every tensor-parallel width: tp2 halves and tp4 quarters. See the block
+// comment in q5_dispatch.cpp for the two rules every groupwise family follows here: shard entries
+// are additive and never collide with a tp1 extent, and a shard uses the family's generic
+// runtime-dimension launchers rather than the parent's compile-time exact instantiations (Q4's
+// draft-head small-T table is exact in both N and K). Returns nullptr when (n, k) is not a
+// registered shard extent.
+Q4Launch select_q4_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    const bool column_shard =
+        (k == 5120 && (n == 512 ||     // 1024  / 2
+                       n == 2048 ||    // 4096  / 2 (gdn/query_key)
+                       n == 3072 ||    // 6144  / 2
+                       n == 3584 ||    // 7168  / 2 (attention/query_key)
+                       n == 17408 ||   // 34816 / 2 (mlp/gate_up)
+                       n == 65536 ||   // 131072/ 2 (draft_head)
+                       n == 256 ||     // 1024  / 4
+                       n == 1024 ||    // 4096  / 4 (gdn/query_key)
+                       n == 1536 ||    // 6144  / 4
+                       n == 1792 ||    // 7168  / 4 (attention/query_key)
+                       n == 8704 ||    // 34816 / 4 (mlp/gate_up)
+                       n == 32768)) || // 131072/ 4 (draft_head)
+        (k == 2048 && n == 65536) ||   // 131072/ 2 (draft_head, short K)
+        (k == 1024 && n == 32768) ||   // 131072/ 4 (draft_head, short K)
+        (n == 5120 && (k == 3072 ||    // 6144  / 2 residual row shard
+                       k == 8704 ||    // 17408 / 2 residual row shard
+                       k == 1536 ||    // 6144  / 4 residual row shard
+                       k == 2560 ||    // 10240 / 4 MTP fc row shard
+                       k == 4352));    // 17408 / 4 residual row shard
     if (!column_shard) { return nullptr; }
     if (t == 1) {
         // The eight-row SM70 schedule is tuned for the V100 TP2 MLP shard. Keep the
@@ -127,10 +142,11 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (const Q4Launch tp1 = select_q4_a16_registered(n, k, t); tp1 != nullptr) {
         return tp1;
     }
-    if (const Q4Launch shard = select_q4_tp2_shard_launch(n, k, t); shard != nullptr) {
+    if (const Q4Launch shard = select_q4_shard_launch(n, k, t); shard != nullptr) {
         return shard;
     }
-    throw std::invalid_argument("q4 linear: unsupported shape or T");
+    throw std::invalid_argument("q4 linear: unsupported shape or T (n=" + std::to_string(n) +
+                                " k=" + std::to_string(k) + " t=" + std::to_string(t) + ")");
 }
 
 #ifdef NINFER_VOLTA_BUILD

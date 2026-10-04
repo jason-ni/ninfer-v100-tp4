@@ -87,54 +87,65 @@ private:
     int previous_ = 0;
 };
 
-// Fork the peer stream into the capture that `stream` (the origin) has already begun.
-void fork_peer(cudaStream_t stream, const DecodeGraphPeerCapture& peer) {
+// Fork every peer stream into the capture that `stream` (the origin) has already begun.
+void fork_peers(cudaStream_t stream, const DecodeGraphPeerCapture& peer) {
     const ScopedDevice scope;
-    ScopedDevice::set(peer.bridge->origin_device());
-    CUDA_CHECK(cudaEventRecord(peer.bridge->fork_event(), stream));
-    ScopedDevice::set(peer.bridge->peer_device());
-    CUDA_CHECK(cudaStreamWaitEvent(peer.stream, peer.bridge->fork_event(), 0));
+    for (int index = 0; index < peer.bridge->peer_count(); ++index) {
+        ScopedDevice::set(peer.bridge->origin_device());
+        CUDA_CHECK(cudaEventRecord(peer.bridge->fork_event(index), stream));
+        ScopedDevice::set(peer.bridge->peer_device(index));
+        CUDA_CHECK(cudaStreamWaitEvent(peer.streams[index], peer.bridge->fork_event(index), 0));
+    }
 }
 
-// Join the peer stream back into the origin. Without this cudaStreamEndCapture reports
+// Join every peer stream back into the origin. Without this cudaStreamEndCapture reports
 // cudaErrorStreamCaptureUnjoined and the whole capture is discarded.
-void join_peer(cudaStream_t stream, const DecodeGraphPeerCapture& peer) {
+void join_peers(cudaStream_t stream, const DecodeGraphPeerCapture& peer) {
     const ScopedDevice scope;
-    ScopedDevice::set(peer.bridge->peer_device());
-    CUDA_CHECK(cudaEventRecord(peer.bridge->join_event(), peer.stream));
-    ScopedDevice::set(peer.bridge->origin_device());
-    CUDA_CHECK(cudaStreamWaitEvent(stream, peer.bridge->join_event(), 0));
+    for (int index = 0; index < peer.bridge->peer_count(); ++index) {
+        ScopedDevice::set(peer.bridge->peer_device(index));
+        CUDA_CHECK(cudaEventRecord(peer.bridge->join_event(index), peer.streams[index]));
+        ScopedDevice::set(peer.bridge->origin_device());
+        CUDA_CHECK(cudaStreamWaitEvent(stream, peer.bridge->join_event(index), 0));
+    }
 }
 
 void discard_capture(cudaStream_t stream, const DecodeGraphPeerCapture* peer,
-                     bool peer_forked) noexcept {
-    // Best effort: rejoin the peer so the origin's EndCapture is well formed. If the capture was
+                     bool peers_forked) noexcept {
+    // Best effort: rejoin every peer so the origin's EndCapture is well formed. If the capture was
     // already invalidated these calls fail harmlessly and EndCapture then returns a null graph and
-    // clears BOTH streams' capture state, which is the outcome that matters. Hand-rolled rather
+    // clears ALL streams' capture state, which is the outcome that matters. Hand-rolled rather
     // than ScopedDevice because this runs on an exception path and must not throw.
     int caller_device = 0;
     const bool restore =
-        peer != nullptr && peer_forked && cudaGetDevice(&caller_device) == cudaSuccess;
-    if (peer != nullptr && peer_forked) {
-        log_cuda_error("cudaSetDevice(peer)", cudaSetDevice(peer->bridge->peer_device()));
-        log_cuda_error("cudaEventRecord(join)",
-                       cudaEventRecord(peer->bridge->join_event(), peer->stream));
-        log_cuda_error("cudaSetDevice(origin)", cudaSetDevice(peer->bridge->origin_device()));
-        log_cuda_error("cudaStreamWaitEvent(join)",
-                       cudaStreamWaitEvent(stream, peer->bridge->join_event(), 0));
+        peer != nullptr && peers_forked && cudaGetDevice(&caller_device) == cudaSuccess;
+    if (peer != nullptr && peers_forked) {
+        for (int index = 0; index < peer->bridge->peer_count(); ++index) {
+            log_cuda_error("cudaSetDevice(peer)",
+                           cudaSetDevice(peer->bridge->peer_device(index)));
+            log_cuda_error("cudaEventRecord(join)",
+                           cudaEventRecord(peer->bridge->join_event(index),
+                                           peer->streams[index]));
+            log_cuda_error("cudaSetDevice(origin)",
+                           cudaSetDevice(peer->bridge->origin_device()));
+            log_cuda_error("cudaStreamWaitEvent(join)",
+                           cudaStreamWaitEvent(stream, peer->bridge->join_event(index), 0));
+        }
     }
     cudaGraph_t discard = nullptr;
     log_cuda_error("cudaStreamEndCapture(discard)", cudaStreamEndCapture(stream, &discard));
     destroy_graph(discard);
-    if (peer != nullptr && peer_forked) {
+    if (peer != nullptr && peers_forked) {
         // A stream left in capture mode would poison every later launch on it, so say so loudly
         // rather than failing mysteriously later.
-        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-        if (cudaStreamIsCapturing(peer->stream, &status) == cudaSuccess &&
-            status != cudaStreamCaptureStatusNone) {
-            std::fprintf(stderr,
-                         "CUDA cleanup failed: peer stream is still capturing after a discarded "
-                         "dual-device capture\n");
+        for (int index = 0; index < peer->bridge->peer_count(); ++index) {
+            cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(peer->streams[index], &status) == cudaSuccess &&
+                status != cudaStreamCaptureStatusNone) {
+                std::fprintf(stderr,
+                             "CUDA cleanup failed: peer stream is still capturing after a "
+                             "discarded multi-device capture\n");
+            }
         }
     }
     if (restore) { log_cuda_error("cudaSetDevice(restore)", cudaSetDevice(caller_device)); }
@@ -143,72 +154,142 @@ void discard_capture(cudaStream_t stream, const DecodeGraphPeerCapture* peer,
 } // namespace
 
 DecodeGraphPeerBridge::DecodeGraphPeerBridge(int origin_device, int peer_device)
-    : origin_device_(origin_device), peer_device_(peer_device) {
-    if (origin_device == peer_device) {
-        throw std::invalid_argument(
-            "DecodeGraphPeerBridge requires two distinct devices; a capture cannot fork a stream "
-            "into itself");
+    : DecodeGraphPeerBridge(origin_device, std::span<const int>(&peer_device, 1)) {}
+
+DecodeGraphPeerBridge::DecodeGraphPeerBridge(int origin_device,
+                                             std::span<const int> peer_devices)
+    : origin_device_(origin_device) {
+    if (peer_devices.empty()) {
+        throw std::invalid_argument("DecodeGraphPeerBridge requires at least one peer device");
     }
+    peer_devices_.assign(peer_devices.begin(), peer_devices.end());
+    for (int index = 0; index < peer_count(); ++index) {
+        if (peer_devices_[static_cast<std::size_t>(index)] == origin_device) {
+            throw std::invalid_argument(
+                "DecodeGraphPeerBridge requires distinct devices; a capture cannot fork a stream "
+                "into itself");
+        }
+        for (int earlier = 0; earlier < index; ++earlier) {
+            if (peer_devices_[static_cast<std::size_t>(earlier)] ==
+                peer_devices_[static_cast<std::size_t>(index)]) {
+                throw std::invalid_argument(
+                    "DecodeGraphPeerBridge requires distinct peer devices");
+            }
+        }
+    }
+    create_events();
+}
+
+void DecodeGraphPeerBridge::create_events() {
     const ScopedDevice scope;
-    cudaEvent_t created[3] = {nullptr, nullptr, nullptr};
-    // fork_ is recorded on the origin, join_ and gate_ on the peer.
-    const int device_of[3] = {origin_device, peer_device, peer_device};
-    for (int slot = 0; slot < 3; ++slot) {
-        cudaError_t status = cudaSetDevice(device_of[slot]);
+    const int n = peer_count();
+    fork_.assign(static_cast<std::size_t>(n), nullptr);
+    join_.assign(static_cast<std::size_t>(n), nullptr);
+    gate_.assign(static_cast<std::size_t>(n), nullptr);
+
+    const auto fail = [&](cudaError_t status) {
+        for (cudaEvent_t& event : fork_) {
+            if (event != nullptr) { (void)cudaEventDestroy(event); }
+        }
+        for (cudaEvent_t& event : join_) {
+            if (event != nullptr) { (void)cudaEventDestroy(event); }
+        }
+        for (cudaEvent_t& event : gate_) {
+            if (event != nullptr) { (void)cudaEventDestroy(event); }
+        }
+        fork_.clear();
+        join_.clear();
+        gate_.clear();
+        throw std::runtime_error(std::string("DecodeGraphPeerBridge: event creation failed: ") +
+                                 cudaGetErrorName(status) + ": " + cudaGetErrorString(status));
+    };
+
+    for (int index = 0; index < n; ++index) {
+        const std::size_t slot = static_cast<std::size_t>(index);
+        // fork_ is recorded on the origin; join_ and gate_ on the peer.
+        cudaError_t status = cudaSetDevice(origin_device_);
         if (status == cudaSuccess) {
-            status = cudaEventCreateWithFlags(&created[slot], cudaEventDisableTiming);
+            status = cudaEventCreateWithFlags(&fork_[slot], cudaEventDisableTiming);
         }
-        if (status != cudaSuccess) {
-            for (int done = 0; done < slot; ++done) { (void)cudaEventDestroy(created[done]); }
-            throw std::runtime_error(std::string("DecodeGraphPeerBridge: event creation failed: ") +
-                                     cudaGetErrorName(status) + ": " + cudaGetErrorString(status));
+        if (status != cudaSuccess) { fail(status); }
+
+        status = cudaSetDevice(peer_devices_[slot]);
+        if (status == cudaSuccess) {
+            status = cudaEventCreateWithFlags(&join_[slot], cudaEventDisableTiming);
         }
+        if (status != cudaSuccess) { fail(status); }
+
+        status = cudaSetDevice(peer_devices_[slot]);
+        if (status == cudaSuccess) {
+            status = cudaEventCreateWithFlags(&gate_[slot], cudaEventDisableTiming);
+        }
+        if (status != cudaSuccess) { fail(status); }
     }
-    fork_ = created[0];
-    join_ = created[1];
-    gate_ = created[2];
 }
 
 DecodeGraphPeerBridge::~DecodeGraphPeerBridge() {
-    destroy_event(fork_);
-    destroy_event(join_);
-    destroy_event(gate_);
+    for (cudaEvent_t& event : fork_) { destroy_event(event); }
+    for (cudaEvent_t& event : join_) { destroy_event(event); }
+    for (cudaEvent_t& event : gate_) { destroy_event(event); }
 }
 
 DecodeGraphPeerBridge::DecodeGraphPeerBridge(DecodeGraphPeerBridge&& other) noexcept
-    : origin_device_(other.origin_device_), peer_device_(other.peer_device_), fork_(other.fork_),
-      join_(other.join_), gate_(other.gate_) {
-    other.fork_ = nullptr;
-    other.join_ = nullptr;
-    other.gate_ = nullptr;
+    : origin_device_(other.origin_device_), peer_devices_(std::move(other.peer_devices_)),
+      fork_(std::move(other.fork_)), join_(std::move(other.join_)), gate_(std::move(other.gate_)) {
+    other.origin_device_ = 0;
 }
 
 DecodeGraphPeerBridge& DecodeGraphPeerBridge::operator=(DecodeGraphPeerBridge&& other) noexcept {
     if (this == &other) { return *this; }
-    destroy_event(fork_);
-    destroy_event(join_);
-    destroy_event(gate_);
+    for (cudaEvent_t& event : fork_) { destroy_event(event); }
+    for (cudaEvent_t& event : join_) { destroy_event(event); }
+    for (cudaEvent_t& event : gate_) { destroy_event(event); }
     origin_device_ = other.origin_device_;
-    peer_device_   = other.peer_device_;
-    fork_          = other.fork_;
-    join_          = other.join_;
-    gate_          = other.gate_;
-    other.fork_    = nullptr;
-    other.join_    = nullptr;
-    other.gate_    = nullptr;
+    peer_devices_  = std::move(other.peer_devices_);
+    fork_          = std::move(other.fork_);
+    join_          = std::move(other.join_);
+    gate_          = std::move(other.gate_);
+    other.origin_device_ = 0;
     return *this;
+}
+
+bool DecodeGraphPeerBridge::live() const noexcept {
+    if (peer_devices_.empty() || fork_.size() != peer_devices_.size() ||
+        join_.size() != peer_devices_.size() || gate_.size() != peer_devices_.size()) {
+        return false;
+    }
+    for (cudaEvent_t event : fork_) {
+        if (event == nullptr) { return false; }
+    }
+    for (cudaEvent_t event : join_) {
+        if (event == nullptr) { return false; }
+    }
+    for (cudaEvent_t event : gate_) {
+        if (event == nullptr) { return false; }
+    }
+    return true;
+}
+
+void DecodeGraphPeerBridge::gate_launch(const cudaStream_t* peer_streams,
+                                        cudaStream_t origin_stream) const {
+    if (!live()) {
+        throw std::logic_error("a moved-from DecodeGraphPeerBridge cannot gate a graph launch");
+    }
+    const ScopedDevice scope;
+    for (int index = 0; index < peer_count(); ++index) {
+        ScopedDevice::set(peer_devices_[static_cast<std::size_t>(index)]);
+        CUDA_CHECK(cudaEventRecord(gate_[static_cast<std::size_t>(index)], peer_streams[index]));
+    }
+    ScopedDevice::set(origin_device_);
+    for (int index = 0; index < peer_count(); ++index) {
+        CUDA_CHECK(
+            cudaStreamWaitEvent(origin_stream, gate_[static_cast<std::size_t>(index)], 0));
+    }
 }
 
 void DecodeGraphPeerBridge::gate_launch(cudaStream_t peer_stream,
                                         cudaStream_t origin_stream) const {
-    if (gate_ == nullptr) {
-        throw std::logic_error("a moved-from DecodeGraphPeerBridge cannot gate a graph launch");
-    }
-    const ScopedDevice scope;
-    ScopedDevice::set(peer_device_);
-    CUDA_CHECK(cudaEventRecord(gate_, peer_stream));
-    ScopedDevice::set(origin_device_);
-    CUDA_CHECK(cudaStreamWaitEvent(origin_stream, gate_, 0));
+    gate_launch(&peer_stream, origin_stream);
 }
 
 DecodeGraphDefinition::~DecodeGraphDefinition() { reset(); }
@@ -234,11 +315,18 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
 
 void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body,
                                     const DecodeGraphPeerCapture& peer) {
-    const bool dual = peer.bridge != nullptr;
-    if (dual) {
-        if (!peer.bridge->live() || peer.stream == nullptr) {
-            throw std::invalid_argument("dual-device capture requires a live peer bridge and "
-                                        "the peer device's stream");
+    const bool multi = peer.bridge != nullptr;
+    if (multi) {
+        if (!peer.bridge->live() || peer.streams == nullptr ||
+            peer.stream_count != peer.bridge->peer_count()) {
+            throw std::invalid_argument("multi-device capture requires a live peer bridge and one "
+                                        "stream per peer device");
+        }
+        for (int index = 0; index < peer.stream_count; ++index) {
+            if (peer.streams[index] == nullptr) {
+                throw std::invalid_argument(
+                    "multi-device capture requires a stream for every peer device");
+            }
         }
     }
     reset();
@@ -247,14 +335,14 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
 
     bool peer_forked = false;
     try {
-        if (dual) {
-            fork_peer(stream, peer);
+        if (multi) {
+            fork_peers(stream, peer);
             peer_forked = true;
         }
         body();
-        if (dual) { join_peer(stream, peer); }
+        if (multi) { join_peers(stream, peer); }
     } catch (...) {
-        discard_capture(stream, dual ? &peer : nullptr, peer_forked);
+        discard_capture(stream, multi ? &peer : nullptr, peer_forked);
         throw;
     }
 

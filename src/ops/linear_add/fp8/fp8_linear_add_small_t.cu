@@ -72,6 +72,29 @@ template <int ActiveTokens>
 struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Tp2RowGeometry, ActiveTokens>
     : Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Geometry, ActiveTokens> {};
 
+// linear_add's tp4 row shards: the 6144 quarter (K=1536) inherits the parent's schedule; the
+// 17408 quarter (K=4352=2^8*17) pins ValuesPerLane=8 because the parent's v16 phase of 512 does
+// not divide K, matching the parent family's own Fp8LinearSmallTProductionSchedule rule.
+template <int ActiveTokens>
+struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual6144Tp4RowGeometry, ActiveTokens>
+    : Fp8LinearAddSmallTProductionSchedule<Fp8Residual6144Geometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Tp4RowGeometry, ActiveTokens> {
+    static_assert(ActiveTokens >= kFp8FirstSmallT && ActiveTokens <= kFp8LastSmallT);
+    using Parent                        = Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Geometry,
+                                                       ActiveTokens>;
+    static constexpr int kWarpsPerCta   = Parent::kWarpsPerCta;
+    static constexpr int kRowsPerWarp   = Parent::kRowsPerWarp;
+    static constexpr int kValuesPerLane = 8;
+    static constexpr int kTokenTile     = Parent::kTokenTile;
+    static constexpr auto kCodeCache    = Parent::kCodeCache;
+    static constexpr auto kBlockOrder   = Parent::kBlockOrder;
+    using Type =
+        Fp8SmallTSchedule<kWarpsPerCta, kRowsPerWarp, kValuesPerLane, kTokenTile, 1,
+                          Fp8SmallTActivationAccess::TokenPacked, kCodeCache, 1, kBlockOrder, 1>;
+};
+
 template <class Geometry, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
     using Schedule = typename Fp8LinearAddSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
@@ -122,6 +145,12 @@ void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor
     case Fp8Problem::Residual17408Tp2Row:
         launchers<Fp8Residual17408Tp2RowGeometry>()[index](x, weight, residual, stream);
         return;
+    case Fp8Problem::Residual6144Tp4Row:
+        launchers<Fp8Residual6144Tp4RowGeometry>()[index](x, weight, residual, stream);
+        return;
+    case Fp8Problem::Residual17408Tp4Row:
+        launchers<Fp8Residual17408Tp4RowGeometry>()[index](x, weight, residual, stream);
+        return;
     case Fp8Problem::AttnInput:
     case Fp8Problem::GdnInput:
     case Fp8Problem::MlpGateUp:
@@ -130,6 +159,10 @@ void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor
     case Fp8Problem::GdnInputTp2Column:
     case Fp8Problem::MlpGateUpTp2Column:
     case Fp8Problem::AttnInputTp2Column:
+    case Fp8Problem::VocabularyTp4Column:
+    case Fp8Problem::GdnInputTp4Column:
+    case Fp8Problem::MlpGateUpTp4Column:
+    case Fp8Problem::AttnInputTp4Column:
         break;
     }
     throw std::invalid_argument("fp8 linear_add small-T: unsupported problem");

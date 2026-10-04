@@ -40,14 +40,16 @@ supports up to fifteen drafts and Qwen3.8-27B artifacts with the optional DFlash
 up to seven. DFlash cannot be combined with `--vision`. A later request cannot enable a capability
 omitted at startup.
 
-`--tp 2` splits one model across two GPUs and requires an explicit `--devices A,B` naming one
-distinct device per rank. The 27B package supports `--spec mtp` and optional Qwen3.8 DFlash2 at
-TP2, but rejects `--vision`. On the two 16 GB V100s, the qualified NVFP4 v3 DFlash2 profile uses
+`--tp 2` or `--tp 4` splits one model across that many GPUs and requires an explicit
+`--devices A,B` (or `A,B,C,D`) naming one distinct device per rank. The 27B package supports
+`--spec mtp` at any tensor-parallel width and optional Qwen3.8 DFlash2 at TP2 only, but rejects
+`--vision`. On the two 16 GB V100s, the qualified NVFP4 v3 DFlash2 profile uses
 `--max-context 98304 --prefill-chunk 1024 --kv-dtype int8 --spec dflash --draft-tokens 7`, without
 `--lm-head-draft`: its selector uses the full vocabulary. It does not fit the 180000-capacity MTP
-profile. The 35B-A3B package has no TP2 path.
+profile. The 35B-A3B package has no tensor-parallel path.
 
-Compatible-prefix reuse is enabled by default at both TP widths, including `--tp 2 --spec mtp`.
+Compatible-prefix reuse is enabled by default at every tensor-parallel width, including
+`--tp 2 --spec mtp` and `--tp 4 --spec mtp`.
 It applies transparently to the HTTP APIs: submit the normal conversation history. A matching
 resident frontier or saved turn/response checkpoint reuses its complete model state, prefilling only
 the suffix; an exact hit requires no prompt-token prefill. See the cache behavior below for matching
@@ -523,8 +525,8 @@ curl http://127.0.0.1:8080/v1/models \
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
-| `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
-| `--devices A,B` | one CUDA device index per `--tp` rank; required for `--tp 2` | `--device` |
+| `--tp 1\|2\|4` | tensor-parallel width; `2` or `4` splits the model across that many GPUs | `1` |
+| `--devices A,B[,...]` | one CUDA device index per `--tp` rank; required for `--tp 2` or `--tp 4` | `--device` |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
@@ -538,10 +540,11 @@ curl http://127.0.0.1:8080/v1/models \
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `65536` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
-| `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
+| `--cuda-graph` / `--no-cuda-graph` | force CUDA Graph capture on/off | off at `--tp > 1`, on at `--tp 1` |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
+| `--chat-template-kwargs JSON` | default chat-template options as a JSON object; supported keys are `preserve_thinking` (bool), `enable_thinking` (bool), and `reasoning_effort` (`none`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`); it overrides `--no-thinking`/`--preserve-thinking` for the keys it names, and requests can still override each field | unset |
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
@@ -588,8 +591,8 @@ they do not infer request behavior from process-global counter deltas.
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
 
-At `--tp 2` every other `engine` and `memory` field in `server_start` is the primary rank's; `tp`
-and `devices` are what identify the record as a dual-device run and name the second GPU. Per-device
+At `--tp > 1` every other `engine` and `memory` field in `server_start` is the primary rank's; `tp`
+and `devices` are what identify the record as a multi-device run and name the peer GPUs. Per-device
 memory rows remain a console load-summary table rather than structured-log fields.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`

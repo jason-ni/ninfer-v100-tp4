@@ -12,8 +12,8 @@
 
 namespace ninfer::artifact {
 
-// One process drives at most two devices (core/device.h ExecutionContext).
-inline constexpr std::size_t kMaximumDevices = 2;
+// One process drives at most four devices (core/device.h ExecutionContext).
+inline constexpr std::size_t kMaximumDevices = 4;
 
 enum class TensorPlacement : std::uint8_t {
     Device,

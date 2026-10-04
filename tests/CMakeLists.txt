@@ -344,6 +344,12 @@ ninfer_add_op_test(ninfer_allreduce_test
   SOURCES ops/test_allreduce.cpp
   LIBRARIES ninfer_ops)
 
+# Multi-device CUDA-graph capture/replay parity: one graph forked across every peer stream. Same
+# multi-device requirement and skip code as the collectives above.
+ninfer_add_op_test(ninfer_decode_graph_peer_test
+  SOURCES test_decode_graph_peer.cpp
+  LIBRARIES ninfer_ops)
+
 # Tensor-parallel split forms. Same two-device requirement and skip code as the collectives above.
 ninfer_add_op_test(ninfer_linear_split_test
   SOURCES ops/test_linear_split.cpp

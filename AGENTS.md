@@ -106,15 +106,17 @@ intermediate artifacts are excluded unless requested or themselves the deliverab
 
 NInfer is a from-scratch C++/CUDA inference engine for a small set of explicitly registered
 checkpoint artifacts. This checkout's active target is maximum single-request performance on
-two Tesla V100-SXM2 16 GB cards using CUDA 12.8 and `sm_70`. It combines the RTX 3060 TP2 path
+up to four Tesla V100-SXM2 16 GB cards (tensor-parallel width 1, 2, or 4) using CUDA 12.8 and
+`sm_70`. It combines the RTX 3060 TP2 path
 with the Volta implementation from `geoffwatts/ninfer-v100`. Ampere `sm_86` and early Ada `sm_89`
 builds remain available; the RTX 5090 `sm_120a` results are inherited upstream evidence, not
 measurements of this target. The supported identities are
 `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
 `qwen3.8-27b/nvfp4`, `qwen3.8-27b/gguf-q4-k-m`, and `qwen3.6-35b-a3b/groupwise-int`.
 The V100X2 workload uses the GGUF-derived Qwen3.8-27B Q4_K_M artifact from the local LM Studio
-directory, 180000-token context capacity, INT8 group-64 KV, CUDA Graphs, and MTP with at most
-three drafts; accepting zero drafts is valid. Capacity must not be confused with prompt occupancy.
+directory, 180000-token context capacity, INT8 group-64 KV, eager decode at tensor-parallel
+width > 1 (CUDA Graph capture is optional there and measurably slower on this target), and MTP
+with at most three drafts; accepting zero drafts is valid. Capacity must not be confused with prompt occupancy.
 Its Q4_K/Q6_K codes and scales must remain unchanged. Numerical transformations and inference
 optimizations require evidence against their applicable exact, mathematical, or behavioral oracle;
 preserving packed bytes alone does not prove absence of end-to-end quality loss.
@@ -128,8 +130,9 @@ including TP2; the official NVFP4 v3 package preserves W8 projections and BF16 a
 The 27B draft window is at most seven. On this V100X2, the verified DFlash profile is 98304-token
 capacity with a 1024-token prefill chunk, not the 180000-capacity MTP acceptance profile.
 
-One Engine owns one resident model, with one device or TP2 on the 27B package and a startup-fixed
-one to eight active requests. The V100X2 acceptance workload is one active request on two cards.
+One Engine owns one resident model, with one device, TP2, or TP4 on the 27B package and a
+startup-fixed one to eight active requests. The V100X2 acceptance workload is one active request
+on two or four cards.
 The Engine forms one compact decode batch at every round boundary and uses bounded
 FIFO ingress with no request preemption. Large-scale or preemptive continuous batching, priority/QoS
 scheduling, additional checkpoint targets, and additional execution platforms beyond those named
@@ -341,7 +344,7 @@ These are conventional project resources, not a checklist of resources every tas
 | normal build | `build-v100/` |
 | private dependency prefix | `build/_deps/install/` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
-| hardware/toolchain | 2 x Tesla V100-SXM2 16 GB, `sm_70`, CUDA 12.8 |
+| hardware/toolchain | 4 x Tesla V100-SXM2 16 GB, `sm_70`, CUDA 12.8 |
 
 Use the selected Python 3.11 interpreter explicitly. Do not install or upgrade dependencies unless
 the task requires it. Never select an artifact by glob, modification time, or an unqualified

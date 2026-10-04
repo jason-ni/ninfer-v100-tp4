@@ -516,13 +516,22 @@ using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
 // (24 % 8 == 0, 5120 % 128 == 0).
 using FoldGeometry48x24Tp2 = FoldGeometry<48, 8, 24, 5120>;
 
+// tp4 head/channel shard of FoldGeometry48x48: the qk-head and value-head counts quarter
+// (16->4, 48->12) and so does the conv channel count (10240->2560). Group size 48/16 == 12/4 == 3
+// is preserved, and the group-aligned split keeps the kernel's own value->qk map exact: local h
+// maps to local h/(12/4) = h/3, which is global (12r+h)/3 = 4r + h/3, the same qk head the tp1
+// geometry assigns. Both static_asserts hold (12 % 4 == 0, 2560 % 128 == 0). It is the partner of
+// FoldGeometry48x24Tp2, one per tensor-parallel width that halves/quarters the geometry.
+using FoldGeometry48x12Tp4 = FoldGeometry<48, 4, 12, 2560>;
+
 // Every registered fold geometry, in one place, so `launch_replay_fold`'s dispatch chain is
 // generated rather than hand-written: a newly registered geometry must not be left behind in a
 // hand-written switch.
 #define NINFER_GDN_FOLD_GEOMETRIES(X)                                                              \
     X(FoldGeometry48x48)                                                                           \
     X(FoldGeometry30x32)                                                                           \
-    X(FoldGeometry48x24Tp2)
+    X(FoldGeometry48x24Tp2)                                                                        \
+    X(FoldGeometry48x12Tp4)
 
 template <class Geometry>
 struct FoldAccess {

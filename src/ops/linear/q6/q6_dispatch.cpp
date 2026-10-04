@@ -5,11 +5,12 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// TP2 shard geometries. See the block comment in q5_dispatch.cpp for the rules. Q6 serves only the
-// vocabulary head in this target, which the ShardPlan splits column-parallel by vocabulary rows.
+// TP2/TP4 shard geometries. See the block comment in q5_dispatch.cpp for the rules. Q6 serves only
+// the vocabulary head in this target, which the ShardPlan splits column-parallel by vocabulary
+// rows: tp2 keeps 248320/2 = 124160 rows, tp4 keeps 248320/4 = 62080.
 // Returns nullptr when (n, k) is not a registered shard extent.
-Q6Launch select_q6_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    const bool column_shard = n == 124160 && (k == 5120 || k == 2048); // 248320 / 2
+Q6Launch select_q6_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    const bool column_shard = (n == 124160 || n == 62080) && (k == 5120 || k == 2048);
     if (!column_shard) { return nullptr; }
     if (t <= 4) { return launch_q6_simt_r8_c4; }
     if (t <= 16) { return launch_q6_mma_r64_c16_k128; }
@@ -85,7 +86,7 @@ Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (const Q6Launch tp1 = select_q6_a16_registered(n, k, t); tp1 != nullptr) {
         return tp1;
     }
-    if (const Q6Launch shard = select_q6_tp2_shard_launch(n, k, t); shard != nullptr) {
+    if (const Q6Launch shard = select_q6_shard_launch(n, k, t); shard != nullptr) {
         return shard;
     }
     throw std::invalid_argument("q6 linear: unsupported shape or T");

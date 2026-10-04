@@ -38,11 +38,12 @@ std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
     if (q_heads == 24) { return 4; }
     if (q_heads == 16) { return 2; }
     if (q_heads == 12) { return 2; }
+    if (q_heads == 6) { return 1; }
     throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry");
 }
 
 void require_kv_heads(std::int32_t kv_heads, const char* op) {
-    if (kv_heads != 4 && kv_heads != 2) {
+    if (kv_heads != 4 && kv_heads != 2 && kv_heads != 1) {
         throw std::invalid_argument(std::string(op) + ": unsupported KV head geometry");
     }
 }
@@ -301,7 +302,7 @@ bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
     // store) for every tile. ChunkedSmallT is the correct fallback -- slower, but it is the path
     // 16q/2kv prefill used before the flash route existed. Re-enabling that geometry means
     // reconciling the two cols_per_warp definitions upstream first.
-    return (q_heads == 24 || q_heads == 12) && batch_size == 1 &&
+    return (q_heads == 24 || q_heads == 12 || q_heads == 6) && batch_size == 1 &&
            (cache_dtype == DType::BF16 || cache_dtype == DType::I8) &&
            width >= detail::kVoltaFlashMinimumWidth;
 }
@@ -322,7 +323,7 @@ template <class Allocator>
 VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace, std::int32_t q_heads,
                                                    std::int32_t width,
                                                    GqaExecutionEnvelope envelope) {
-    const std::int32_t kv_heads = q_heads == 24 ? 4 : 2;
+    const std::int32_t kv_heads = q_heads == 24 ? 4 : (q_heads == 6 ? 1 : 2);
     // Both the gathered K/V and the mask are sized by the padded key extent; see
     // the FATTN_KQ_STRIDE note in gqa_attention_volta_flash.cu.
     const auto visible          = static_cast<std::int32_t>(envelope.max_visible_keys);

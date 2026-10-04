@@ -87,8 +87,8 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
                                                 const Tensor& A_log, const Tensor& dt_bias,
                                                 Tensor& g, Tensor& beta, cudaStream_t stream);
 
-// --- tp2 column-shard forms (24 rows/GPU; see bf16_gdn_gating_proj_kernels.cu's kShardN
-// comment for why every T routes through gemv/small-T-split10, bypassing the MMA route). ---
+// --- Column-shard forms (24 rows/GPU at tp2, 12 at tp4; see bf16_gdn_gating_proj_kernels.cu's
+// kShardN comment for why every T routes through gemv/small-T-split10, bypassing the MMA route). ---
 
 void bf16_gdn_gating_proj_gemv_shard_launch(const Tensor& x, const Weight& a_weight,
                                             const Weight& b_weight, const Tensor& A_log,

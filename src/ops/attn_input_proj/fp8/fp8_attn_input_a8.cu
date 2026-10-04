@@ -26,6 +26,12 @@ static_assert(
 static_assert(
     (Fp8AttentionInputShardOutput<Fp8AttnInputTp2ColumnGeometry>::kKeyRows %
      Fp8LinearA8ProductionSchedule<Fp8AttnInputTp2ColumnGeometry>::Type::kBlockRows) == 0);
+static_assert(
+    (Fp8AttentionInputShardOutput<Fp8AttnInputTp4ColumnGeometry>::kQueryRows %
+     Fp8LinearA8ProductionSchedule<Fp8AttnInputTp4ColumnGeometry>::Type::kBlockRows) == 0);
+static_assert(
+    (Fp8AttentionInputShardOutput<Fp8AttnInputTp4ColumnGeometry>::kKeyRows %
+     Fp8LinearA8ProductionSchedule<Fp8AttnInputTp4ColumnGeometry>::Type::kBlockRows) == 0);
 
 template <class Geometry, class Output, bool FullTokens>
 void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
@@ -74,10 +80,16 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
                                                              stream);
 }
 
-// The tp2 column shard.
+// The tp2/tp4 column shards.
 void fp8_attn_input_a8_launch_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                     Tensor& k, Tensor& v, Fp8A8Workspace workspace,
                                     cudaStream_t stream) {
+    if (weight.n == Fp8AttnInputTp4ColumnGeometry::kOutputRows) {
+        launch_a8<Fp8AttnInputTp4ColumnGeometry,
+                  Fp8AttentionInputShardOutput<Fp8AttnInputTp4ColumnGeometry>>(x, weight, q, gate, k,
+                                                                              v, workspace, stream);
+        return;
+    }
     launch_a8<Fp8AttnInputTp2ColumnGeometry, Fp8AttentionInputShardOutput<Fp8AttnInputTp2ColumnGeometry>>(
         x, weight, q, gate, k, v, workspace, stream);
 }

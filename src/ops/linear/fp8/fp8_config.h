@@ -169,6 +169,27 @@ using Fp8AttnInputTp2ColumnGeometry = Fp8Geometry<7168, 5120>;
 using Fp8Activation3072Geometry = Fp8ActivationGeometry<3072>;
 using Fp8Activation8704Geometry = Fp8ActivationGeometry<8704>;
 
+// TP4 quarter shards of the same six problems. Every extent is the tp2 shard's half (or the tp1
+// full quarter), and the shard policy is identical: column shards split OutputRows and keep
+// InputRows=5120; row shards split InputRows and keep OutputRows=5120. Decode/small-T tuning is
+// inherited from the tp1 parent family, exactly as the tp2 shards inherit it -- the split reuses
+// its family's measured policy rather than re-deriving one.
+using Fp8VocabularyTp4ColumnGeometry = Fp8Geometry<62080, 5120>;
+
+using Fp8GdnInputTp4ColumnGeometry = Fp8Geometry<4096, 5120>;
+
+using Fp8Residual6144Tp4RowGeometry  = Fp8Geometry<5120, 1536>;
+using Fp8Residual17408Tp4RowGeometry = Fp8Geometry<5120, 4352>;
+
+using Fp8MlpGateUpTp4ColumnGeometry = Fp8Geometry<8704, 5120>;
+
+using Fp8AttnInputTp4ColumnGeometry = Fp8Geometry<3584, 5120>;
+
+// Row-parallel activation-quantize geometries for the A8 route at the quartered K extents
+// (mirrors the tp2 <3072>/<8704> activation geometries).
+using Fp8Activation1536Geometry = Fp8ActivationGeometry<1536>;
+using Fp8Activation4352Geometry = Fp8ActivationGeometry<4352>;
+
 inline constexpr std::int32_t kFp8VocabularyFirstA16MmaT = 1;
 inline constexpr std::int32_t kFp8VocabularyLastA16MmaT  = 48;
 
@@ -208,6 +229,13 @@ enum class Fp8Problem : std::uint8_t {
     MlpGateUpTp2Column,
     // attn_input_proj's own tp2 column shard, appended for the same reason.
     AttnInputTp2Column,
+    // TP4 shards of the same six problems, appended for the same reason.
+    VocabularyTp4Column,
+    GdnInputTp4Column,
+    Residual6144Tp4Row,
+    Residual17408Tp4Row,
+    MlpGateUpTp4Column,
+    AttnInputTp4Column,
 };
 
 inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -234,7 +262,19 @@ inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32
            (output_rows == Fp8MlpGateUpTp2ColumnGeometry::kOutputRows &&
             input_rows == Fp8MlpGateUpTp2ColumnGeometry::kInputRows) ||
            (output_rows == Fp8AttnInputTp2ColumnGeometry::kOutputRows &&
-            input_rows == Fp8AttnInputTp2ColumnGeometry::kInputRows);
+            input_rows == Fp8AttnInputTp2ColumnGeometry::kInputRows) ||
+           (output_rows == Fp8VocabularyTp4ColumnGeometry::kOutputRows &&
+            input_rows == Fp8VocabularyTp4ColumnGeometry::kInputRows) ||
+           (output_rows == Fp8GdnInputTp4ColumnGeometry::kOutputRows &&
+            input_rows == Fp8GdnInputTp4ColumnGeometry::kInputRows) ||
+           (output_rows == Fp8Residual6144Tp4RowGeometry::kOutputRows &&
+            input_rows == Fp8Residual6144Tp4RowGeometry::kInputRows) ||
+           (output_rows == Fp8Residual17408Tp4RowGeometry::kOutputRows &&
+            input_rows == Fp8Residual17408Tp4RowGeometry::kInputRows) ||
+           (output_rows == Fp8MlpGateUpTp4ColumnGeometry::kOutputRows &&
+            input_rows == Fp8MlpGateUpTp4ColumnGeometry::kInputRows) ||
+           (output_rows == Fp8AttnInputTp4ColumnGeometry::kOutputRows &&
+            input_rows == Fp8AttnInputTp4ColumnGeometry::kInputRows);
 }
 
 inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -286,12 +326,37 @@ inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t inp
         input_rows == Fp8AttnInputTp2ColumnGeometry::kInputRows) {
         return Fp8Problem::AttnInputTp2Column;
     }
+    if (output_rows == Fp8VocabularyTp4ColumnGeometry::kOutputRows &&
+        input_rows == Fp8VocabularyTp4ColumnGeometry::kInputRows) {
+        return Fp8Problem::VocabularyTp4Column;
+    }
+    if (output_rows == Fp8GdnInputTp4ColumnGeometry::kOutputRows &&
+        input_rows == Fp8GdnInputTp4ColumnGeometry::kInputRows) {
+        return Fp8Problem::GdnInputTp4Column;
+    }
+    if (output_rows == Fp8Residual6144Tp4RowGeometry::kOutputRows &&
+        input_rows == Fp8Residual6144Tp4RowGeometry::kInputRows) {
+        return Fp8Problem::Residual6144Tp4Row;
+    }
+    if (output_rows == Fp8Residual17408Tp4RowGeometry::kOutputRows &&
+        input_rows == Fp8Residual17408Tp4RowGeometry::kInputRows) {
+        return Fp8Problem::Residual17408Tp4Row;
+    }
+    if (output_rows == Fp8MlpGateUpTp4ColumnGeometry::kOutputRows &&
+        input_rows == Fp8MlpGateUpTp4ColumnGeometry::kInputRows) {
+        return Fp8Problem::MlpGateUpTp4Column;
+    }
+    if (output_rows == Fp8AttnInputTp4ColumnGeometry::kOutputRows &&
+        input_rows == Fp8AttnInputTp4ColumnGeometry::kInputRows) {
+        return Fp8Problem::AttnInputTp4Column;
+    }
     throw std::invalid_argument("unsupported FP8 problem");
 }
 
 // True for the problems whose only route is the vocabulary A16 MMA path, at every policy and T.
 inline constexpr bool is_fp8_vocabulary_problem(Fp8Problem problem) {
-    return problem == Fp8Problem::Vocabulary || problem == Fp8Problem::VocabularyTp2Column;
+    return problem == Fp8Problem::Vocabulary || problem == Fp8Problem::VocabularyTp2Column ||
+           problem == Fp8Problem::VocabularyTp4Column;
 }
 
 template <class Geometry>
@@ -347,6 +412,27 @@ template <>
 struct Fp8LinearDecodeProductionSchedule<Fp8AttnInputTp2ColumnGeometry>
     : Fp8LinearDecodeProductionSchedule<Fp8AttnInputGeometry> {};
 
+// Every new tp4 shard inherits its parent's measured decode schedule, like the tp2 shards above.
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8GdnInputTp4ColumnGeometry>
+    : Fp8LinearDecodeProductionSchedule<Fp8GdnInputGeometry> {};
+
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8Residual6144Tp4RowGeometry>
+    : Fp8LinearDecodeProductionSchedule<Fp8Residual6144Geometry> {};
+
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8Residual17408Tp4RowGeometry>
+    : Fp8LinearDecodeProductionSchedule<Fp8Residual17408Geometry> {};
+
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8MlpGateUpTp4ColumnGeometry>
+    : Fp8LinearDecodeProductionSchedule<Fp8MlpGateUpGeometry> {};
+
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8AttnInputTp4ColumnGeometry>
+    : Fp8LinearDecodeProductionSchedule<Fp8AttnInputGeometry> {};
+
 inline constexpr std::int32_t kFp8FirstSmallT = 2;
 inline constexpr std::int32_t kFp8LastSmallT  = 24;
 
@@ -390,6 +476,27 @@ inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8MlpGateUpTp2ColumnGeometry>
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry> =
     kFp8LinearSmallTMax<Fp8AttnInputGeometry>;
+
+// Every new tp4 shard inherits its parent's measured small-T ceiling.
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8GdnInputTp4ColumnGeometry> =
+    kFp8LinearSmallTMax<Fp8GdnInputGeometry>;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual6144Tp4RowGeometry> =
+    kFp8LinearSmallTMax<Fp8Residual6144Geometry>;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual17408Tp4RowGeometry> =
+    kFp8LinearSmallTMax<Fp8Residual17408Geometry>;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8MlpGateUpTp4ColumnGeometry> =
+    kFp8LinearSmallTMax<Fp8MlpGateUpGeometry>;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8AttnInputTp4ColumnGeometry> =
+    kFp8LinearSmallTMax<Fp8AttnInputGeometry>;
 #ifdef NINFER_VOLTA_BUILD
 // Upstream serves the vocabulary head only through the A16 MMA kernel, which is ldmatrix-based
 // (sm_75+) and has no SIMT sibling, so on Volta the head has no route at all. Register it on the
@@ -412,6 +519,14 @@ inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8VocabularyGeometry> = kFp8L
 
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8VocabularyTp2ColumnGeometry> = kFp8LastSmallT;
+
+// The TP4 vocabulary shard uses the same Volta SIMT schedule as the full head and the tp2 shard.
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8VocabularyTp4ColumnGeometry>
+    : Fp8LinearDecodeProductionSchedule<Fp8VocabularyGeometry> {};
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8VocabularyTp4ColumnGeometry> = kFp8LastSmallT;
 #endif // NINFER_VOLTA_BUILD
 
 inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
@@ -424,6 +539,8 @@ inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
         return kFp8LinearSmallTMax<Fp8MlpGateUpGeometry>;
     case Fp8Problem::GdnInputTp2Column:
         return kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
+    case Fp8Problem::GdnInputTp4Column:
+        return kFp8LinearSmallTMax<Fp8GdnInputTp4ColumnGeometry>;
     case Fp8Problem::Vocabulary:
 #ifdef NINFER_VOLTA_BUILD
         return kFp8LinearSmallTMax<Fp8VocabularyGeometry>;
@@ -436,6 +553,12 @@ inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
 #else
         break;
 #endif
+    case Fp8Problem::VocabularyTp4Column:
+#ifdef NINFER_VOLTA_BUILD
+        return kFp8LinearSmallTMax<Fp8VocabularyTp4ColumnGeometry>;
+#else
+        break;
+#endif
     case Fp8Problem::Residual6144:
         return kFp8LinearSmallTMax<Fp8Residual6144Geometry>;
     case Fp8Problem::Residual17408:
@@ -444,8 +567,14 @@ inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
         return kFp8LinearSmallTMax<Fp8Residual6144Tp2RowGeometry>;
     case Fp8Problem::Residual17408Tp2Row:
         return kFp8LinearSmallTMax<Fp8Residual17408Tp2RowGeometry>;
+    case Fp8Problem::Residual6144Tp4Row:
+        return kFp8LinearSmallTMax<Fp8Residual6144Tp4RowGeometry>;
+    case Fp8Problem::Residual17408Tp4Row:
+        return kFp8LinearSmallTMax<Fp8Residual17408Tp4RowGeometry>;
     case Fp8Problem::MlpGateUpTp2Column:
     case Fp8Problem::AttnInputTp2Column:
+    case Fp8Problem::MlpGateUpTp4Column:
+    case Fp8Problem::AttnInputTp4Column:
         // Not routed through ops::linear's own kernel-level dispatch (linear_swiglu / attn_input_proj
         // own their own registries under src/ops/<family>/fp8) -- unreachable from here.
         break;
@@ -551,6 +680,36 @@ struct Fp8LinearSmallTProductionSchedule<Fp8MlpGateUpTp2ColumnGeometry, ActiveTo
 
 template <int ActiveTokens>
 struct Fp8LinearSmallTProductionSchedule<Fp8AttnInputTp2ColumnGeometry, ActiveTokens>
+    : Fp8LinearSmallTProductionSchedule<Fp8AttnInputGeometry, ActiveTokens> {};
+
+// Every new tp4 shard inherits its parent's measured small-T schedule at every T, like the tp2
+// shards above.
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8GdnInputTp4ColumnGeometry, ActiveTokens>
+    : Fp8LinearSmallTProductionSchedule<Fp8GdnInputGeometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8Residual6144Tp4RowGeometry, ActiveTokens>
+    : Fp8LinearSmallTProductionSchedule<Fp8Residual6144Geometry, ActiveTokens> {};
+
+// The tp4 residual-17408 row shard halves K to 4352 = 2^8*17; the parent's ValuesPerLane=16
+// (256-value phase, 512) does not divide it, so pin ValuesPerLane=8 (256 phase -> 17 phases),
+// preserving the parent's phase count of 17.
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8Residual17408Tp4RowGeometry, ActiveTokens> {
+    static_assert(ActiveTokens >= kFp8FirstSmallT);
+    static_assert(ActiveTokens <= kFp8LinearSmallTMax<Fp8Residual17408Tp4RowGeometry>);
+    using Type = Fp8SmallTSchedule<8, 2, 8, ActiveTokens, 1,
+                                   Fp8SmallTActivationAccess::TokenPacked, Fp8CodeCache::Default, 1,
+                                   Fp8SmallTBlockOrder::RowsContiguous, 1>;
+};
+
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8MlpGateUpTp4ColumnGeometry, ActiveTokens>
+    : Fp8LinearSmallTProductionSchedule<Fp8MlpGateUpGeometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8AttnInputTp4ColumnGeometry, ActiveTokens>
     : Fp8LinearSmallTProductionSchedule<Fp8AttnInputGeometry, ActiveTokens> {};
 
 } // namespace ninfer::ops::detail

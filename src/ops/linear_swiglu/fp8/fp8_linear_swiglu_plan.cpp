@@ -180,6 +180,8 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 std::size_t fp8_linear_swiglu_shard_workspace_capacity_bytes(LinearPolicy policy,
                                                              std::int32_t min_tokens,
                                                              std::int32_t max_tokens) {
+    // The tp2 shard is the wider of the two column shards (17408 vs tp4's 8704 output rows), and
+    // every shard-scaling workspace term grows with N, so its capacity bounds tp4 too.
     return capacity_bytes_impl<Fp8MlpGateUpTp2ColumnGeometry>(policy, min_tokens, max_tokens);
 }
 
@@ -205,7 +207,11 @@ void fp8_linear_swiglu_dispatch_shard(const Tensor& x, const Weight& weight, Ten
             throw std::invalid_argument(
                 "fp8 A16 linear_swiglu column-parallel requires caller workspace");
         }
-        launch_a16<Fp8MlpGateUpTp2ColumnGeometry>(x, weight, out, *workspace, stream);
+        if (weight.n == Fp8MlpGateUpTp4ColumnGeometry::kOutputRows) {
+            launch_a16<Fp8MlpGateUpTp4ColumnGeometry>(x, weight, out, *workspace, stream);
+        } else {
+            launch_a16<Fp8MlpGateUpTp2ColumnGeometry>(x, weight, out, *workspace, stream);
+        }
         return;
     }
     if (workspace == nullptr) {

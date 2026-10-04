@@ -391,20 +391,20 @@ public:
     LoadedModelData(LoadedModelData&&)                 = delete;
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
-    // The model view for one rank. `runtime` is rank 0's (the only one at tp == 1); `runtime_peer`
-    // holds rank 1's at tp == 2. Both describe the SHARD that rank's arena holds, not the whole
-    // model -- every sharded extent in the view is already divided by tp.
+    // The model view for one rank. Each entry describes the SHARD that rank's arena holds, not the
+    // whole model -- every sharded extent in the view is already divided by tp. Entries [0, tp) are
+    // populated; [tp, kMaximumDevices) stay empty.
     [[nodiscard]] const RuntimeModelView& view(int rank) const {
-        if (rank == 0) { return runtime; }
-        if (rank == 1 && runtime_peer.has_value()) { return *runtime_peer; }
-        throw std::out_of_range("qwen3_6_27b model view rank is out of range");
+        if (rank < 0 || rank >= tp) {
+            throw std::out_of_range("qwen3_6_27b model view rank is out of range");
+        }
+        return *runtime[static_cast<std::size_t>(rank)];
     }
 
     artifact::MaterializedArtifact backing;
     qwen3_6::FrontendResources frontend;
     int tp = 1;
-    RuntimeModelView runtime;
-    std::optional<RuntimeModelView> runtime_peer;
+    std::array<std::optional<RuntimeModelView>, artifact::kMaximumDevices> runtime;
 
 private:
     void build_device_view(const BindingPlan& plan, int device, RuntimeModelView& runtime);

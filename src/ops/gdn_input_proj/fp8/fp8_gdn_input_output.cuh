@@ -53,9 +53,9 @@ static_assert((Fp8GdnInputOutput::kZRows % 128) == 0);
 // object -- it is the flagship Qwen38Nvfp4 profile's own binding for `gdn/query_key_value_z`.
 template <class Geometry>
 struct Fp8GdnInputShardOutput {
-    static constexpr std::int32_t kKeyRows   = 1024;
-    static constexpr std::int32_t kValueRows = 3072;
-    static constexpr std::int32_t kQkvRows   = 2 * kKeyRows + kValueRows;
+    static constexpr std::int32_t kKeyRows   = Geometry::kOutputRows / 8;
+    static constexpr std::int32_t kValueRows = 3 * kKeyRows;
+    static constexpr std::int32_t kQkvRows   = 5 * kKeyRows;
     static constexpr std::int32_t kZRows     = kValueRows;
 
     static_assert(Geometry::kOutputRows == kQkvRows + kZRows);

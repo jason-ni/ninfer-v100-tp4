@@ -155,14 +155,14 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
-| `--devices A,B` | one CUDA device index per `--tp` rank; required for `--tp 2` | `--device` |
+| `--tp 1\|2\|4` | tensor-parallel width; `2` or `4` splits the model across that many GPUs | `1` |
+| `--devices A,B[,...]` | one CUDA device index per `--tp` rank; required for `--tp 2` or `--tp 4` | `--device` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
-| `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
+| `--cuda-graph` / `--no-cuda-graph` | force CUDA Graph capture on/off | off at `--tp > 1`, on at `--tp 1` |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |
@@ -204,32 +204,36 @@ token is off-distribution and its text is not a product output.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
 
-## Dual-GPU execution
+## Tensor-parallel execution
 
-`--tp 2` splits one resident model across two CUDA devices and requires an explicit `--devices A,B`
-naming two distinct devices of the same compute capability. `--device` alone selects the single
-device used at the default `--tp 1`; when both are given they must agree on the primary device.
+`--tp 2` or `--tp 4` splits one resident model across that many CUDA devices and requires an explicit
+`--devices A,B` (or `A,B,C,D`) naming that many distinct devices of the same compute capability.
+`--device` alone selects the single device used at the default `--tp 1`; when both are given they
+must agree on the primary device.
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
-  --tp 2 --devices 0,1 \
+  --tp 4 --devices 0,1,2,3 \
   --max-context 262144 --kv-dtype int8 --kv-capacity auto \
   --messages long_prompt.json --max-new 256 --no-thinking
 ```
 
 Tensor-parallel execution is implemented for the 27B execution package (`qwen3.6-27b` and
-`qwen3.8-27b`, either weight profile). `qwen3.6-35b-a3b` has no tensor-parallel path and rejects
-`--tp 2` at startup, as does `--vision`. `--spec mtp` and optional Qwen3.8 DFlash2 are supported
-at `--tp 2`, including compatible-prefix reuse in a resident Engine. Both suffix prefill and exact-frontier
-sampling restore the complete state on both devices. The HTTP server enables reuse by default;
-separate CLI processes do not share a cache.
+`qwen3.8-27b`, either weight profile) at width 1, 2, or 4. `qwen3.6-35b-a3b` has no tensor-parallel
+path and rejects `--tp 2`/`--tp 4` at startup, as does `--vision`. `--spec mtp` is supported at all
+tensor-parallel widths, including compatible-prefix reuse in a resident Engine. Optional Qwen3.8
+DFlash2 remains limited to `--tp 2`. Both suffix prefill and exact-frontier sampling restore the
+complete state on every device. The HTTP server enables reuse by default; separate CLI processes do
+not share a cache.
 
 The load summary reports weights, KV pool, GDN state, sequence, workspace, CUDA Graph and reserved
-bytes per device, plus a free/total row for each. `--no-cuda-graph` runs decode eagerly; at `--tp 2`
-that is the same two-stream forward pass without a captured graph, and the tokens are identical.
-`--tp 1` is bit-identical to single-device execution.
+bytes per device, plus a free/total row for each. `--cuda-graph` captures one cross-device decode
+graph and `--no-cuda-graph` runs the same multi-stream forward pass eagerly with cross-device event
+synchronization; the tokens are identical. Graphs default off at `--tp > 1` because on this V100
+target the multi-device graph replays with GPU idle bubbles and is slower than eager, and on at
+`--tp 1`. `--tp 1` is bit-identical to single-device execution.
 
-Speculative decoding at `--tp 2` is output-equivalent to non-speculative decoding rather than
+Speculative decoding at `--tp > 1` is output-equivalent to non-speculative decoding rather than
 bit-identical: a verify round evaluates the target model over `draft_tokens + 1` columns at once
 while an ordinary round evaluates one, which selects different GEMM shapes, so greedy streams can
 diverge on a near-tie token. Every committed token is still one the target model's own argmax

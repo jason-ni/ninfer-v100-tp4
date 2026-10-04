@@ -40,13 +40,15 @@ void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& o
                                 LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream);
 
-// --- tp2 column-shard forms (Fp8MlpGateUpTp2ColumnGeometry, 17408x5120) ------------------------
+// --- tp2/tp4 column-shard forms (Fp8MlpGateUpTp2ColumnGeometry, 17408x5120 /
+// Fp8MlpGateUpTp4ColumnGeometry, 8704x5120) -------------------------------------------------------
 //
-// Same kernel templates as the tp1 forms above, instantiated at the shard's halved N (see
+// Same kernel templates as the tp1 forms above, instantiated at the shard's halved/quartered N (see
 // src/ops/linear/fp8/fp8_config.h and each .cu file's Geometry template parameter). Route
 // selection (resolve_route) is inherited from the parent unchanged -- a pure function of
 // (policy, token count), not of N/K. Workspace is sized separately because the QPN scratch and
-// materialized CUTLASS plane both scale with the shard's halved output extent.
+// materialized CUTLASS plane both scale with the shard's output extent; the wider tp2 shard
+// provides the bound for both.
 void fp8_linear_swiglu_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,
                                            cudaStream_t stream);
 void fp8_linear_swiglu_small_t_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,

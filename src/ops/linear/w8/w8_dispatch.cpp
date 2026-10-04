@@ -5,19 +5,28 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// TP2 shard geometries. See the block comment in q5_dispatch.cpp for the rules; in particular W8's
-// small-T table is a set of compile-time exact geometries (attention/GDN/MTP), so a shard uses the
-// generic SIMT/MMA launchers instead. Returns nullptr when (n, k) is not a registered shard
-// extent.
+// TP2/TP4 shard geometries. See the block comment in q5_dispatch.cpp for the rules; in particular
+// W8's small-T table is a set of compile-time exact geometries (attention/GDN/MTP), so a shard uses
+// the generic SIMT/MMA launchers instead. Returns nullptr when (n, k) is not a registered shard
+// extent. A shard extent is width-independent: the tp2 and tp4 rows below are the same logical
+// sections split two and four ways, and the generic launchers are exact for any such (n, k).
 W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    const bool column_shard = k == 5120 && (n == 512 ||     // 1024   / 2
-                                            n == 3072 ||    // 6144   / 2
-                                            n == 7168 ||    // 14336  / 2 (attention input)
-                                            n == 17408 ||   // 34816  / 2 (mlp/gate_up)
-                                            n == 124160);   // 248320 / 2 (output_head)
-    const bool row_shard    = n == 5120 && (k == 3072 ||    // 6144   / 2 (attention/gdn output)
-                                            k == 5120 ||    // 10240  / 2 (mtp/input_projection)
-                                            k == 8704);     // 17408  / 2 (mlp/down)
+    const bool column_shard = k == 5120 && (n == 512 ||      // 1024   / 2
+                                            n == 3072 ||     // 6144   / 2
+                                            n == 7168 ||     // 14336  / 2 (attention input)
+                                            n == 17408 ||    // 34816  / 2 (mlp/gate_up)
+                                            n == 124160 ||   // 248320 / 2 (output_head)
+                                            n == 256 ||      // 1024   / 4
+                                            n == 1536 ||     // 6144   / 4
+                                            n == 3584 ||     // 14336  / 4 (attention input)
+                                            n == 8704 ||     // 34816  / 4 (mlp/gate_up)
+                                            n == 62080);     // 248320 / 4 (output_head)
+    const bool row_shard    = n == 5120 && (k == 3072 ||     // 6144   / 2 (attention/gdn output)
+                                            k == 5120 ||     // 10240  / 2 (mtp/input_projection)
+                                            k == 8704 ||     // 17408  / 2 (mlp/down)
+                                            k == 1536 ||     // 6144   / 4 (attention/gdn output)
+                                            k == 2560 ||     // 10240  / 4 (mtp/input_projection)
+                                            k == 4352);      // 17408  / 4 (mlp/down)
     if (!column_shard && !row_shard) { return nullptr; }
     if (t <= 4) { return launch_w8_simt_r8_c4; }
     if (t <= 16) { return launch_w8_simt_r8_c8; }

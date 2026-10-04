@@ -5,13 +5,13 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// --- TP2 shard geometries ---------------------------------------------------------------------
+// --- TP2/TP4 shard geometries ----------------------------------------------------------------
 //
-// A tp2 shard is the same row-split tensor with one axis halved: a column-parallel shard halves N
-// (attention/query_key, attention/gate_value, mlp/gate_up, gdn/*), a row-parallel shard halves K
+// A shard is the same row-split tensor with one axis divided: a column-parallel shard divides N
+// (attention/query_key, attention/gate_value, mlp/gate_up, gdn/*), a row-parallel shard divides K
 // (attention/output, gdn/output, mlp/down). No new kernel exists -- every launcher named below
 // reads its extents from the tensors, so a shard entry only records which launcher serves the
-// halved extent and the halved grid follows automatically.
+// divided extent and the divided grid follows automatically.
 //
 // Two deliberate rules, stated once here and followed by every groupwise family:
 //
@@ -20,19 +20,24 @@ namespace {
 //      the one it was.
 //   2. A shard uses the family's GENERIC runtime-dimension launchers. It deliberately does not
 //      inherit the parent's compile-time EXACT instantiations (q5's gemv_r16_s2_x is N-exact and
-//      its split2 SIMT is K-exact, so neither covers a halved extent), and it deliberately does
+//      its split2 SIMT is K-exact, so neither covers a divided extent), and it deliberately does
 //      not get its own exact instantiation: that would be a second tuned kernel set to qualify.
 //      This is a performance choice only -- the generic launchers are the same qualified compute
-//      body -- and re-measuring the halved crossovers is a separate, benchmarked change.
+//      body -- and re-measuring the divided crossovers is a separate, benchmarked change.
 //
 // Returns nullptr when (n, k) is not a registered shard extent, so the caller falls through to the
 // tp1 table and its error message.
-Q5Launch select_q5_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+Q5Launch select_q5_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     const bool column_shard = k == 5120 && (n == 512 ||   // 1024  / 2
                                             n == 3072 ||  // 6144  / 2
-                                            n == 3584);   // 7168  / 2
+                                            n == 3584 ||  // 7168  / 2
+                                            n == 256 ||   // 1024  / 4
+                                            n == 1536 ||  // 6144  / 4
+                                            n == 1792);   // 7168  / 4
     const bool row_shard    = n == 5120 && (k == 3072 ||  // 6144  / 2 (attention/gdn output)
-                                            k == 8704);   // 17408 / 2 (mlp/down)
+                                            k == 8704 ||  // 17408 / 2 (mlp/down)
+                                            k == 1536 ||  // 6144  / 4 (attention/gdn output)
+                                            k == 4352);   // 17408 / 4 (mlp/down)
     if (!column_shard && !row_shard) { return nullptr; }
     if (t <= 4) { return launch_q5_simt_r8_c4; }
     if (t <= 24) { return launch_q5_simt_r8_c8; }
@@ -117,7 +122,7 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (const Q5Launch tp1 = select_q5_a16_registered(n, k, t); tp1 != nullptr) {
         return tp1;
     }
-    if (const Q5Launch shard = select_q5_tp2_shard_launch(n, k, t); shard != nullptr) {
+    if (const Q5Launch shard = select_q5_shard_launch(n, k, t); shard != nullptr) {
         return shard;
     }
     throw std::invalid_argument("q5 linear: unsupported shape or T");

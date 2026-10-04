@@ -332,101 +332,101 @@ namespace {
 
 } // namespace
 
-void Variant::attention_projection(const std::array<Tensor, 2>&,
-                                   const std::array<const FullAttentionProjectionWeights*, 2>&,
-                                   const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                   const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                   qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&,
+void Variant::attention_projection(const std::array<Tensor, kMaximumDevices>&,
+                                   const std::array<const FullAttentionProjectionWeights*, kMaximumDevices>&,
+                                   const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+                                   const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+                                   qwen3_6::TextPhase, const std::array<WorkspaceArena*, kMaximumDevices>&,
                                    const ExecutionContext&) {
     reject_tensor_parallel("attention_projection");
 }
 
-void Variant::attention_output_projection(const std::array<Tensor, 2>&,
-                                          const std::array<Weight, 2>&,
-                                          const std::array<Tensor, 2>&,
-                                          const std::array<Tensor, 2>&, qwen3_6::TextPhase,
-                                          const std::array<WorkspaceArena*, 2>&,
+void Variant::attention_output_projection(const std::array<Tensor, kMaximumDevices>&,
+                                          const std::array<Weight, kMaximumDevices>&,
+                                          const std::array<Tensor, kMaximumDevices>&,
+                                          const std::array<Tensor, kMaximumDevices>&, qwen3_6::TextPhase,
+                                          const std::array<WorkspaceArena*, kMaximumDevices>&,
                                           const ExecutionContext&, const ops::PeerEvents&) {
     reject_tensor_parallel("attention_output_projection");
 }
 
-void Variant::gdn_input_projection(const std::array<Tensor, 2>&,
-                                   const std::array<const GdnProjectionWeights*, 2>&,
-                                   const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                   qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&,
+void Variant::gdn_input_projection(const std::array<Tensor, kMaximumDevices>&,
+                                   const std::array<const GdnProjectionWeights*, kMaximumDevices>&,
+                                   const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+                                   qwen3_6::TextPhase, const std::array<WorkspaceArena*, kMaximumDevices>&,
                                    const ExecutionContext&) {
     reject_tensor_parallel("gdn_input_projection");
 }
 
 void Variant::gdn_input_projection_snapshot(
-    const std::array<Tensor, 2>&, const std::array<const GdnProjectionWeights*, 2>&,
-    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-    qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&, const ExecutionContext&) {
+    const std::array<Tensor, kMaximumDevices>&, const std::array<const GdnProjectionWeights*, kMaximumDevices>&,
+    const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+    const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+    const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+    qwen3_6::TextPhase, const std::array<WorkspaceArena*, kMaximumDevices>&, const ExecutionContext&) {
     reject_tensor_parallel("gdn_input_projection_snapshot");
 }
 
-void Variant::gdn_output_projection(const std::array<Tensor, 2>&, const std::array<Weight, 2>&,
-                                    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                    qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&,
+void Variant::gdn_output_projection(const std::array<Tensor, kMaximumDevices>&, const std::array<Weight, kMaximumDevices>&,
+                                    const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+                                    qwen3_6::TextPhase, const std::array<WorkspaceArena*, kMaximumDevices>&,
                                     const ExecutionContext&, const ops::PeerEvents&) {
     reject_tensor_parallel("gdn_output_projection");
 }
 
-void Variant::gdn_control_projection(const std::array<Tensor, 2>&,
-                                     const std::array<const GdnProjectionWeights*, 2>&,
-                                     const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                     const std::array<WorkspaceArena*, 2>&,
+void Variant::gdn_control_projection(const std::array<Tensor, kMaximumDevices>&,
+                                     const std::array<const GdnProjectionWeights*, kMaximumDevices>&,
+                                     const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+                                     const std::array<WorkspaceArena*, kMaximumDevices>&,
                                      const ExecutionContext&) {
     reject_tensor_parallel("gdn_control_projection");
 }
 
-void Variant::post_mixer(const std::array<Tensor, 2>&,
-                         const std::array<const PostMixerWeights*, 2>&,
-                         const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                         qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&,
+void Variant::post_mixer(const std::array<Tensor, kMaximumDevices>&,
+                         const std::array<const PostMixerWeights*, kMaximumDevices>&,
+                         const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+                         qwen3_6::TextPhase, const std::array<WorkspaceArena*, kMaximumDevices>&,
                          const ExecutionContext&, const ops::PeerEvents&) {
     reject_tensor_parallel("post_mixer");
 }
 
 void Variant::gdn_input_projection_record(
-    const std::array<Tensor, 2>&, const std::array<const GdnProjectionWeights*, 2>&,
-    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-    qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&, const ExecutionContext&) {
+    const std::array<Tensor, kMaximumDevices>&, const std::array<const GdnProjectionWeights*, kMaximumDevices>&,
+    const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+    const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+    const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+    qwen3_6::TextPhase, const std::array<WorkspaceArena*, kMaximumDevices>&, const ExecutionContext&) {
     reject_tensor_parallel("gdn_input_projection_record");
 }
 
-void Variant::mtp_attention_projection(const std::array<Tensor, 2>&,
-                                       const std::array<const MtpAttentionProjectionWeights*, 2>&,
-                                       const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                       const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                       const std::array<WorkspaceArena*, 2>&,
+void Variant::mtp_attention_projection(const std::array<Tensor, kMaximumDevices>&,
+                                       const std::array<const MtpAttentionProjectionWeights*, kMaximumDevices>&,
+                                       const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+                                       const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+                                       const std::array<WorkspaceArena*, kMaximumDevices>&,
                                        const ExecutionContext&) {
     reject_tensor_parallel("mtp_attention_projection");
 }
 
-void Variant::mtp_kv_projection(const std::array<Tensor, 2>&,
-                                const std::array<const MtpAttentionProjectionWeights*, 2>&,
-                                const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                const std::array<WorkspaceArena*, 2>&, const ExecutionContext&) {
+void Variant::mtp_kv_projection(const std::array<Tensor, kMaximumDevices>&,
+                                const std::array<const MtpAttentionProjectionWeights*, kMaximumDevices>&,
+                                const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+                                const std::array<WorkspaceArena*, kMaximumDevices>&, const ExecutionContext&) {
     reject_tensor_parallel("mtp_kv_projection");
 }
 
-void Variant::mtp_q_gate_projection(const std::array<Tensor, 2>&,
-                                    const std::array<const MtpAttentionProjectionWeights*, 2>&,
-                                    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                    const std::array<WorkspaceArena*, 2>&,
+void Variant::mtp_q_gate_projection(const std::array<Tensor, kMaximumDevices>&,
+                                    const std::array<const MtpAttentionProjectionWeights*, kMaximumDevices>&,
+                                    const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+                                    const std::array<WorkspaceArena*, kMaximumDevices>&,
                                     const ExecutionContext&) {
     reject_tensor_parallel("mtp_q_gate_projection");
 }
 
-void Variant::mtp_post_mixer(const std::array<Tensor, 2>&,
-                             const std::array<const MtpPostMixerWeights*, 2>&,
-                             const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                             const std::array<WorkspaceArena*, 2>&, const ExecutionContext&,
+void Variant::mtp_post_mixer(const std::array<Tensor, kMaximumDevices>&,
+                             const std::array<const MtpPostMixerWeights*, kMaximumDevices>&,
+                             const std::array<Tensor, kMaximumDevices>&, const std::array<Tensor, kMaximumDevices>&,
+                             const std::array<WorkspaceArena*, kMaximumDevices>&, const ExecutionContext&,
                              const ops::PeerEvents&) {
     reject_tensor_parallel("mtp_post_mixer");
 }

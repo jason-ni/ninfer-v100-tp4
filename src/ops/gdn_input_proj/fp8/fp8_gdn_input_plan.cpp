@@ -94,23 +94,27 @@ void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& q
     }
 }
 
-// The tp2 column shard -- halved row counts (Fp8GdnInputTp2ColumnGeometry's own
-// qkv=5120=1024+1024+3072, z=3072).
+// The tp2/tp4 column shards -- halved/quartered row counts (tp2's own qkv=5120=1024+1024+3072,
+// z=3072; tp4's own qkv=2560=512+512+1536, z=1536).
 void fp8_gdn_input_a16_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
                                       Tensor& z, WorkspaceArena* workspace,
                                       cudaStream_t stream) {
-    constexpr std::int32_t kQkvRows = 5120;
-    constexpr std::int32_t kZRows   = 3072;
+    const bool tp4                  = weight.n == Fp8GdnInputTp4ColumnGeometry::kOutputRows;
+    const std::int32_t kQkvRows     = tp4 ? 2560 : 5120;
+    const std::int32_t kZRows       = tp4 ? 1536 : 3072;
 #ifdef NINFER_VOLTA_BUILD
     if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
         fp8_gdn_input_cutlass_sm70_launch_shard(x, weight, qkv, z, *workspace, stream);
         return;
     }
-    const std::int32_t kChunk = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens)
-                                    ? kFp8VoltaQpnMaxTokens
-                                    : kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
+    const std::int32_t kChunk =
+        fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens)
+            ? kFp8VoltaQpnMaxTokens
+            : (tp4 ? kFp8LinearSmallTMax<Fp8GdnInputTp4ColumnGeometry>
+                   : kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>);
 #else
-    constexpr std::int32_t kChunk = kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
+    const std::int32_t kChunk = tp4 ? kFp8LinearSmallTMax<Fp8GdnInputTp4ColumnGeometry>
+                                    : kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
 #endif
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);

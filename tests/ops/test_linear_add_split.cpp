@@ -403,16 +403,16 @@ int run_case(const Case& test_case, const ExecutionContext& ec, const ops::PeerE
                 staging[slot].emplace(elements * sizeof(std::uint16_t));
             }
 
-            const std::array<Tensor, 2> x{Tensor(shard_x[0].p, DType::BF16, {sk, tokens}),
+            const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(shard_x[0].p, DType::BF16, {sk, tokens}),
                                           Tensor(shard_x[1].p, DType::BF16, {sk, tokens})};
-            const std::array<Weight, 2> w{shard[0].weight, shard[1].weight};
-            const std::array<Tensor, 2> residual{
+            const std::array<Weight, ninfer::kMaximumDevices> w{shard[0].weight, shard[1].weight};
+            const std::array<Tensor, ninfer::kMaximumDevices> residual{
                 Tensor(split_residual[0]->data(), DType::BF16, {n, tokens}),
                 Tensor(split_residual[1]->data(), DType::BF16, {n, tokens})};
-            const std::array<Tensor, 2> staging_view{
+            const std::array<Tensor, ninfer::kMaximumDevices> staging_view{
                 Tensor(staging[0]->p, DType::BF16, {n, tokens}),
                 Tensor(staging[1]->p, DType::BF16, {n, tokens})};
-            const std::array<ninfer::WorkspaceArena*, 2> workspace{&*arena[0], &*arena[1]};
+            const std::array<ninfer::WorkspaceArena*, ninfer::kMaximumDevices> workspace{&*arena[0], &*arena[1]};
 
             retire_staging(ec);
             ops::linear_add_row_parallel(x, w, residual, staging_view, policy, workspace, ec,
@@ -593,38 +593,38 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
     fake.k     = kK;
 
     expect_throw("token count", [&] {
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kK, 2}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(x0.p, DType::BF16, {kK, 2}),
                                       Tensor(x1.p, DType::BF16, {kK, 1})};
-        const std::array<Tensor, 2> r{Tensor(r0.p, DType::BF16, {kN, 2}),
+        const std::array<Tensor, ninfer::kMaximumDevices> r{Tensor(r0.p, DType::BF16, {kN, 2}),
                                       Tensor(r1.p, DType::BF16, {kN, 1})};
-        const std::array<Tensor, 2> staging{Tensor(stage0.p, DType::BF16, {kN, 2}),
+        const std::array<Tensor, ninfer::kMaximumDevices> staging{Tensor(stage0.p, DType::BF16, {kN, 2}),
                                             Tensor(stage1.p, DType::BF16, {kN, 1})};
-        ops::linear_add_row_parallel(x, {fake, fake}, r, staging, ec, events);
+        ops::linear_add_row_parallel(x, std::array<Weight, ninfer::kMaximumDevices>{fake, fake}, r, staging, ec, events);
     });
 
     expect_throw("row N", [&] {
         Weight other = fake;
         other.n      = kN / 2;
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kK, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(x0.p, DType::BF16, {kK, 1}),
                                       Tensor(x1.p, DType::BF16, {kK, 1})};
-        const std::array<Tensor, 2> r{Tensor(r0.p, DType::BF16, {kN, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> r{Tensor(r0.p, DType::BF16, {kN, 1}),
                                       Tensor(r1.p, DType::BF16, {kN / 2, 1})};
-        const std::array<Tensor, 2> staging{Tensor(stage0.p, DType::BF16, {kN, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> staging{Tensor(stage0.p, DType::BF16, {kN, 1}),
                                             Tensor(stage1.p, DType::BF16, {kN / 2, 1})};
-        ops::linear_add_row_parallel(x, {fake, other}, r, staging, ec, events);
+        ops::linear_add_row_parallel(x, std::array<Weight, ninfer::kMaximumDevices>{fake, other}, r, staging, ec, events);
     });
 
     expect_throw("tp1 context", [&] {
         const ExecutionContext single({0});
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kK, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(x0.p, DType::BF16, {kK, 1}),
                                       Tensor(x1.p, DType::BF16, {kK, 1})};
-        const std::array<Tensor, 2> r{Tensor(r0.p, DType::BF16, {kN, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> r{Tensor(r0.p, DType::BF16, {kN, 1}),
                                       Tensor(r1.p, DType::BF16, {kN, 1})};
-        const std::array<Tensor, 2> staging{Tensor(stage0.p, DType::BF16, {kN, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> staging{Tensor(stage0.p, DType::BF16, {kN, 1}),
                                             Tensor(stage1.p, DType::BF16, {kN, 1})};
         // require_split_context rejects `single` before events is ever touched, so the outer
         // (valid) events object is fine to reuse here.
-        ops::linear_add_row_parallel(x, {fake, fake}, r, staging, single, events);
+        ops::linear_add_row_parallel(x, std::array<Weight, ninfer::kMaximumDevices>{fake, fake}, r, staging, single, events);
     });
 
     expect_throw("unsupported format", [&] {
@@ -632,13 +632,13 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
         w8.qtype  = QType::W8G32_F16S;
         w8.n      = kN;
         w8.k      = kK;
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kK, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> x{Tensor(x0.p, DType::BF16, {kK, 1}),
                                       Tensor(x1.p, DType::BF16, {kK, 1})};
-        const std::array<Tensor, 2> r{Tensor(r0.p, DType::BF16, {kN, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> r{Tensor(r0.p, DType::BF16, {kN, 1}),
                                       Tensor(r1.p, DType::BF16, {kN, 1})};
-        const std::array<Tensor, 2> staging{Tensor(stage0.p, DType::BF16, {kN, 1}),
+        const std::array<Tensor, ninfer::kMaximumDevices> staging{Tensor(stage0.p, DType::BF16, {kN, 1}),
                                             Tensor(stage1.p, DType::BF16, {kN, 1})};
-        ops::linear_add_row_parallel(x, {w8, w8}, r, staging, ec, events);
+        ops::linear_add_row_parallel(x, std::array<Weight, ninfer::kMaximumDevices>{w8, w8}, r, staging, ec, events);
     });
 
     std::cout << (failures ? "FAIL" : "OK") << " split rejections\n";

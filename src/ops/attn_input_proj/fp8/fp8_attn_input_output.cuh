@@ -61,9 +61,9 @@ struct Fp8AttentionInputOutput {
 // was -- every existing tp1 call site continues to build the identical 4-tensor aggregate.
 template <class Geometry>
 struct Fp8AttentionInputShardOutput {
-    static constexpr std::int32_t kQueryRows  = 3072;
-    static constexpr std::int32_t kKeyRows    = 512;
-    static constexpr std::int32_t kGateRows   = 3072;
+    static constexpr std::int32_t kKeyRows    = Geometry::kOutputRows / 14;
+    static constexpr std::int32_t kQueryRows  = 6 * kKeyRows;
+    static constexpr std::int32_t kGateRows   = kQueryRows;
     static constexpr std::int32_t kKeyBegin   = kQueryRows;
     static constexpr std::int32_t kGateBegin  = kKeyBegin + kKeyRows;
     static constexpr std::int32_t kValueBegin = kGateBegin + kGateRows;

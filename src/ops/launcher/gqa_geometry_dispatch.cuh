@@ -36,11 +36,17 @@ static_assert(Gqa35Geometry::QHeads == 16 && Gqa35Geometry::KVHeads == 2,
 static_assert(Gqa27Tp2Geometry::QHeads == 12 && Gqa27Tp2Geometry::KVHeads == 2,
               "gqa_attention.cpp's kv_heads_for_q_heads() mirrors 12|2; update it and this assert "
               "together");
+static_assert(Gqa27Tp4Geometry::QHeads == 6 && Gqa27Tp4Geometry::KVHeads == 1,
+              "gqa_attention.cpp's kv_heads_for_q_heads() mirrors 6|1; update it and this assert "
+              "together");
 
 // Q-head counts must stay pairwise distinct, or selection by Q-head count is not a function.
 static_assert(Gqa27Geometry::QHeads != Gqa35Geometry::QHeads &&
               Gqa27Geometry::QHeads != Gqa27Tp2Geometry::QHeads &&
-              Gqa35Geometry::QHeads != Gqa27Tp2Geometry::QHeads);
+              Gqa35Geometry::QHeads != Gqa27Tp2Geometry::QHeads &&
+              Gqa27Geometry::QHeads != Gqa27Tp4Geometry::QHeads &&
+              Gqa35Geometry::QHeads != Gqa27Tp4Geometry::QHeads &&
+              Gqa27Tp2Geometry::QHeads != Gqa27Tp4Geometry::QHeads);
 
 // Every registered geometry's KV-head count must be served by an append representative.
 constexpr bool gqa_kv_head_count_is_represented(int kv_heads) {

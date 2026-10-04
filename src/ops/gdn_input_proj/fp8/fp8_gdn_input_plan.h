@@ -36,7 +36,7 @@ void fp8_gdn_input_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qk
 void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
 
-// --- tp2 column-shard siblings, instantiated at Fp8GdnInputTp2ColumnGeometry. ---
+// --- tp2/tp4 column-shard siblings (Fp8GdnInputTp2ColumnGeometry / Fp8GdnInputTp4ColumnGeometry). ---
 
 void fp8_gdn_input_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
                                        Tensor& z, cudaStream_t stream);

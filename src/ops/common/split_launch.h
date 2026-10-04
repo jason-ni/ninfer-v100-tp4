@@ -62,9 +62,16 @@ private:
 };
 
 inline void require_split_context(const ExecutionContext& ec, const char* message) {
-    if (ec.tp != 2 || !ec.dev[0].has_value() || !ec.dev[1].has_value() ||
-        ec.dev[0]->device == ec.dev[1]->device) {
+    if (ec.tp < 2 || ec.tp > static_cast<int>(kMaximumDevices)) {
         throw std::invalid_argument(message);
+    }
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        if (!ec.dev[rank].has_value()) { throw std::invalid_argument(message); }
+        for (int other = rank + 1; other < ec.tp; ++other) {
+            if (ec.dev[rank]->device == ec.dev[other]->device) {
+                throw std::invalid_argument(message);
+            }
+        }
     }
 }
 
@@ -100,13 +107,13 @@ inline void require_rank_residency([[maybe_unused]] const ExecutionContext& ec,
 #endif
 }
 
-// Issues `body(rank)` for rank 0 then rank 1 with that rank's device current, restoring the
-// caller's current device afterwards. Rank order is fixed and the calls are enqueue-only, so two
+// Issues `body(rank)` for rank 0 through ec.tp - 1 with that rank's device current, restoring the
+// caller's current device afterwards. Rank order is fixed and the calls are enqueue-only, so all
 // ranks' kernels overlap on the device even though the host issues them in sequence.
 template <class Body>
 void for_each_rank(const ExecutionContext& ec, Body&& body) {
     const CurrentDeviceScope scope;
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         CurrentDeviceScope::set(ec.dev[rank]->device);
         body(rank);
     }

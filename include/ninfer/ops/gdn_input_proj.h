@@ -286,24 +286,24 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
 [[nodiscard]] std::size_t gdn_input_proj_column_parallel_workspace_capacity_bytes(
     QType qtype, LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
 
-void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                    const std::array<Weight, 2>& query_key_value_z_weight,
-                                    const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+void gdn_input_proj_column_parallel(const std::array<Tensor, kMaximumDevices>& x,
+                                    const std::array<Weight, kMaximumDevices>& query_key_value_z_weight,
+                                    const std::array<Tensor, kMaximumDevices>& qkv, const std::array<Tensor, kMaximumDevices>& z,
                                     LinearPolicy policy,
-                                    const std::array<WorkspaceArena*, 2>& workspace,
+                                    const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
                                     const ExecutionContext& ec);
 
 /** A16-only convenience overload, no policy/workspace. */
-void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                    const std::array<Weight, 2>& query_key_value_z_weight,
-                                    const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+void gdn_input_proj_column_parallel(const std::array<Tensor, kMaximumDevices>& x,
+                                    const std::array<Weight, kMaximumDevices>& query_key_value_z_weight,
+                                    const std::array<Tensor, kMaximumDevices>& qkv, const std::array<Tensor, kMaximumDevices>& z,
                                     const ExecutionContext& ec);
 
 /** Q4G64_F16S/Q5G64_F16S split-storage two-weight form. */
-void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                    const std::array<Weight, 2>& query_key_weight,
-                                    const std::array<Weight, 2>& value_z_weight,
-                                    const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+void gdn_input_proj_column_parallel(const std::array<Tensor, kMaximumDevices>& x,
+                                    const std::array<Weight, kMaximumDevices>& query_key_weight,
+                                    const std::array<Weight, kMaximumDevices>& value_z_weight,
+                                    const std::array<Tensor, kMaximumDevices>& qkv, const std::array<Tensor, kMaximumDevices>& z,
                                     const ExecutionContext& ec);
 
 // --- Tensor-parallel split forms of the fused projection+conv1d+SiLU pair (tp == 2) -------------
@@ -354,42 +354,42 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
     std::int32_t max_width);
 
 void gdn_input_proj_conv_snapshot_column_parallel(
-    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_value_z_weight,
-    const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
-    const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_state_slots,
-    const std::array<Tensor, 2>& snapshot_base_slots, const std::array<Tensor, 2>& query,
-    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-    const std::array<Tensor, 2>& z, LinearPolicy policy,
-    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec);
+    const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& query_key_value_z_weight,
+    const std::array<Tensor, kMaximumDevices>& conv_weight, const std::array<Tensor, kMaximumDevices>& conv_states,
+    const std::array<Tensor, kMaximumDevices>& valid_columns, const std::array<Tensor, kMaximumDevices>& initial_state_slots,
+    const std::array<Tensor, kMaximumDevices>& snapshot_base_slots, const std::array<Tensor, kMaximumDevices>& query,
+    const std::array<Tensor, kMaximumDevices>& key, const std::array<Tensor, kMaximumDevices>& value,
+    const std::array<Tensor, kMaximumDevices>& z, LinearPolicy policy,
+    const std::array<WorkspaceArena*, kMaximumDevices>& workspace, const ExecutionContext& ec);
 
 /** Q4G64_F16S/Q5G64_F16S split-storage two-weight snapshot form (A16 only). */
 void gdn_input_proj_conv_snapshot_column_parallel(
-    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_weight,
-    const std::array<Weight, 2>& value_z_weight, const std::array<Tensor, 2>& conv_weight,
-    const std::array<Tensor, 2>& conv_states, const std::array<Tensor, 2>& valid_columns,
-    const std::array<Tensor, 2>& initial_state_slots,
-    const std::array<Tensor, 2>& snapshot_base_slots, const std::array<Tensor, 2>& query,
-    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-    const std::array<Tensor, 2>& z, const std::array<WorkspaceArena*, 2>& workspace,
+    const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& query_key_weight,
+    const std::array<Weight, kMaximumDevices>& value_z_weight, const std::array<Tensor, kMaximumDevices>& conv_weight,
+    const std::array<Tensor, kMaximumDevices>& conv_states, const std::array<Tensor, kMaximumDevices>& valid_columns,
+    const std::array<Tensor, kMaximumDevices>& initial_state_slots,
+    const std::array<Tensor, kMaximumDevices>& snapshot_base_slots, const std::array<Tensor, kMaximumDevices>& query,
+    const std::array<Tensor, kMaximumDevices>& key, const std::array<Tensor, kMaximumDevices>& value,
+    const std::array<Tensor, kMaximumDevices>& z, const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
     const ExecutionContext& ec);
 
 void gdn_input_proj_conv_record_column_parallel(
-    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_value_z_weight,
-    const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
-    const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_state_slots,
-    const std::array<Tensor, 2>& conv_record, const std::array<Tensor, 2>& query,
-    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-    const std::array<Tensor, 2>& z, LinearPolicy policy,
-    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec);
+    const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& query_key_value_z_weight,
+    const std::array<Tensor, kMaximumDevices>& conv_weight, const std::array<Tensor, kMaximumDevices>& conv_states,
+    const std::array<Tensor, kMaximumDevices>& valid_columns, const std::array<Tensor, kMaximumDevices>& initial_state_slots,
+    const std::array<Tensor, kMaximumDevices>& conv_record, const std::array<Tensor, kMaximumDevices>& query,
+    const std::array<Tensor, kMaximumDevices>& key, const std::array<Tensor, kMaximumDevices>& value,
+    const std::array<Tensor, kMaximumDevices>& z, LinearPolicy policy,
+    const std::array<WorkspaceArena*, kMaximumDevices>& workspace, const ExecutionContext& ec);
 
 /** Q4G64_F16S/Q5G64_F16S split-storage two-weight record form (A16 only). */
 void gdn_input_proj_conv_record_column_parallel(
-    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_weight,
-    const std::array<Weight, 2>& value_z_weight, const std::array<Tensor, 2>& conv_weight,
-    const std::array<Tensor, 2>& conv_states, const std::array<Tensor, 2>& valid_columns,
-    const std::array<Tensor, 2>& initial_state_slots, const std::array<Tensor, 2>& conv_record,
-    const std::array<Tensor, 2>& query, const std::array<Tensor, 2>& key,
-    const std::array<Tensor, 2>& value, const std::array<Tensor, 2>& z,
-    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec);
+    const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& query_key_weight,
+    const std::array<Weight, kMaximumDevices>& value_z_weight, const std::array<Tensor, kMaximumDevices>& conv_weight,
+    const std::array<Tensor, kMaximumDevices>& conv_states, const std::array<Tensor, kMaximumDevices>& valid_columns,
+    const std::array<Tensor, kMaximumDevices>& initial_state_slots, const std::array<Tensor, kMaximumDevices>& conv_record,
+    const std::array<Tensor, kMaximumDevices>& query, const std::array<Tensor, kMaximumDevices>& key,
+    const std::array<Tensor, kMaximumDevices>& value, const std::array<Tensor, kMaximumDevices>& z,
+    const std::array<WorkspaceArena*, kMaximumDevices>& workspace, const ExecutionContext& ec);
 
 } // namespace ninfer::ops

@@ -288,23 +288,26 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
 // head-local output sub-tensor mapping, and which formats are registered).
 namespace {
 
-constexpr std::int32_t kShardHidden    = 5120;
-constexpr std::int32_t kShardQueryRows = 3072;
-constexpr std::int32_t kShardKeyRows   = 512;
-constexpr std::int32_t kShardFusedRows = 7168;
-constexpr std::int32_t kShardSplitRows = 3584; // query_key / gate_value shard row count
+constexpr std::int32_t kShardHidden   = 5120;
+constexpr std::int32_t kFullQueryRows = 6144;  // q (and gate) rows over all ranks
+constexpr std::int32_t kFullKeyRows   = 1024;  // k (and v) rows over all ranks
+constexpr std::int32_t kFullFusedRows = 14336; // q + gate + k + v
+constexpr std::int32_t kFullSplitRows = 7168;  // query_key / gate_value rows over all ranks
 
 void validate_fused_column_rank_semantics(const Tensor& x, const Weight& w, const Tensor& q,
                                           const Tensor& gate, const Tensor& k, const Tensor& v,
-                                          LinearPolicy policy) {
+                                          LinearPolicy policy, const ExecutionContext& ec) {
     validate_policy(policy);
-    const std::int32_t cols = x.ne[1];
+    const std::int32_t cols  = x.ne[1];
+    const std::int32_t tp    = ec.tp;
+    const std::int32_t query = kFullQueryRows / tp;
+    const std::int32_t key   = kFullKeyRows / tp;
     if (cols <= 0) { throw std::invalid_argument("attn_input_proj column-parallel: T must be positive"); }
     require_matrix(x, kShardHidden, cols, "x");
-    require_matrix(q, kShardQueryRows, cols, "q");
-    require_matrix(gate, kShardQueryRows, cols, "gate");
-    require_matrix(k, kShardKeyRows, cols, "k");
-    require_matrix(v, kShardKeyRows, cols, "v");
+    require_matrix(q, query, cols, "q");
+    require_matrix(gate, query, cols, "gate");
+    require_matrix(k, key, cols, "k");
+    require_matrix(v, key, cols, "v");
 
     if (w.qtype == QType::GGML_K) {
         (void)linear_workspace_capacity_bytes(w.qtype, w.n, w.k, policy, cols, cols);
@@ -324,7 +327,7 @@ void validate_fused_column_rank_semantics(const Tensor& x, const Weight& w, cons
         throw std::invalid_argument(
             "attn_input_proj column-parallel: unsupported fused weight format");
     }
-    if (w.n != kShardFusedRows || w.k != kShardHidden) {
+    if (w.n != kFullFusedRows / tp || w.k != kShardHidden) {
         throw std::invalid_argument(
             "attn_input_proj column-parallel: unsupported weight shard shape");
     }
@@ -333,59 +336,65 @@ void validate_fused_column_rank_semantics(const Tensor& x, const Weight& w, cons
 // Cross-rank agreement only a pair can check; every per-rank invariant is validated separately by
 // validate_fused_column_rank_semantics. Mirrors linear_swiglu's own validate_swiglu_split_pair
 // (src/ops/wrapper/linear_swiglu.cpp).
-void validate_fused_split_pair(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+void validate_fused_split_pair(const std::array<Tensor, kMaximumDevices>& x, const std::array<Weight, kMaximumDevices>& w,
                                const ExecutionContext& ec) {
     detail::require_split_context(
         ec,
-        "attn_input_proj column-parallel: requires an ExecutionContext with two distinct devices");
-    if (x[0].ne[1] != x[1].ne[1]) {
-        throw std::invalid_argument(
-            "attn_input_proj column-parallel: both ranks must carry the same token count");
-    }
-    if (w[0].qtype != w[1].qtype || w[0].layout != w[1].layout) {
-        throw std::invalid_argument(
-            "attn_input_proj column-parallel: both ranks must carry the same weight format");
-    }
-    if (w[0].k != w[1].k) {
-        throw std::invalid_argument(
-            "attn_input_proj column-parallel: both ranks must consume the same input extent K");
+        "attn_input_proj column-parallel: requires an ExecutionContext with 2..4 distinct devices");
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        if (x[rank].ne[1] != x[0].ne[1]) {
+            throw std::invalid_argument(
+                "attn_input_proj column-parallel: every rank must carry the same token count");
+        }
+        if (w[rank].qtype != w[0].qtype || w[rank].layout != w[0].layout) {
+            throw std::invalid_argument(
+                "attn_input_proj column-parallel: every rank must carry the same weight format");
+        }
+        if (w[rank].k != w[0].k) {
+            throw std::invalid_argument(
+                "attn_input_proj column-parallel: every rank must consume the same input extent K");
+        }
     }
 }
 
 void validate_split_storage_column_rank_semantics(const Tensor& x, const Weight& query_key_w,
                                                    const Weight& gate_value_w, const Tensor& q,
                                                    const Tensor& gate, const Tensor& k,
-                                                   const Tensor& v) {
+                                                   const Tensor& v, const ExecutionContext& ec) {
     const std::int32_t cols = x.ne[1];
+    const std::int32_t tp   = ec.tp;
     if (cols <= 0) { throw std::invalid_argument("attn_input_proj column-parallel: T must be positive"); }
     require_matrix(x, kShardHidden, cols, "x");
-    require_matrix(q, kShardQueryRows, cols, "q");
-    require_matrix(gate, kShardQueryRows, cols, "gate");
-    require_matrix(k, kShardKeyRows, cols, "k");
-    require_matrix(v, kShardKeyRows, cols, "v");
-    require_rowsplit(query_key_w, QType::Q4G64_F16S, kShardSplitRows, "query/key weight shard");
-    require_rowsplit(gate_value_w, QType::Q5G64_F16S, kShardSplitRows, "gate/value weight shard");
+    require_matrix(q, kFullQueryRows / tp, cols, "q");
+    require_matrix(gate, kFullQueryRows / tp, cols, "gate");
+    require_matrix(k, kFullKeyRows / tp, cols, "k");
+    require_matrix(v, kFullKeyRows / tp, cols, "v");
+    require_rowsplit(query_key_w, QType::Q4G64_F16S, kFullSplitRows / tp, "query/key weight shard");
+    require_rowsplit(gate_value_w, QType::Q5G64_F16S, kFullSplitRows / tp, "gate/value weight shard");
 }
 
-void validate_split_storage_split_pair(const std::array<Tensor, 2>& x,
-                                       const std::array<Weight, 2>& query_key_w,
-                                       const std::array<Weight, 2>& gate_value_w,
+void validate_split_storage_split_pair(const std::array<Tensor, kMaximumDevices>& x,
+                                       const std::array<Weight, kMaximumDevices>& query_key_w,
+                                       const std::array<Weight, kMaximumDevices>& gate_value_w,
                                        const ExecutionContext& ec) {
     detail::require_split_context(
         ec,
-        "attn_input_proj column-parallel: requires an ExecutionContext with two distinct devices");
-    if (x[0].ne[1] != x[1].ne[1]) {
-        throw std::invalid_argument(
-            "attn_input_proj column-parallel: both ranks must carry the same token count");
-    }
-    if (query_key_w[0].qtype != query_key_w[1].qtype ||
-        gate_value_w[0].qtype != gate_value_w[1].qtype) {
-        throw std::invalid_argument(
-            "attn_input_proj column-parallel: both ranks must carry the same weight format");
-    }
-    if (query_key_w[0].k != query_key_w[1].k || gate_value_w[0].k != gate_value_w[1].k) {
-        throw std::invalid_argument(
-            "attn_input_proj column-parallel: both ranks must consume the same input extent K");
+        "attn_input_proj column-parallel: requires an ExecutionContext with 2..4 distinct devices");
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        if (x[rank].ne[1] != x[0].ne[1]) {
+            throw std::invalid_argument(
+                "attn_input_proj column-parallel: every rank must carry the same token count");
+        }
+        if (query_key_w[rank].qtype != query_key_w[0].qtype ||
+            gate_value_w[rank].qtype != gate_value_w[0].qtype) {
+            throw std::invalid_argument(
+                "attn_input_proj column-parallel: every rank must carry the same weight format");
+        }
+        if (query_key_w[rank].k != query_key_w[0].k ||
+            gate_value_w[rank].k != gate_value_w[0].k) {
+            throw std::invalid_argument(
+                "attn_input_proj column-parallel: every rank must consume the same input extent K");
+        }
     }
 }
 
@@ -395,7 +404,7 @@ std::size_t attn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype
                                                                       std::int32_t min_tokens,
                                                                       std::int32_t max_tokens) {
     if (qtype == QType::GGML_K) {
-        return linear_workspace_capacity_bytes(qtype, kShardFusedRows, kShardHidden,
+        return linear_workspace_capacity_bytes(qtype, kFullFusedRows, kShardHidden,
                                                 policy, min_tokens, max_tokens);
     }
     // The W4A4/A8 activation-quantize workspace is a pure function of (tokens, K), and K=5120 is
@@ -416,30 +425,30 @@ std::size_t attn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype
         "attn_input_proj column-parallel workspace: unsupported weight format");
 }
 
-void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& query_key_gate_value_weight,
-                                     const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
+void attn_input_proj_column_parallel(const std::array<Tensor, kMaximumDevices>& x,
+                                     const std::array<Weight, kMaximumDevices>& query_key_gate_value_weight,
+                                     const std::array<Tensor, kMaximumDevices>& q, const std::array<Tensor, kMaximumDevices>& gate,
+                                     const std::array<Tensor, kMaximumDevices>& k, const std::array<Tensor, kMaximumDevices>& v,
                                      LinearPolicy policy,
-                                     const std::array<WorkspaceArena*, 2>& workspace,
+                                     const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
                                      const ExecutionContext& ec) {
     validate_fused_split_pair(x, query_key_gate_value_weight, ec);
     // Validate both ranks before issuing either, so a rejected pair enqueues nothing.
-    for (std::size_t slot = 0; slot < 2; ++slot) {
+    for (std::size_t slot = 0; slot < static_cast<std::size_t>(ec.tp); ++slot) {
         validate_fused_column_rank_semantics(x[slot], query_key_gate_value_weight[slot], q[slot],
-                                             gate[slot], k[slot], v[slot], policy);
+                                             gate[slot], k[slot], v[slot], policy, ec);
     }
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, query_key_gate_value_weight[slot].payload, q[slot].data,
             "attn_input_proj column-parallel: every per-rank argument must be resident on "
             "ec.dev[rank]");
     }
-    std::array<Tensor, 2> q_dst{q[0], q[1]};
-    std::array<Tensor, 2> gate_dst{gate[0], gate[1]};
-    std::array<Tensor, 2> k_dst{k[0], k[1]};
-    std::array<Tensor, 2> v_dst{v[0], v[1]};
+    std::array<Tensor, kMaximumDevices> q_dst = q;
+    std::array<Tensor, kMaximumDevices> gate_dst = gate;
+    std::array<Tensor, kMaximumDevices> k_dst = k;
+    std::array<Tensor, kMaximumDevices> v_dst = v;
     detail::for_each_rank(ec, [&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
         const Weight& w  = query_key_gate_value_weight[slot];
@@ -459,32 +468,32 @@ void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
     });
 }
 
-void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& query_key_gate_value_weight,
-                                     const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
+void attn_input_proj_column_parallel(const std::array<Tensor, kMaximumDevices>& x,
+                                     const std::array<Weight, kMaximumDevices>& query_key_gate_value_weight,
+                                     const std::array<Tensor, kMaximumDevices>& q, const std::array<Tensor, kMaximumDevices>& gate,
+                                     const std::array<Tensor, kMaximumDevices>& k, const std::array<Tensor, kMaximumDevices>& v,
                                      const ExecutionContext& ec) {
     attn_input_proj_column_parallel(x, query_key_gate_value_weight, q, gate, k, v,
                                     LinearPolicy::A16Only, {nullptr, nullptr}, ec);
 }
 
-void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& query_key_weight,
-                                     const std::array<Weight, 2>& gate_value_weight,
-                                     const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
-                                     const std::array<WorkspaceArena*, 2>& workspace,
+void attn_input_proj_column_parallel(const std::array<Tensor, kMaximumDevices>& x,
+                                     const std::array<Weight, kMaximumDevices>& query_key_weight,
+                                     const std::array<Weight, kMaximumDevices>& gate_value_weight,
+                                     const std::array<Tensor, kMaximumDevices>& q, const std::array<Tensor, kMaximumDevices>& gate,
+                                     const std::array<Tensor, kMaximumDevices>& k, const std::array<Tensor, kMaximumDevices>& v,
+                                     const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
                                      const ExecutionContext& ec) {
     validate_split_storage_split_pair(x, query_key_weight, gate_value_weight, ec);
-    for (std::size_t slot = 0; slot < 2; ++slot) {
+    for (std::size_t slot = 0; slot < static_cast<std::size_t>(ec.tp); ++slot) {
         if (workspace[slot] == nullptr) {
             throw std::invalid_argument("Q4/Q5 attention shard requires a workspace arena");
         }
         validate_split_storage_column_rank_semantics(x[slot], query_key_weight[slot],
                                                       gate_value_weight[slot], q[slot], gate[slot],
-                                                      k[slot], v[slot]);
+                                                      k[slot], v[slot], ec);
     }
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, query_key_weight[slot].payload, q[slot].data,
@@ -495,10 +504,10 @@ void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
             "attn_input_proj column-parallel: every per-rank argument must be resident on "
             "ec.dev[rank]");
     }
-    std::array<Tensor, 2> q_dst{q[0], q[1]};
-    std::array<Tensor, 2> gate_dst{gate[0], gate[1]};
-    std::array<Tensor, 2> k_dst{k[0], k[1]};
-    std::array<Tensor, 2> v_dst{v[0], v[1]};
+    std::array<Tensor, kMaximumDevices> q_dst = q;
+    std::array<Tensor, kMaximumDevices> gate_dst = gate;
+    std::array<Tensor, kMaximumDevices> k_dst = k;
+    std::array<Tensor, kMaximumDevices> v_dst = v;
     detail::for_each_rank(ec, [&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::q4_q5_attn_input_dispatch_shard(x[slot], query_key_weight[slot],

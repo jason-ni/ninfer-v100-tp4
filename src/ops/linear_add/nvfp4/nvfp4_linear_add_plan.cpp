@@ -24,13 +24,17 @@ enum class Nvfp4LinearAddRoute : std::uint8_t {
     W4A4,
 };
 
-// The 6144/17408 families each admit their tp1 extent and its tp2 row-parallel half (3072/8704):
-// the shard is the same kernel template at a halved K, so it inherits the parent's measured A16/
-// W4A4 crossover rather than getting one re-measured for it (see nvfp4_config.h's
-// Nvfp4LinearSmallTProductionSchedule specializations for the shard geometries, which do the same
-// inheritance at the schedule level).
-bool is_6144_family(std::int32_t input_rows) { return input_rows == 6144 || input_rows == 3072; }
-bool is_17408_family(std::int32_t input_rows) { return input_rows == 17408 || input_rows == 8704; }
+// The 6144/17408 families each admit their tp1 extent and its tp2/tp4 row-parallel shards
+// (6144 -> 3072 -> 1536, 17408 -> 8704 -> 4352): the shard is the same kernel template at a
+// smaller K, so it inherits the parent's measured A16/W4A4 crossover rather than getting one
+// re-measured for it (see nvfp4_config.h's Nvfp4LinearSmallTProductionSchedule specializations for
+// the shard geometries, which do the same inheritance at the schedule level).
+bool is_6144_family(std::int32_t input_rows) {
+    return input_rows == 6144 || input_rows == 3072 || input_rows == 1536;
+}
+bool is_17408_family(std::int32_t input_rows) {
+    return input_rows == 17408 || input_rows == 8704 || input_rows == 4352;
+}
 
 Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                   LinearPolicy policy, std::int32_t tokens) {

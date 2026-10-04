@@ -43,10 +43,15 @@ void fp8_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tens
     decode_launch<Fp8MlpGateUpGeometry>(x, weight, out, stream);
 }
 
-// linear_swiglu's own tp2 column shard -- the SAME kernel template instantiated at the
-// halved N (kIntermediate halves too), exactly as NVFP4's own linear_swiglu shard is served.
+// linear_swiglu's own tp2/tp4 column shards -- the SAME kernel template instantiated at the
+// halved/quartered N (kIntermediate halves/quarters too), exactly as NVFP4's own linear_swiglu
+// shard is served.
 void fp8_linear_swiglu_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,
                                            cudaStream_t stream) {
+    if (weight.n == Fp8MlpGateUpTp4ColumnGeometry::kOutputRows) {
+        decode_launch<Fp8MlpGateUpTp4ColumnGeometry>(x, weight, out, stream);
+        return;
+    }
     decode_launch<Fp8MlpGateUpTp2ColumnGeometry>(x, weight, out, stream);
 }
 

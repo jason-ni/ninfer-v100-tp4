@@ -152,6 +152,7 @@ struct MtpStemRoots {
     Tensor normalized_embedding;
     Tensor normalized_hidden;
     Tensor packed_input;
+    Tensor fc_input;
     Tensor residual;
     Tensor attention_hidden;
 };
@@ -175,6 +176,14 @@ MtpStemRoots mtp_stem(Allocator& allocator, std::int32_t tokens, bool allocate_e
     out.normalized_hidden    = matrix(allocator, DType::BF16, Config::hidden, tokens);
     if (tp == 1) {
         out.packed_input = matrix(allocator, DType::BF16, Config::mtp_input_rows, tokens);
+    }
+    // At tp >= 4 each rank contracts a slice of one normalized half that is narrower than the half
+    // itself. Because the hidden axis is the contiguous (ne[0]) axis of the half, that slice is not
+    // a contiguous tensor, so the stem stages it into this compact [mtp_input_rows / tp, T] buffer
+    // before linear_row_parallel. At tp <= 2 the slice IS the whole half and no buffer is needed;
+    // the recipe allocates it only when the runtime width actually narrows the shard.
+    if (tp > 1 && Config::mtp_input_rows / tp < Config::hidden) {
+        out.fc_input = matrix(allocator, DType::BF16, Config::mtp_input_rows / tp, tokens);
     }
     out.residual         = matrix(allocator, DType::BF16, Config::hidden, tokens);
     out.attention_hidden = matrix(allocator, DType::BF16, Config::hidden, tokens);

@@ -25,6 +25,13 @@ void launch_fp8_attn_input_volta_qpn(const Tensor& x, const Weight& weight, Tens
 void launch_fp8_attn_input_volta_qpn_shard(const Tensor& x, const Weight& weight, Tensor& query,
                                            Tensor& gate, Tensor& key, Tensor& value,
                                            cudaStream_t stream) {
+    if (weight.n == Fp8AttnInputTp4ColumnGeometry::kOutputRows) {
+        const Fp8AttentionInputShardOutput<Fp8AttnInputTp4ColumnGeometry> output{
+            static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
+            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(value.data)};
+        launch_fp8_volta_qpn_with_output(x, weight, output, weight.n, stream);
+        return;
+    }
     const Fp8AttentionInputShardOutput<Fp8AttnInputTp2ColumnGeometry> output{
         static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(value.data)};

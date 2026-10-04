@@ -197,9 +197,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
         row.sequence_bytes      = memory.sequence.capacity_bytes;
         row.workspace_bytes     = memory.workspace.capacity_bytes;
         // Measured per device: instantiating the decode graphs materializes driver state on each
-        // device the graph has nodes on, which at tp 2 is both of them.
-        row.cuda_graph_bytes = rank == 0 ? memory.cuda_graph_observed_bytes
-                                         : memory.cuda_graph_peer_observed_bytes;
+        // device the graph has nodes on, which at tp > 1 is every device.
+        row.cuda_graph_bytes = memory.cuda_graph_device_bytes[slot];
         row.reserved_bytes = row.weights_bytes + capacity_resolution.runtime_reservation_bytes;
         row.free_after_startup_bytes = current_free_device_bytes(row.device);
         row.total_bytes              = current_total_device_bytes(row.device);
