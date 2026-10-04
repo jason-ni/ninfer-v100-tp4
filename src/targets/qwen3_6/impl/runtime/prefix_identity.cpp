@@ -154,4 +154,33 @@ bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>
            resident_identity.matches(prompt, count);
 }
 
+PrefixDivergence prefix_divergence(const PreparedPromptData& prompt,
+                                   const std::vector<TokenId>& resident_tokens, std::size_t count) {
+    PrefixDivergence out;
+    const std::size_t limit = std::min({count, prompt.token_ids.size(), resident_tokens.size()});
+    out.frontier_index   = static_cast<std::uint32_t>(count);
+    out.divergence_index = static_cast<std::uint32_t>(limit);
+    out.tokens_matched   = true;
+    for (std::size_t i = 0; i < limit; ++i) {
+        if (prompt.token_ids[i] != resident_tokens[i]) {
+            out.divergence_index = static_cast<std::uint32_t>(i);
+            out.tokens_matched   = false;
+            break;
+        }
+    }
+    const auto token_at = [](const auto& tokens, std::ptrdiff_t pos) -> std::int32_t {
+        return pos >= 0 && static_cast<std::size_t>(pos) < tokens.size()
+                   ? static_cast<std::int32_t>(tokens[static_cast<std::size_t>(pos)])
+                   : -1;
+    };
+    constexpr std::size_t half = kPrefixDivergenceWindow / 2;
+    out.window_begin = out.divergence_index > half ? out.divergence_index - half : 0;
+    for (std::size_t k = 0; k < kPrefixDivergenceWindow; ++k) {
+        const std::ptrdiff_t pos  = static_cast<std::ptrdiff_t>(out.window_begin + k);
+        out.prompt_tokens[k]      = token_at(prompt.token_ids, pos);
+        out.resident_tokens[k]    = token_at(resident_tokens, pos);
+    }
+    return out;
+}
+
 } // namespace ninfer::targets::qwen3_6::detail

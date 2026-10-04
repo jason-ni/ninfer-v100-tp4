@@ -34,4 +34,11 @@ private:
                                   const ResidentPrefixIdentity& resident_identity,
                                   std::size_t count);
 
+// Localizes the first token where an incoming prompt stops matching `count` resident tokens. When
+// every token matches up to `count` (so the mismatch was in the auxiliary identity -- MRoPE
+// positions or Vision items), `tokens_matched` stays true and `divergence_index == count`.
+[[nodiscard]] PrefixDivergence prefix_divergence(const PreparedPromptData& prompt,
+                                                 const std::vector<TokenId>& resident_tokens,
+                                                 std::size_t count);
+
 } // namespace ninfer::targets::qwen3_6::detail

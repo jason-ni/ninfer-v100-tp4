@@ -426,6 +426,42 @@ enum class PrefixReusePath : std::uint8_t {
     RestoreResponseCheckpoint,
 };
 
+// Diagnostic explanation of `PrefixReusePath`. A successful reuse reports which continuation state
+// matched; a `FullReset` reports the dominant gate that discarded the retained sequence, so the
+// request log can explain why a turn did not resume from the previous KV state.
+enum class PrefixReuseReason : std::uint8_t {
+    None = 0,
+    ReusedFrontier,
+    ReusedTurnCheckpoint,
+    ReusedResponseCheckpoint,
+    ReuseDisabled,
+    PromptNotReusable,
+    NoRetainedSequence,
+    FrontierEmpty,
+    DflashFrontierMismatch,
+    FrontierPrefixMismatch,
+    CheckpointUnavailable,
+    MtpTailHiddenInvalid,
+    MtpCacheMissing,
+    MtpKvTooShort,
+    DflashCheckpointInvalid,
+};
+
+// First point where an incoming prompt stops matching a retained prefix. Captured only when a
+// frontier/checkpoint match fails, so the request log can localize the divergence. The arrays hold
+// a window of token ids starting at `window_begin` (centered on the divergence point); out-of-range
+// entries are -1.
+inline constexpr std::size_t kPrefixDivergenceWindow = 16;
+
+struct PrefixDivergence {
+    std::uint32_t frontier_index   = 0;
+    std::uint32_t divergence_index = 0;
+    bool tokens_matched            = true;
+    std::uint32_t window_begin     = 0;
+    std::array<std::int32_t, kPrefixDivergenceWindow> prompt_tokens{};
+    std::array<std::int32_t, kPrefixDivergenceWindow> resident_tokens{};
+};
+
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
@@ -435,6 +471,8 @@ struct GenerationResult {
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
+    PrefixReuseReason prefix_reuse_reason = PrefixReuseReason::None;
+    PrefixDivergence prefix_divergence;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };

@@ -38,6 +38,8 @@ struct GenerationMetrics {
     std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
+    ninfer::PrefixReuseReason prefix_reuse_reason = ninfer::PrefixReuseReason::None;
+    ninfer::PrefixDivergence prefix_divergence;
 };
 
 struct GenerationOutcome {

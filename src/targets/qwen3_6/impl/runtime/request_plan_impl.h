@@ -191,15 +191,22 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
-    if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
+    if (!base.allow_prefix_reuse) {
+        plan->reuse_reason = PrefixReuseReason::ReuseDisabled;
+    } else if (!prompt.identity.reusable) {
+        plan->reuse_reason = PrefixReuseReason::PromptNotReusable;
+    } else if (!sequence.retained) {
+        plan->reuse_reason = PrefixReuseReason::NoRetainedSequence;
+    } else {
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
             sequence.dflash_context_frontier == sequence.execution_frontier;
         if (sequence.execution_frontier != 0 && dflash_append_ready &&
             qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                             sequence.execution_frontier)) {
-            plan->reuse      = ReusePath::AppendAtFrontier;
-            plan->reuse_base = sequence.execution_frontier;
+            plan->reuse        = ReusePath::AppendAtFrontier;
+            plan->reuse_base   = sequence.execution_frontier;
+            plan->reuse_reason = PrefixReuseReason::ReusedFrontier;
         } else if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
                    sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
                    qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
@@ -207,6 +214,21 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                                    sequence.rewrite_checkpoint.frontier)) {
             plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
             plan->reuse_base = sequence.rewrite_checkpoint.frontier;
+            plan->reuse_reason =
+                sequence.rewrite_checkpoint.kind == RewriteCheckpointKind::TurnClosure
+                    ? PrefixReuseReason::ReusedTurnCheckpoint
+                    : PrefixReuseReason::ReusedResponseCheckpoint;
+        } else if (sequence.execution_frontier == 0) {
+            plan->reuse_reason = PrefixReuseReason::FrontierEmpty;
+        } else if (!dflash_append_ready) {
+            plan->reuse_reason = PrefixReuseReason::DflashFrontierMismatch;
+        } else {
+            plan->reuse_divergence = qwen3_6::detail::prefix_divergence(
+                prompt, sequence.ledger, sequence.execution_frontier);
+            plan->reuse_reason =
+                (!sequence.rewrite_checkpoint.valid || sequence.rewrite_checkpoint.frontier == 0)
+                    ? PrefixReuseReason::CheckpointUnavailable
+                    : PrefixReuseReason::FrontierPrefixMismatch;
         }
     }
 
@@ -219,6 +241,13 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                       decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
                                       sequence.mtp_kv_valid >= plan->reuse_base - 1;
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
+            if (plan->reuse == ReusePath::AppendAtFrontier && !sequence.tail_hidden_valid) {
+                plan->reuse_reason = PrefixReuseReason::MtpTailHiddenInvalid;
+            } else if (decoder->mtp_cache() == nullptr) {
+                plan->reuse_reason = PrefixReuseReason::MtpCacheMissing;
+            } else {
+                plan->reuse_reason = PrefixReuseReason::MtpKvTooShort;
+            }
             plan->reuse      = ReusePath::FullReset;
             plan->reuse_base = 0;
         }
@@ -229,8 +258,9 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         (!dflash || !sequence.kv ||
          dflash->full.has_value() != sequence.kv->backend.has_value() ||
          sequence.dflash_context_frontier < plan->reuse_base)) {
-        plan->reuse      = ReusePath::FullReset;
-        plan->reuse_base = 0;
+        plan->reuse_reason = PrefixReuseReason::DflashCheckpointInvalid;
+        plan->reuse        = ReusePath::FullReset;
+        plan->reuse_base   = 0;
     }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;

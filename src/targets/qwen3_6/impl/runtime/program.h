@@ -76,6 +76,8 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
     NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::FullReset;
     std::uint32_t reuse_base                  = 0;
+    PrefixReuseReason reuse_reason            = PrefixReuseReason::None;
+    PrefixDivergence reuse_divergence;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
@@ -206,6 +208,8 @@ struct RequestControl {
         bool prepare_mtp                 = false;
         ReusePath reuse                  = ReusePath::FullReset;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
+        PrefixReuseReason reuse_reason   = PrefixReuseReason::None;
+        PrefixDivergence reuse_divergence;
     };
 
     std::optional<Prefill> prefill;

@@ -837,6 +837,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .prepare_mtp                = request_plan.prepare_mtp,
             .reuse                      = request_plan.reuse,
             .mtp_bridge                 = request_plan.mtp_bridge,
+            .reuse_reason               = request_plan.reuse_reason,
+            .reuse_divergence           = request_plan.reuse_divergence,
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
@@ -2322,7 +2324,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     RequestControl::Prefill& staged = *request.prefill;
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
                                         .reused_prompt_tokens = staged.base,
-                                        .prefix_reuse_path    = staged.reuse};
+                                        .prefix_reuse_path    = staged.reuse,
+                                        .prefix_reuse_reason  = staged.reuse_reason,
+                                        .prefix_divergence    = staged.reuse_divergence};
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {

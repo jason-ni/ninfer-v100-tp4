@@ -117,6 +117,59 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
     return "unknown";
 }
 
+const char* prefix_reuse_reason_name(ninfer::PrefixReuseReason reason) {
+    switch (reason) {
+    case ninfer::PrefixReuseReason::None:
+        return "none";
+    case ninfer::PrefixReuseReason::ReusedFrontier:
+        return "reused_frontier";
+    case ninfer::PrefixReuseReason::ReusedTurnCheckpoint:
+        return "reused_turn_checkpoint";
+    case ninfer::PrefixReuseReason::ReusedResponseCheckpoint:
+        return "reused_response_checkpoint";
+    case ninfer::PrefixReuseReason::ReuseDisabled:
+        return "reuse_disabled";
+    case ninfer::PrefixReuseReason::PromptNotReusable:
+        return "prompt_not_reusable";
+    case ninfer::PrefixReuseReason::NoRetainedSequence:
+        return "no_retained_sequence";
+    case ninfer::PrefixReuseReason::FrontierEmpty:
+        return "frontier_empty";
+    case ninfer::PrefixReuseReason::DflashFrontierMismatch:
+        return "dflash_frontier_mismatch";
+    case ninfer::PrefixReuseReason::FrontierPrefixMismatch:
+        return "frontier_prefix_mismatch";
+    case ninfer::PrefixReuseReason::CheckpointUnavailable:
+        return "checkpoint_unavailable";
+    case ninfer::PrefixReuseReason::MtpTailHiddenInvalid:
+        return "mtp_tail_hidden_invalid";
+    case ninfer::PrefixReuseReason::MtpCacheMissing:
+        return "mtp_cache_missing";
+    case ninfer::PrefixReuseReason::MtpKvTooShort:
+        return "mtp_kv_too_short";
+    case ninfer::PrefixReuseReason::DflashCheckpointInvalid:
+        return "dflash_checkpoint_invalid";
+    }
+    return "unknown";
+}
+
+std::string prefix_divergence_str(const ninfer::PrefixDivergence& divergence) {
+    if (divergence.frontier_index == 0) { return {}; }
+    std::ostringstream out;
+    out << " divergence=@" << divergence.divergence_index << "/" << divergence.frontier_index
+        << (divergence.tokens_matched ? "(identity)" : "(token)") << " window_from="
+        << divergence.window_begin << " prompt=[";
+    for (std::size_t k = 0; k < ninfer::kPrefixDivergenceWindow; ++k) {
+        out << (k == 0 ? "" : ",") << divergence.prompt_tokens[k];
+    }
+    out << "] resident=[";
+    for (std::size_t k = 0; k < ninfer::kPrefixDivergenceWindow; ++k) {
+        out << (k == 0 ? "" : ",") << divergence.resident_tokens[k];
+    }
+    out << "]";
+    return out.str();
+}
+
 Json event_base(const std::string& server_instance_id, std::uint64_t timestamp, const char* event) {
     return Json{{"artifact_type", kRequestLogArtifactType},
                 {"schema_version", kRequestLogSchemaVersion},
@@ -391,7 +444,10 @@ std::string format_request_done(const RequestLogContext& context,
     if (!outcome.tool_calls.empty()) { out << " tool_calls=" << outcome.tool_calls.size(); }
     out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
         << " cache=" << metrics.prefix_cache_hit_tokens
-        << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path) << " ttft=" << std::fixed
+        << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path)
+        << " reuse_reason=" << prefix_reuse_reason_name(metrics.prefix_reuse_reason)
+        << prefix_divergence_str(metrics.prefix_divergence)
+        << " ttft=" << std::fixed
         << std::setprecision(0) << ttft_ms << "ms"
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
@@ -569,7 +625,25 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                               static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
+             {"prefix_reuse_reason",
+              prefix_reuse_reason_name(outcome.metrics.prefix_reuse_reason)},
              {"tool_call_count", outcome.tool_calls.size()}};
+    const ninfer::PrefixDivergence& divergence = outcome.metrics.prefix_divergence;
+    if (divergence.frontier_index != 0) {
+        Json prompt_window = Json::array();
+        Json resident_window = Json::array();
+        for (std::size_t k = 0; k < ninfer::kPrefixDivergenceWindow; ++k) {
+            prompt_window.push_back(divergence.prompt_tokens[k]);
+            resident_window.push_back(divergence.resident_tokens[k]);
+        }
+        record["result"]["prefix_divergence"] =
+            Json{{"divergence_index", divergence.divergence_index},
+                 {"frontier_index", divergence.frontier_index},
+                 {"tokens_matched", divergence.tokens_matched},
+                 {"window_begin", divergence.window_begin},
+                 {"prompt_tokens", std::move(prompt_window)},
+                 {"resident_tokens", std::move(resident_window)}};
+    }
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
