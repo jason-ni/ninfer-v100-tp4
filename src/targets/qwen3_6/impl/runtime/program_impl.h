@@ -810,8 +810,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
             sequence.ledger.resize(base);
         } else if (request_plan.reuse == ReusePath::BlockSnapshot) {
-            if (prefix_index == nullptr || !sequence.kv) {
-                throw std::logic_error("hybrid block snapshot has no KV allocation bundle");
+            if (prefix_index == nullptr) {
+                throw std::logic_error("hybrid block snapshot has no prefix index");
             }
             const ninfer::prefix_cache::Snapshot* snap =
                 prefix_index->snapshot(request_plan.block_snapshot);
