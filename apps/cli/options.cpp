@@ -129,9 +129,10 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--ignore-eos]\n"
-           "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
-           "       [--cuda-graph|--no-cuda-graph]\n"
-           "\n"
+            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
+            "       [--cuda-graph|--no-cuda-graph]\n"
+            "       [--prefix-cache] [--host-cache-mib N]\n"
+            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
@@ -158,9 +159,13 @@ std::string usage_text(const char* argv0) {
            "--stop-token-id, --stop and --reasoning-stop still apply.\n"
            "--cuda-graph captures one decode graph per rank, with the NCCL collectives recorded as "
            "nodes in each rank's graph; --no-cuda-graph runs the same forward pass eagerly. The two "
-           "produce the same tokens. Eager is the default at --tp > 1 because on this V100 target "
-           "the per-rank graph replays with GPU idle bubbles and is slower than eager; --tp 1 "
-           "defaults to graphs.\n";
+            "produce the same tokens. Eager is the default at --tp > 1 because on this V100 target "
+            "the per-rank graph replays with GPU idle bubbles and is slower than eager; --tp 1 "
+            "defaults to graphs.\n"
+            "--prefix-cache enables the hybrid content-addressed prefix cache, which reuses KV "
+            "blocks and state snapshots across requests that share a prompt prefix. "
+            "--host-cache-mib N adds a pinned host-RAM tier (N MiB) so evicted blocks and "
+            "snapshots survive device pressure; 0 keeps the cache device-only.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -236,6 +241,10 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
             cuda_graph_explicit    = true;
+        } else if (arg == "--prefix-cache") {
+            options.prefix_cache = true;
+        } else if (arg == "--host-cache-mib") {
+            options.host_cache_mib = parse_u32(value(arg), "host-cache-mib", true);
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

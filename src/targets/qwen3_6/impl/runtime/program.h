@@ -393,10 +393,25 @@ public:
     struct PrefixCacheSink;
     std::unique_ptr<PrefixCacheSink> prefix_sink;
     std::unique_ptr<ninfer::prefix_cache::PrefixIndex> prefix_index;
+    std::unique_ptr<ninfer::prefix_cache::HostSlabPool> prefix_host_pool; // M2
     std::uint32_t prefix_snapshot_slots = 0;
     std::uint32_t prefix_max_new_taps   = 0;
     std::uint32_t prefix_ladder_tokens  = 0;
     std::uint32_t prefix_min_gap        = 0;
+    // M2: dedicated cache transfer stream per rank for D2H/H2D copies.
+    std::array<cudaStream_t, kMaximumDevices> prefix_cache_stream{};
+    std::array<cudaEvent_t, kMaximumDevices> prefix_cache_event{};
+    // Per-rank slice sizes inside a host slab (a slab holds tp consecutive rank slices).
+    std::size_t prefix_block_rank_bytes = 0;
+    std::size_t prefix_snapshot_rank_bytes = 0;
+    // Write-throughs enqueued but not yet polled complete. The newest per-rank cache event marks
+    // the end of the whole pending set, so tick_prefix_cache() drains it all-or-nothing.
+    struct InflightCacheWrite {
+        bool is_snapshot = false;
+        ninfer::prefix_cache::NodeId node = ninfer::prefix_cache::kInvalidNode;
+        ninfer::prefix_cache::SnapshotId snapshot = ninfer::prefix_cache::kInvalidSnapshot;
+    };
+    std::vector<InflightCacheWrite> prefix_inflight_writes;
     // Continuation hidden captured with each tap state image; column `slot` matches the
     // LinearStateSlots snapshot slot. Empty unless the cache is enabled.
     Tensor prefix_snapshot_hidden_store;
@@ -477,6 +492,10 @@ public:
 private:
     // Returns cache-owned pages to every rank's text-KV pool (page ids are identical across ranks).
     void release_cached_pages(const ninfer::prefix_cache::PoolPages& pages) noexcept;
+    // Release a request's prefix-cache state: persist blocks to the host tier (M2), return any
+    // unconsumed tap-slot reservations, and drop the request's node/snapshot pins so its committed
+    // blocks become evictable. Called when a request completes or its lane is cleared; idempotent.
+    void finalize_prefix_cache_state(SequenceState& sequence) noexcept;
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();
@@ -513,6 +532,31 @@ private:
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
+    // M2 host-tier transfer layer. All copies run on the per-rank cache streams; slabs are
+    // rank-sliced (rank r owns bytes [r * rank_bytes, (r+1) * rank_bytes) of a slab).
+    // Returns false on the first failed CUDA copy (never throws).
+    [[nodiscard]] qwen3_6::PagedKVCache* rank_backend_cache(int rank) noexcept;
+    // Acquire one cache-owned page bundle (text pool + backend pool when present) on every rank.
+    // The pools are lockstep, so every rank hands out the same ids; a mismatch is a logic error.
+    // When a pool is exhausted, evict one device-resident cache node through the index (demoting
+    // or erasing it via its sink) and retry until the acquire fits or nothing is evictable, in
+    // which case std::bad_alloc propagates.
+    [[nodiscard]] ninfer::prefix_cache::PoolPages acquire_cache_bundle();
+    bool copy_cache_block(int rank, std::int32_t text_page, std::int32_t backend_page,
+                          void* slab_base, bool device_to_host) noexcept;
+    bool copy_snapshot_slot(int rank, std::int32_t slot, void* slab_base,
+                            bool device_to_host) noexcept;
+    // Issue an async D2H write-through for one cache entry (block node or snapshot image).
+    // Best-effort and non-throwing: allocation or enqueue failure rolls the reservation back.
+    void issue_block_write_through(ninfer::prefix_cache::NodeId node) noexcept;
+    void issue_snapshot_write_through(ninfer::prefix_cache::SnapshotId id) noexcept;
+    // Poll in-flight write-throughs; complete (and unpin) every transfer whose per-rank events
+    // have all fired. Called at round boundaries.
+    void tick_prefix_cache() noexcept;
+    // Blocking drain: wait for every pending cache write to land on host, then finalize it. A
+    // completed request settles its writes this way so its committed blocks are host-backed and
+    // evictable before any later admission reads the pool counts.
+    void settle_prefix_writes() noexcept;
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets);

@@ -31,7 +31,8 @@ add_library(ninfer_core STATIC
   runtime/engine/public_types.cpp
   runtime/engine/request_memory.cpp
   runtime/prefix_cache/prefix_index.cpp
-  runtime/prefix_cache/tap_planner.cpp)
+  runtime/prefix_cache/tap_planner.cpp
+  runtime/prefix_cache/host_slab_pool.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads ninfer_nccl)

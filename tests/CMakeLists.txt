@@ -78,6 +78,7 @@ ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
 ninfer_add_test(ninfer_prefix_cache_index_test SOURCES test_prefix_cache_index.cpp)
+ninfer_add_test(ninfer_prefix_cache_host_test SOURCES test_prefix_cache_host.cpp)
 # Host-only: no artifact, no device, no Engine construction. tp2 per-device KV pool sizing (4.1).
 ninfer_add_test(ninfer_kv_capacity_tp2_test SOURCES test_kv_capacity_tp2.cpp)
 ninfer_add_test(ninfer_sampling_defaults_test

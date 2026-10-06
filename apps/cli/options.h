@@ -38,6 +38,11 @@ struct Options {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+    // Hybrid content-addressed prefix cache. `prefix_cache` enables it explicitly; a positive
+    // `host_cache_mib` implies it as well.
+    bool prefix_cache  = false;
+    // M2: pinned host RAM for the hybrid prefix cache (MiB). 0 = device-only (M1).
+    std::uint32_t host_cache_mib = 0;
 
     bool raw_output      = false;
     bool print_token_ids = false;

@@ -182,8 +182,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
-            "[--vision] [--cuda-graph|--no-cuda-graph] [--no-prefix-reuse] [--prefix-cache] "
-             "[--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+             "[--vision] [--cuda-graph|--no-cuda-graph] [--no-prefix-reuse] [--prefix-cache] "
+              "[--host-cache-mib N] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
             "[--chat-template-kwargs JSON] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -204,10 +204,15 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
-           "       --no-prefix-reuse disables compatible-prefix caching (enabled by default).\n"
-           "       Prefix reuse supports --tp 2 with --spec mtp, including exact prompt hits.\n"
-           "       Reuse resumes a retained frontier or complete turn/response checkpoint;\n"
-           "       an arbitrary matching token prefix is not a reusable checkpoint.\n"
+            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default).\n"
+            "       Prefix reuse supports --tp 2 with --spec mtp, including exact prompt hits.\n"
+            "       Reuse resumes a retained frontier or complete turn/response checkpoint;\n"
+            "       an arbitrary matching token prefix is not a reusable checkpoint.\n"
+            "       --prefix-cache enables the hybrid content-addressed prefix cache, which reuses\n"
+            "       KV blocks and state snapshots across requests sharing a prompt prefix, even when\n"
+            "       earlier context was rewritten between turns. --host-cache-mib N adds a pinned\n"
+            "       host-RAM tier (N MiB) so evicted blocks and snapshots survive device pressure;\n"
+            "       0 keeps the cache device-only.\n"
             "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
             "       --chat-template-kwargs sets default chat-template options as a JSON object, e.g.\n"
             "       '{\"preserve_thinking\": true, \"reasoning_effort\": \"low\"}'. Supported keys are\n"
@@ -387,6 +392,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.allow_prefix_reuse = false;
         } else if (arg == "--prefix-cache") {
             options.prefix_cache_enabled = true;
+        } else if (arg == "--host-cache-mib") {
+            options.host_cache_mib = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--host-cache-mib"), "host-cache-mib"));
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {

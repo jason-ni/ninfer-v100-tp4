@@ -192,26 +192,34 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
-    // Hybrid content-addressed admission: take the deepest device-resident snapshot on the matched
-    // block path. Falls through to the legacy owner/checkpoint logic when the index has no usable
-    // hit, so the cache is purely additive to the existing reuse paths.
+    // Hybrid content-addressed admission: take the deepest usable snapshot on the matched block
+    // path, preferring device residency on a frontier tie (it needs no restore). Falls through to
+    // the legacy owner/checkpoint logic when the index has no usable hit, so the cache is purely
+    // additive to the existing reuse paths.
     const auto admit_block_snapshot = [&]() -> bool {
         if (prefix_index == nullptr || prompt.block_hashes.empty()) {
             return false;
         }
         const ninfer::prefix_cache::PrefixMatch match =
             prefix_index->match(prompt.token_ids, prompt.block_hashes, prompt.block_extras);
-        if (match.best_device == ninfer::prefix_cache::kInvalidSnapshot) { return false; }
-        const ninfer::prefix_cache::Snapshot* snap = prefix_index->snapshot(match.best_device);
+        ninfer::prefix_cache::SnapshotId chosen = match.best_device;
+        std::uint32_t chosen_frontier           = match.best_device_frontier;
+        if (match.best_host != ninfer::prefix_cache::kInvalidSnapshot &&
+            match.best_host_frontier > chosen_frontier) {
+            chosen          = match.best_host;
+            chosen_frontier = match.best_host_frontier;
+        }
+        if (chosen == ninfer::prefix_cache::kInvalidSnapshot) { return false; }
+        const ninfer::prefix_cache::Snapshot* snap = prefix_index->snapshot(chosen);
         const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
         if (snap == nullptr || snap->frontier == 0 || snap->frontier > n - 1 ||
-            !snap->device_resident()) {
+            snap->tail_len != 0) {
             return false;
         }
         plan->reuse             = ReusePath::BlockSnapshot;
         plan->reuse_base        = snap->frontier;
         plan->reuse_reason      = PrefixReuseReason::ReusedBlockSnapshot;
-        plan->block_snapshot    = match.best_device;
+        plan->block_snapshot    = chosen;
         plan->block_path        = match.path;
         plan->block_path_blocks = static_cast<std::uint32_t>(match.matched_blocks);
         return true;

@@ -355,5 +355,31 @@ int main() {
     failures += expect_size(cache_pool.cached_pages(), 0, "promoted cache release");
     failures += expect_size(cache_pool.free_pages(), 6, "promoted cache release restored free pages");
 
+    // Regression: page ids are physical page-group ids bounded by page_group_count(), not by the
+    // per-allocation logical capacity. With M > L, a long-context allocation can own and promote
+    // physical pages above L; those must not be rejected. Reproduce by forcing the allocation into
+    // the high physical pages (occupy the low ones as cache-owned first).
+    auto wide_plan = plan_paged_cache(12, 4, 1, {{ninfer::DType::BF16, 16, 1}});
+    ninfer::DeviceArena wide_arena(wide_plan.bytes);
+    ninfer::PagedKVPool wide_pool({wide_arena.base(), wide_arena.capacity()}, wide_plan.layout);
+    std::vector<std::int32_t> wide_cached = wide_pool.acquire_cache_pages(8);
+    failures += expect_page_ids(wide_cached, {0, 1, 2, 3, 4, 5, 6, 7}, "wide cache-owned pages");
+    auto wide = wide_pool.reserve(4);
+    wide.materialize_pages(4);
+    failures += expect_page_ids(wide.page_ids(), {8, 9, 10, 11}, "wide physical page ids");
+    bool wide_promoted = true;
+    try {
+        wide.promote_owned_pages(4);
+    } catch (const std::invalid_argument&) {
+        wide_promoted = false;
+    }
+    if (!wide_promoted) {
+        ++failures;
+        std::cerr << "Promoting physical pages above the logical capacity was rejected\n";
+    }
+    failures += expect_size(wide_pool.cached_pages(), 12, "wide promotion counted cache pages");
+    wide.unbind_row();
+    wide.release();
+
     return failures == 0 ? 0 : fail("kv cache test failed");
 }

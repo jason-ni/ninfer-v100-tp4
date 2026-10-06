@@ -117,6 +117,13 @@ void PrefixIndex::free_node(NodeId id) noexcept {
 
 void PrefixIndex::link_lru_tail(NodeId id) noexcept {
     BlockNode& record = nodes_[id - 1U];
+    // A node is evictable iff it is device-resident and held by no one: no active sequence
+    // (active_refs) and no in-flight transfer (restore_pins). Linking is conditional so every
+    // state-change site can simply call this after mutating the counters.
+    if (record.lru_linked || record.device_state != Residency::Resident ||
+        record.active_refs != 0U || record.restore_pins != 0U) {
+        return;
+    }
     record.lru_prev   = lru_tail_;
     record.lru_next   = kInvalidNode;
     if (lru_tail_ != kInvalidNode) {
@@ -160,19 +167,13 @@ void PrefixIndex::unpin_node(NodeId id) noexcept {
     BlockNode& record = nodes_[id - 1U];
     if (record.active_refs == 0U) { return; }
     --record.active_refs;
-    if (record.active_refs == 0U && record.device_state == Residency::Resident &&
-        !record.lru_linked) {
-        link_lru_tail(id);
-    }
+    link_lru_tail(id);
 }
 
 void PrefixIndex::pin_restore(NodeId id) noexcept {
     if (!valid(id)) { return; }
     BlockNode& record = nodes_[id - 1U];
-    if (record.restore_pins == 0U && record.active_refs == 0U &&
-        record.device_state == Residency::Resident) {
-        unlink_lru(id);
-    }
+    if (record.restore_pins == 0U) { unlink_lru(id); }
     ++record.restore_pins;
 }
 
@@ -181,10 +182,7 @@ void PrefixIndex::unpin_restore(NodeId id) noexcept {
     BlockNode& record = nodes_[id - 1U];
     if (record.restore_pins == 0U) { return; }
     --record.restore_pins;
-    if (record.restore_pins == 0U && record.active_refs == 0U &&
-        record.device_state == Residency::Resident && !record.lru_linked) {
-        link_lru_tail(id);
-    }
+    link_lru_tail(id);
 }
 
 void PrefixIndex::pin_snapshot(SnapshotId id) noexcept {
@@ -201,7 +199,12 @@ void PrefixIndex::unpin_snapshot(SnapshotId id) noexcept {
 
 void PrefixIndex::inc_live_below(NodeId node) noexcept {
     for (NodeId cur = node; cur != kInvalidNode; cur = nodes_[cur - 1U].parent) {
-        ++nodes_[cur - 1U].live_snapshots_below;
+        BlockNode& record = nodes_[cur - 1U];
+        if (record.live_snapshots_below == 0 && host_pool_ != nullptr &&
+            record.host_page != kInvalidHostPage) {
+            host_pool_->mark_alive(record.host_page);
+        }
+        ++record.live_snapshots_below;
     }
 }
 
@@ -210,6 +213,42 @@ void PrefixIndex::dec_live_below(NodeId node, std::uint32_t count) noexcept {
         BlockNode& record = nodes_[cur - 1U];
         record.live_snapshots_below =
             record.live_snapshots_below >= count ? record.live_snapshots_below - count : 0U;
+        // Dead-KV: a node no longer reachable from any snapshot is the lowest-priority host-resident
+        // data. Marking it dead only adjusts eviction priority (the pool evicts dead slabs first);
+        // the actual cleanup happens lazily when its slab is evicted (reconcile_host_eviction) or
+        // its device copy is evicted (evict_device_lru). No eager structural change here, which keeps
+        // this callable from inside snapshot deletion without reentrancy.
+        if (record.live_snapshots_below == 0 && host_pool_ != nullptr &&
+            record.host_page != kInvalidHostPage) {
+            host_pool_->mark_dead(record.host_page);
+        }
+    }
+}
+
+void PrefixIndex::reconcile_host_eviction(HostPageId page) noexcept {
+    if (page == kInvalidHostPage) { return; }
+    // The pool already freed `page`; only the owner's bookkeeping must be cleared.
+    for (std::size_t i = 0; i < nodes_.size(); ++i) {
+        BlockNode& n = nodes_[i];
+        if (!n.live || n.host_page != page) { continue; }
+        n.host_page  = kInvalidHostPage;
+        n.host_state = Residency::Absent;
+        if (n.device_state != Residency::Resident && n.device_state != Residency::Filling &&
+            n.active_refs == 0 && n.restore_pins == 0) {
+            erase_subtree(static_cast<NodeId>(i + 1U));
+        }
+        return;
+    }
+    for (std::size_t i = 0; i < snapshots_.size(); ++i) {
+        Snapshot& s = snapshots_[i];
+        if (!s.live || s.host_page != page) { continue; }
+        s.host_page  = kInvalidHostPage;
+        s.host_state = Residency::Absent;
+        if (s.device_state != Residency::Resident && s.device_state != Residency::Filling &&
+            s.restore_pins == 0) {
+            delete_snapshot(static_cast<SnapshotId>(i + 1U));
+        }
+        return;
     }
 }
 
@@ -276,26 +315,45 @@ PrefixMatch PrefixIndex::match(std::span<const TokenId> prompt_tokens,
 
             // A snapshot is valid iff every node on its anchor path, its tail bundle and its image
             // are resident. Path residency is checked against the matched path prefix.
-            bool resident = candidate.device_state == Residency::Resident &&
-                            (candidate.tail_len == 0U ||
-                             candidate.tail_state == Residency::Resident);
-            if (resident) {
+            bool device_resident = candidate.device_state == Residency::Resident &&
+                                    (candidate.tail_len == 0U ||
+                                     candidate.tail_state == Residency::Resident);
+            bool host_resident = candidate.host_state == Residency::Host &&
+                                  (candidate.tail_len == 0U ||
+                                   candidate.tail_state == Residency::Host);
+            if (device_resident) {
                 const std::size_t anchor_index = static_cast<std::size_t>(anchor.depth + 1);
                 // path[0] is the root, which owns no KV pages; residency of a prefix is carried by
                 // the deepest matching node.
                 for (std::size_t i = 1; i <= anchor_index && i < result.path.size(); ++i) {
                     if (nodes_[result.path[i] - 1U].device_state != Residency::Resident) {
-                        resident = false;
+                        device_resident = false;
+                        break;
+                    }
+                }
+            }
+            if (host_resident) {
+                // Every node on the path must have data available somewhere (device or host) so it
+                // can be made device-resident for the restore.
+                const std::size_t anchor_index = static_cast<std::size_t>(anchor.depth + 1);
+                for (std::size_t i = 1; i <= anchor_index && i < result.path.size(); ++i) {
+                    const BlockNode& n = nodes_[result.path[i] - 1U];
+                    if (n.device_state != Residency::Resident && n.host_state != Residency::Host) {
+                        host_resident = false;
                         break;
                     }
                 }
             }
 
             result.candidates.push_back(SnapshotCandidate{snapshot_id, candidate.frontier,
-                                                          resident});
-            if (resident && candidate.frontier >= result.best_device_frontier) {
+                                                          device_resident, host_resident});
+            if (device_resident && candidate.frontier >= result.best_device_frontier) {
                 result.best_device          = snapshot_id;
                 result.best_device_frontier = candidate.frontier;
+            }
+            if (host_resident && candidate.frontier >= result.best_host_frontier) {
+                result.best_host          = snapshot_id;
+                result.best_host_frontier = candidate.frontier;
             }
         }
     }
@@ -310,10 +368,11 @@ NodeId PrefixIndex::commit_block(const BlockCommit& commit, bool& adopted) {
         find_child(commit.parent, commit.lookup_hash, commit.tokens, commit.extra);
     if (existing.node != kInvalidNode) {
         BlockNode& record = nodes_[existing.node - 1U];
-        if (record.device_state != Residency::Resident) {
+        // Adopt the offered pages only when no transfer is in flight on this node: a concurrent
+        // restore already owns the destination pages and must not be retargeted underneath it.
+        if (record.device_state != Residency::Resident && record.restore_pins == 0U) {
             record.device_pages  = commit.pages;
             record.device_state  = Residency::Resident;
-            record.lru_backed    = false;
             link_lru_tail(existing.node);
             adopted = true;
         }
@@ -330,7 +389,6 @@ NodeId PrefixIndex::commit_block(const BlockCommit& commit, bool& adopted) {
     std::copy(commit.tokens.begin(), commit.tokens.end(), record.tokens.begin());
     record.device_pages     = commit.pages;
     record.device_state     = Residency::Resident;
-    record.lru_backed       = false;
     record.last_access_tick = ++tick_;
     nodes_[commit.parent - 1U].children.push_back(id);
     link_lru_tail(id);
@@ -361,7 +419,11 @@ SlotId PrefixIndex::acquire_slot(std::uint64_t priority) {
         }
     }
     if (superseded_victim != kInvalidSnapshot) {
-        const SlotId slot = detach_snapshot(superseded_victim);
+        // A superseded snapshot that still has a host copy is demoted (kept alive as
+        // host-resident) rather than deleted, so its image survives the device-slot eviction.
+        const SlotId slot = snapshots_[superseded_victim - 1U].host_state == Residency::Host
+                                ? demote_snapshot_device(superseded_victim)
+                                : detach_snapshot(superseded_victim);
         slot_owner_[static_cast<std::size_t>(slot)] = kInvalidSnapshot;
         return slot;
     }
@@ -380,7 +442,9 @@ SlotId PrefixIndex::acquire_slot(std::uint64_t priority) {
         }
     }
     if (lowest_victim != kInvalidSnapshot && lowest <= priority) {
-        const SlotId slot = detach_snapshot(lowest_victim);
+        const SlotId slot = snapshots_[lowest_victim - 1U].host_state == Residency::Host
+                                ? demote_snapshot_device(lowest_victim)
+                                : detach_snapshot(lowest_victim);
         slot_owner_[static_cast<std::size_t>(slot)] = kInvalidSnapshot;
         return slot;
     }
@@ -480,11 +544,15 @@ void PrefixIndex::release_reserved_slot(SlotId slot) noexcept {
 
 void PrefixIndex::supersede(SnapshotId id) noexcept {
     Snapshot* record = id == kInvalidSnapshot ? nullptr
-                     : (id <= snapshots_.size() && snapshots_[id - 1U].live ? &snapshots_[id - 1U]
-                                                                            : nullptr);
+                      : (id <= snapshots_.size() && snapshots_[id - 1U].live ? &snapshots_[id - 1U]
+                                                                             : nullptr);
     if (record == nullptr || record->superseded) { return; }
     record->superseded    = true;
     record->superseded_at = ++tick_;
+    // A superseded snapshot's host image is the next candidate for reclamation after dead KV.
+    if (host_pool_ != nullptr && record->host_page != kInvalidHostPage) {
+        host_pool_->supersede(record->host_page);
+    }
 }
 
 void PrefixIndex::hit(SnapshotId id) noexcept {
@@ -495,6 +563,10 @@ void PrefixIndex::hit(SnapshotId id) noexcept {
     record.superseded_at = 0;
     ++record.freq;
     record.last_hit_tick = ++tick_;
+    if (host_pool_ != nullptr && record.host_page != kInvalidHostPage) {
+        host_pool_->hit(record.host_page, tick_);
+        host_pool_->clear_superseded(record.host_page);
+    }
 }
 
 SlotId PrefixIndex::detach_snapshot(SnapshotId id) {
@@ -506,6 +578,18 @@ SlotId PrefixIndex::detach_snapshot(SnapshotId id) {
         sink_->release_tail_pages(record.tail_pages);
     }
     const SlotId slot = record.device_slot;
+
+    // A fully deleted snapshot keeps no host copy: release its slab (if any). An in-flight write
+    // cannot reach this point: delete_snapshot defers while restore_pins is nonzero, and in-flight
+    // slabs are pinned against pool eviction.
+    if (record.host_page != kInvalidHostPage) {
+        if (host_pool_ != nullptr) {
+            host_pool_->unpin(record.host_page);
+            host_pool_->release(record.host_page);
+        }
+        record.host_page  = kInvalidHostPage;
+        record.host_state = Residency::Absent;
+    }
 
     if (valid(record.anchor)) {
         std::vector<SnapshotId>& list = nodes_[record.anchor - 1U].snapshots;
@@ -519,7 +603,31 @@ SlotId PrefixIndex::detach_snapshot(SnapshotId id) {
     return slot;
 }
 
+SlotId PrefixIndex::demote_snapshot_device(SnapshotId id) {
+    if (id == kInvalidSnapshot || id > snapshots_.size()) { return kInvalidSlot; }
+    Snapshot& record = snapshots_[id - 1U];
+    if (!record.live) { return kInvalidSlot; }
+
+    // Release the tail pages if they are device-resident; the snapshot survives as host-resident.
+    if (record.tail_state == Residency::Resident && sink_ != nullptr) {
+        sink_->release_tail_pages(record.tail_pages);
+        record.tail_state = Residency::Absent;
+    }
+    const SlotId slot = record.device_slot;
+    record.device_slot  = kInvalidSlot;
+    record.device_state = Residency::Absent;
+    // The snapshot stays alive (still in its anchor's list, still counted in live_snapshots_below)
+    // and can be restored later via begin_snapshot_restore.
+    return slot;
+}
+
 void PrefixIndex::delete_snapshot(SnapshotId id) {
+    if (id == kInvalidSnapshot || id > snapshots_.size()) { return; }
+    Snapshot& record = snapshots_[id - 1U];
+    // A snapshot with an in-flight host transfer is deferred, not deleted: its write must land
+    // (or roll back) first. The caller's eviction pass simply makes no progress this round; the
+    // snapshot becomes deletable once finish_* releases the pin.
+    if (!record.live || record.restore_pins != 0U) { return; }
     const SlotId slot = detach_snapshot(id);
     if (slot == kInvalidSlot) { return; }
     if (sink_ != nullptr) { sink_->release_snapshot_slot(slot); }
@@ -531,12 +639,46 @@ void PrefixIndex::remove_snapshot(SnapshotId id) { delete_snapshot(id); }
 
 NodeId PrefixIndex::evict_device_lru() {
     if (lru_head_ == kInvalidNode) { return kInvalidNode; }
-    const NodeId victim = lru_head_;
-    const BlockNode& record = nodes_[victim - 1U];
-    if (record.active_refs != 0U || record.restore_pins != 0U) { return kInvalidNode; }
-    unlink_lru(victim);
-    erase_subtree(victim);
-    return victim;
+
+    // Pass 1: prefer a backed victim (host_state == Host, unpinned). Demote it: release device
+    // pages, unlink from LRU, node stays alive as host-only.
+    NodeId current = lru_head_;
+    while (current != kInvalidNode) {
+        BlockNode& record = nodes_[current - 1U];
+        if (record.active_refs == 0 && record.restore_pins == 0 &&
+            record.host_state == Residency::Host) {
+            if (sink_ != nullptr) { sink_->release_block_pages(record.device_pages); }
+            record.device_state = Residency::Absent;
+            unlink_lru(current);
+            return current;
+        }
+        current = record.lru_next;
+    }
+
+    // Pass 2: no backed victim. Device eviction never copies (HPC): take the first unpinned
+    // victim and erase its subtree. The data is lost from the cache; if a host copy existed it
+    // would have been found in pass 1.
+    current = lru_head_;
+    while (current != kInvalidNode) {
+        BlockNode& record = nodes_[current - 1U];
+        if (record.active_refs == 0 && record.restore_pins == 0) {
+            erase_subtree(current);
+            return current;
+        }
+        current = record.lru_next;
+    }
+
+    return kInvalidNode;
+}
+
+std::array<std::uint32_t, kMaxPools> PrefixIndex::evictable_page_counts() const noexcept {
+    std::array<std::uint32_t, kMaxPools> counts{0U, 0U};
+    for (NodeId id = lru_head_; id != kInvalidNode; id = nodes_[id - 1U].lru_next) {
+        const BlockNode& record = nodes_[id - 1U];
+        if (record.device_pages.page[0] >= 0) { ++counts[0]; }
+        if (record.device_pages.page[1] >= 0) { ++counts[1]; }
+    }
+    return counts;
 }
 
 void PrefixIndex::erase_subtree(NodeId node) {
@@ -572,8 +714,192 @@ void PrefixIndex::erase_subtree(NodeId node) {
             if (sink_ != nullptr) { sink_->release_block_pages(record.device_pages); }
             record.device_state = Residency::Absent;
         }
+        // Release host slab back to pool (if any). The node is being freed, so its host copy is
+        // no longer referenced.
+        if (host_pool_ != nullptr && record.host_page != kInvalidHostPage) {
+            host_pool_->release(record.host_page);
+            record.host_page = kInvalidHostPage;
+            record.host_state = Residency::Absent;
+        }
         free_node(current);
     }
+}
+
+// --- M2 async fill APIs ---
+
+HostWriteTarget PrefixIndex::begin_host_write(NodeId id) {
+    HostWriteTarget result;
+    if (!valid(id) || host_pool_ == nullptr) { return result; }
+    BlockNode& record = nodes_[id - 1U];
+    if (record.device_state != Residency::Resident || record.host_state != Residency::Absent) {
+        return result;
+    }
+
+    // Allocate a host slab. If the pool evicted another slab to make room, reconcile its owner.
+    SlabAllocation alloc = host_pool_->allocate_block();
+    if (alloc.page == kInvalidHostPage) { return result; }
+    if (alloc.evicted != kInvalidHostPage) { reconcile_host_eviction(alloc.evicted); }
+
+    record.host_page  = alloc.page;
+    record.host_state = Residency::Filling;
+    // Keep the node out of the eviction LRU for the duration of the transfer: its pages must stay
+    // allocated while the D2H reads them.
+    pin_restore(id);
+    host_pool_->pin(alloc.page);
+    // Dead-KV: a block no snapshot reaches is the first host-resident data to go.
+    if (record.live_snapshots_below == 0U) { host_pool_->mark_dead(alloc.page); }
+    result.node = id;
+    result.page = alloc.page;
+    return result;
+}
+
+void PrefixIndex::finish_host_write(NodeId id, bool ok) noexcept {
+    if (!valid(id)) { return; }
+    BlockNode& record = nodes_[id - 1U];
+    if (record.host_state != Residency::Filling) { return; }
+    if (ok) {
+        record.host_state = Residency::Host;
+        // Transfer complete: release the in-flight pin so the slab is evictable by policy again.
+        if (host_pool_ != nullptr && record.host_page != kInvalidHostPage) {
+            host_pool_->unpin(record.host_page);
+        }
+    } else {
+        // Rollback: release the host slab.
+        if (host_pool_ != nullptr && record.host_page != kInvalidHostPage) {
+            host_pool_->unpin(record.host_page);
+            host_pool_->release(record.host_page);
+            record.host_page = kInvalidHostPage;
+        }
+        record.host_state = Residency::Absent;
+    }
+    unpin_restore(id);
+}
+
+void PrefixIndex::begin_device_fill(NodeId id, PoolPages pages) noexcept {
+    if (!valid(id)) { return; }
+    BlockNode& record = nodes_[id - 1U];
+    if (record.device_state != Residency::Absent) { return; }
+    record.device_pages = pages;
+    record.device_state = Residency::Filling;
+    // Pin the node (pages must not be evicted mid-copy) and the source slab (the pool must not
+    // reclaim it while the H2D reads from it).
+    pin_restore(id);
+    if (host_pool_ != nullptr && record.host_page != kInvalidHostPage) {
+        host_pool_->pin(record.host_page);
+    }
+}
+
+void PrefixIndex::finish_device_fill(NodeId id, bool ok) noexcept {
+    if (!valid(id)) { return; }
+    BlockNode& record = nodes_[id - 1U];
+    if (record.device_state != Residency::Filling) { return; }
+    if (ok) {
+        record.device_state = Residency::Resident;
+    } else {
+        // Rollback: release the device pages.
+        if (sink_ != nullptr) { sink_->release_block_pages(record.device_pages); }
+        record.device_pages = PoolPages{};
+        record.device_state = Residency::Absent;
+    }
+    if (host_pool_ != nullptr && record.host_page != kInvalidHostPage) {
+        host_pool_->unpin(record.host_page);
+    }
+    unpin_restore(id); // re-links into the LRU when the node is now fully unpinned
+}
+
+SnapshotWriteTarget PrefixIndex::begin_snapshot_write(SnapshotId id) {
+    SnapshotWriteTarget result;
+    if (id == kInvalidSnapshot || id > snapshots_.size() || host_pool_ == nullptr) {
+        return result;
+    }
+    Snapshot& record = snapshots_[id - 1U];
+    if (!record.live || record.device_state != Residency::Resident ||
+        record.host_state != Residency::Absent) {
+        return result;
+    }
+
+    // Allocate a snapshot slab. If the pool evicted another slab to make room, reconcile its owner.
+    SlabAllocation alloc = host_pool_->allocate_snapshot();
+    if (alloc.page == kInvalidHostPage) { return result; }
+    if (alloc.evicted != kInvalidHostPage) { reconcile_host_eviction(alloc.evicted); }
+
+    record.host_page  = alloc.page;
+    record.host_state = Residency::Filling;
+    ++record.restore_pins;
+    // Pin the anchor node so neither it nor its subtree can be erased while the image is being
+    // written out (erase_subtree aborts on a pinned node).
+    pin_restore(record.anchor);
+    host_pool_->pin(alloc.page);
+    result.id   = id;
+    result.page = alloc.page;
+    return result;
+}
+
+void PrefixIndex::finish_snapshot_write(SnapshotId id, bool ok) noexcept {
+    if (id == kInvalidSnapshot || id > snapshots_.size()) { return; }
+    Snapshot& record = snapshots_[id - 1U];
+    if (!record.live || record.host_state != Residency::Filling) { return; }
+    if (ok) {
+        record.host_state = Residency::Host;
+        // Transfer complete: release the in-flight pin so the slab is evictable by policy again.
+        if (host_pool_ != nullptr && record.host_page != kInvalidHostPage) {
+            host_pool_->unpin(record.host_page);
+        }
+    } else {
+        // Rollback: release the host slab.
+        if (host_pool_ != nullptr && record.host_page != kInvalidHostPage) {
+            host_pool_->unpin(record.host_page);
+            host_pool_->release(record.host_page);
+            record.host_page = kInvalidHostPage;
+        }
+        record.host_state = Residency::Absent;
+    }
+    if (record.restore_pins > 0U) { --record.restore_pins; }
+    unpin_restore(record.anchor);
+}
+
+SnapshotRestoreTarget PrefixIndex::begin_snapshot_restore(SnapshotId id) {
+    SnapshotRestoreTarget result;
+    if (id == kInvalidSnapshot || id > snapshots_.size() || host_pool_ == nullptr) {
+        return result;
+    }
+    Snapshot& record = snapshots_[id - 1U];
+    if (!record.live || record.host_state != Residency::Host) { return result; }
+
+    // Acquire a device slot. If no free slot is available, evict one per GDSF.
+    SlotId slot = acquire_slot(0);
+    if (slot == kInvalidSlot) { return result; }
+
+    record.device_slot  = slot;
+    record.device_state = Residency::Filling;
+    ++record.restore_pins;
+    host_pool_->pin(record.host_page);
+    result.id   = id;
+    result.slot = slot;
+    result.page = record.host_page;
+    return result;
+}
+
+void PrefixIndex::finish_snapshot_restore(SnapshotId id, bool ok) noexcept {
+    if (id == kInvalidSnapshot || id > snapshots_.size()) { return; }
+    Snapshot& record = snapshots_[id - 1U];
+    if (!record.live || record.device_state != Residency::Filling) { return; }
+    if (ok) {
+        record.device_state = Residency::Resident;
+    } else {
+        // Rollback: return the slot to the free list.
+        const SlotId slot = record.device_slot;
+        record.device_slot  = kInvalidSlot;
+        record.device_state = Residency::Absent;
+        if (slot != kInvalidSlot) {
+            slot_owner_[static_cast<std::size_t>(slot)] = kInvalidSnapshot;
+            free_slots_.push_back(slot);
+        }
+    }
+    if (host_pool_ != nullptr && record.host_page != kInvalidHostPage) {
+        host_pool_->unpin(record.host_page);
+    }
+    if (record.restore_pins > 0U) { --record.restore_pins; }
 }
 
 } // namespace ninfer::prefix_cache

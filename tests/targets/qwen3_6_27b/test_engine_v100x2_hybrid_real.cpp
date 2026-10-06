@@ -203,9 +203,61 @@ void exercise_exhaustion(const char* artifact) {
     std::cout << "V100X2 hybrid prefix cache (exhaustion): PASS" << std::endl;
 }
 
+// M2 host tier: two long, disjoint conversations that cannot both fit on device. Running B after
+// A evicts A's blocks from device; because A was written through to the pinned host tier, they are
+// demoted (backed) rather than erased, and re-issuing A restores them from host instead of
+// recomputing. This is the M2 exit criterion: the device pool cannot hold every conversation, yet
+// the host tier still serves it.
+void exercise_host_tier(const char* artifact) {
+    ninfer::EngineOptions options = engine_options(artifact);
+    // Each snapshot slab is the full GDN state (~147 MiB) and the snapshot tier gets 20% of the
+    // pool, so the size must be large enough to hold BOTH conversations' taps at once (up to 8
+    // slabs) or host_A's snapshots get evicted before host_A_again can restore from them.
+    options.prefix_cache.host_cache_mib = 8192;  // enable the pinned host tier (M2)
+    ninfer::Engine engine(options);
+    v100x2_test::check_identity(engine);
+
+    auto make_long = [](const char* intro, const char* fn, int n_ops) {
+        std::string text = std::string(intro);
+        for (int i = 0; i < n_ops; ++i) {
+            text += std::string("def ") + fn + "_" + std::to_string(i) + "(value):\n    return value + " +
+                    std::to_string(i) + "\n";
+        }
+        ninfer::PromptInput input;
+        input.messages.push_back(message(ninfer::ChatRole::User, std::move(text)));
+        return input;
+    };
+    const ninfer::PromptInput prompt_a = make_long(
+        "Conversation A: review these functions and implement a bounded FIFO queue with push, pop, "
+        "and unit tests. Explain empty and full behavior.\n\n",
+        "addA", 280);
+    const ninfer::PromptInput prompt_b = make_long(
+        "Conversation B: analyze the complexity of these routines and write a thread-safe LRU cache "
+        "with get, put, and capacity-eviction tests.\n\n",
+        "subB", 280);
+
+    const auto a_tokens = engine.prepare(prompt_a).debug_token_ids();
+    const std::uint32_t n_a = static_cast<std::uint32_t>(a_tokens.size());
+    require(n_a >= 4096 && n_a + 512 < kCapacity,
+            "host-tier fixture must be long and leave capacity headroom");
+
+    // 1. Cold-run A: its blocks land on device and are written through to the host tier.
+    run(engine, "host_A", engine.prepare(prompt_a), false, ninfer::PrefixReusePath::FullReset);
+    // 2. Run B (disjoint, equally long): it cannot coexist with A on device, so A's blocks are
+    //    evicted from device and demoted to the host tier (backed), not erased.
+    run(engine, "host_B", engine.prepare(prompt_b), false, ninfer::PrefixReusePath::FullReset);
+    // 3. Re-issue A: it must be restored from the host tier, not recomputed from scratch.
+    const auto a_again = run(engine, "host_A_again", engine.prepare_tokens(a_tokens, true), true,
+                             ninfer::PrefixReusePath::BlockSnapshot);
+    require(a_again.reused > 0 && a_again.reused < n_a,
+            "A was not restored from the host tier after B evicted it from device");
+    std::cout << "V100X2 hybrid prefix cache (host tier): PASS" << std::endl;
+}
+
 void exercise(const char* artifact) {
     exercise_normal(artifact);
     exercise_exhaustion(artifact);
+    exercise_host_tier(artifact);
 }
 
 } // namespace

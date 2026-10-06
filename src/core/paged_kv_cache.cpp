@@ -138,6 +138,83 @@ Tensor PagedKVPool::block_table_row(std::int32_t row) const {
         {static_cast<std::int32_t>(logical_page_capacity())});
 }
 
+namespace {
+
+// Every KV plane is physically laid out [page][head][token][leading] with `leading` fastest --
+// the exact convention ops/kernel/paged_kv_address.cuh addresses (both the attention reads and
+// the KV writes go through paged_kv_element_offset). One page therefore consists of
+// head_extent contiguous runs of (leading_extent * page_size) elements; run h of page p starts
+// at LE * PS * (h + HE * p). The declared tensor shape (PageMajor/HeadMajor) does not change
+// this physical arrangement.
+std::size_t per_plane_page_bytes(const PagedKVPlaneSpec& spec) noexcept {
+    return static_cast<std::size_t>(spec.leading_extent) * kPagedKVPageSize *
+           static_cast<std::size_t>(spec.head_extent) * dtype_size(spec.dtype);
+}
+
+template <bool DeviceToHost>
+bool copy_plane_page(const PagedKVPlaneSpec& spec, std::int32_t page_id, void* host_base,
+                     char* device_base, cudaStream_t stream) noexcept {
+    const std::size_t leading = static_cast<std::size_t>(spec.leading_extent);
+    const std::size_t heads   = static_cast<std::size_t>(spec.head_extent);
+    const std::size_t run_bytes = leading * kPagedKVPageSize * dtype_size(spec.dtype);
+    char* host = static_cast<char*>(host_base);
+    for (std::size_t h = 0; h < heads; ++h) {
+        char* dev_run = device_base +
+                        leading * kPagedKVPageSize * (h + heads * static_cast<std::size_t>(page_id));
+        if (DeviceToHost) {
+            if (cudaMemcpyAsync(host, dev_run, run_bytes, cudaMemcpyDeviceToHost, stream) !=
+                cudaSuccess) {
+                return false;
+            }
+        } else {
+            if (cudaMemcpyAsync(dev_run, host, run_bytes, cudaMemcpyHostToDevice, stream) !=
+                cudaSuccess) {
+                return false;
+            }
+        }
+        host += run_bytes;
+    }
+    return true;
+}
+
+} // namespace
+
+std::size_t PagedKVPool::per_page_bytes() const noexcept {
+    std::size_t total = 0;
+    for (const PagedKVPlaneSpec& spec : spec_.planes) {
+        total += per_plane_page_bytes(spec);
+    }
+    return total;
+}
+
+bool PagedKVPool::copy_page_d2h(void* host_dst, std::int32_t page_id,
+                                cudaStream_t stream) const noexcept {
+    char* out = static_cast<char*>(host_dst);
+    for (std::size_t i = 0; i < planes_.size(); ++i) {
+        if (!copy_plane_page<true>(spec_.planes[i], page_id, out,
+                                   static_cast<char*>(planes_[i].data), stream)) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        out += per_plane_page_bytes(spec_.planes[i]);
+    }
+    return true;
+}
+
+bool PagedKVPool::copy_page_h2d(const void* host_src, std::int32_t page_id,
+                                cudaStream_t stream) const noexcept {
+    char* in = const_cast<char*>(static_cast<const char*>(host_src));
+    for (std::size_t i = 0; i < planes_.size(); ++i) {
+        if (!copy_plane_page<false>(spec_.planes[i], page_id, in,
+                                    static_cast<char*>(planes_[i].data), stream)) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        in += per_plane_page_bytes(spec_.planes[i]);
+    }
+    return true;
+}
+
 std::uint32_t PagedKVPool::entitled_pages() const noexcept { return entitled_pages_; }
 
 std::uint32_t PagedKVPool::mapped_pages() const noexcept { return mapped_pages_; }
@@ -279,8 +356,12 @@ std::vector<std::int32_t> PagedKVPool::acquire_cache_pages(std::uint32_t count) 
 
 void PagedKVPool::release_cache_pages(std::span<const std::int32_t> page_ids) noexcept {
     if (page_ids.empty()) { return; }
+    // A cache page was already removed from mapped_pages_ when it was promoted, so releasing it
+    // only moves it back to the free list and out of the cache. Decrementing mapped here (as
+    // return_pages does) would double-count and drive mapped_pages_ negative under eviction.
     cached_pages_ -= static_cast<std::uint32_t>(page_ids.size());
-    return_pages(page_ids);
+    free_page_ids_.insert(free_page_ids_.end(), page_ids.begin(), page_ids.end());
+    std::sort(free_page_ids_.begin(), free_page_ids_.end());
 }
 
 void PagedKVPool::promote_to_cache(std::span<const std::int32_t> page_ids) {
@@ -288,10 +369,13 @@ void PagedKVPool::promote_to_cache(std::span<const std::int32_t> page_ids) {
     if (page_ids.size() > mapped_pages_) {
         throw std::invalid_argument("Paged KV promotion exceeds the mapped page count");
     }
-    const auto capacity = static_cast<std::int32_t>(logical_page_capacity());
+    // page_ids are physical page-group ids in [0, page_group_count()); they are NOT bounded by the
+    // per-allocation logical capacity (M >= L). A resumed long-context request can own physical
+    // pages above L, so validating against logical_page_capacity() rejects valid promotions.
+    const auto capacity = static_cast<std::int32_t>(page_group_count());
     for (const std::int32_t page : page_ids) {
         if (page < 0 || page >= capacity) {
-            throw std::invalid_argument("Paged KV promotion page id out of range");
+            throw std::invalid_argument("Paged KV promotion physical page is out of range");
         }
     }
     cached_pages_ += static_cast<std::uint32_t>(page_ids.size());

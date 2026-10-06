@@ -22,4 +22,11 @@ export NINFER_V100X2_SERVE_MAX_CONCURRENCY=${NINFER_V100X2_SERVE_MAX_CONCURRENCY
 # generated frontier (append_frontier) instead of the conservative turn-closure checkpoint.
 export NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS=${NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS:-'{"preserve_thinking": true, "reasoning_effort":"low"}'}
 
-exec "$(dirname -- "${BASH_SOURCE[0]}")/tools/v100/ninfer-v100x2-serve.sh" "$@"
+# Enable the hybrid prefix cache with the pinned host tier (M2): KV blocks and snapshot images that
+# no longer fit on device are demoted to pinned host RAM instead of dropped, so an evicted
+# conversation can still be restored without recomputing. Each snapshot slab is ~147 MiB, so the
+# pool is sized to hold several conversations' taps; override with NINFER_V100X2_SERVE_HOST_CACHE_MIB.
+host_cache_mib=${NINFER_V100X2_SERVE_HOST_CACHE_MIB:-28192}
+
+exec "$(dirname -- "${BASH_SOURCE[0]}")/tools/v100/ninfer-v100x2-serve.sh" \
+    --prefix-cache --host-cache-mib "${host_cache_mib}" "$@"

@@ -109,6 +109,23 @@ public:
     [[nodiscard]] const Tensor& block_tables() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;
 
+    // Total bytes occupied by one physical page across all storage planes (sum over planes of the
+    // per-plane page extent). Used to size host slabs for the prefix cache.
+    [[nodiscard]] std::size_t per_page_bytes() const noexcept;
+
+    // Copy one physical page (all planes) out of this pool into a contiguous buffer `host_dst` on
+    // `stream`. The buffer layout is plane-major: for each plane, in plane order, the page's data
+    // appears as head_extent contiguous runs of (leading_extent * page_size * dtype_size) bytes,
+    // head-first. Returns false (clearing the CUDA error) if any copy fails; the buffer holds a
+    // full page iff true was returned.
+    [[nodiscard]] bool copy_page_d2h(void* host_dst, std::int32_t page_id,
+                                     cudaStream_t stream) const noexcept;
+
+    // Copy one physical page (all planes) from a contiguous buffer `host_src` into this pool on
+    // `stream`, using the same layout as copy_page_d2h. Returns false on the first failed copy.
+    [[nodiscard]] bool copy_page_h2d(const void* host_src, std::int32_t page_id,
+                                     cudaStream_t stream) const noexcept;
+
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     [[nodiscard]] std::uint32_t free_pages() const noexcept;

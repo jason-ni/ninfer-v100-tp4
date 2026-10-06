@@ -97,6 +97,8 @@ struct PrefixCacheOptions {
     std::uint32_t ladder_tokens  = 0;
     // Minimum token gap between ladder taps. Zero derives `max(1024, prefill_chunk)`.
     std::uint32_t min_gap        = 0;
+    // Pinned host RAM for the prefix pool in MiB. Zero = device-only (M1).
+    std::uint32_t host_cache_mib = 0;
 };
 
 struct LoadProgress {

@@ -9,6 +9,7 @@
 // PrefixPageSink when the index drops its last copy.
 
 #include <ninfer/types.h>
+#include "runtime/prefix_cache/host_slab_pool.h"
 
 #include <array>
 #include <cstddef>
@@ -58,12 +59,12 @@ enum class SnapshotKind : std::uint8_t {
     Boundary,       // explicit client breakpoint or structural boundary, shareable
 };
 
-// A node may own a device copy, no copy, or a copy being filled in. Host is reserved for M2 and
-// is always Absent in this device-only cut.
+// A node may own a device copy, a host copy, no copy, or a copy being filled in.
 enum class Residency : std::uint8_t {
-    Absent,
-    Resident,
-    Filling,
+    Absent,   // no copy exists anywhere
+    Resident, // device-resident
+    Host,     // host-resident (data in pinned host memory)
+    Filling,  // in-flight transfer (D2H or H2D)
 };
 
 struct BlockNode {
@@ -77,6 +78,10 @@ struct BlockNode {
     PoolPages device_pages{};
     Residency device_state = Residency::Absent;
 
+    // Host tier (M2): pinned host slab holding this block's KV data.
+    HostPageId host_page = kInvalidHostPage;
+    Residency host_state = Residency::Absent;
+
     std::uint32_t active_refs          = 0; // active sequences whose table maps this node
     std::uint32_t restore_pins         = 0; // in-flight transfers reading/writing this node
     std::uint32_t live_snapshots_below = 0; // snapshots whose path includes this node
@@ -86,12 +91,14 @@ struct BlockNode {
     NodeId lru_prev = kInvalidNode;
     NodeId lru_next = kInvalidNode;
     bool lru_linked = false;
-    bool lru_backed = false; // M2: node has a host copy; backed entries evict first
 
     std::vector<SnapshotId> snapshots; // snapshots anchored here
 
     std::uint32_t generation = 1;
     bool live                = true;
+
+    // True when a host copy exists and can back the device copy (safe to demote on eviction).
+    [[nodiscard]] bool is_backed() const noexcept { return host_state == Residency::Host; }
 };
 
 struct Snapshot {
@@ -105,6 +112,10 @@ struct Snapshot {
 
     SlotId device_slot = kInvalidSlot; // index into the D device snapshot slots
     Residency device_state = Residency::Absent;
+
+    // Host tier (M2): pinned host slab holding this snapshot's state image.
+    HostPageId host_page = kInvalidHostPage;
+    Residency host_state = Residency::Absent;
 
     SnapshotKind kind = SnapshotKind::Tap;
     bool superseded   = false;
@@ -124,13 +135,14 @@ struct Snapshot {
     }
 };
 
-// Returned when the index drops the last reference to physical storage.
+// Returned when the index drops the last reference to physical storage. Device eviction never
+// copies: a backed node demotes (host copy survives), an unbacked node erases its subtree.
 class PrefixPageSink {
 public:
     virtual ~PrefixPageSink() = default;
-    virtual void release_block_pages(const PoolPages& pages) noexcept      = 0;
-    virtual void release_tail_pages(const PoolPages& pages) noexcept       = 0;
-    virtual void release_snapshot_slot(SlotId slot) noexcept               = 0;
+    virtual void release_block_pages(const PoolPages& pages) noexcept = 0;
+    virtual void release_tail_pages(const PoolPages& pages) noexcept  = 0;
+    virtual void release_snapshot_slot(SlotId slot) noexcept          = 0;
 };
 
 struct PrefixIndexOptions {
@@ -174,6 +186,7 @@ struct SnapshotCandidate {
     SnapshotId id      = kInvalidSnapshot;
     std::uint32_t frontier = 0;
     bool device_resident   = false;
+    bool host_resident     = false;
 };
 
 struct PrefixMatch {
@@ -183,6 +196,31 @@ struct PrefixMatch {
     // Deepest candidate with F <= n-1 whose storage is fully device resident, or invalid.
     SnapshotId best_device = kInvalidSnapshot;
     std::uint32_t best_device_frontier = 0;
+    // Deepest candidate with F <= n-1 whose image is host resident and whose path is restorable
+    // (every node has a device or host copy), or invalid.
+    SnapshotId best_host = kInvalidSnapshot;
+    std::uint32_t best_host_frontier = 0;
+};
+
+// Result of begin_host_write: the node and the host slab that will receive its KV data. The
+// caller enqueues the D2H copy and calls finish_host_write when it completes.
+struct HostWriteTarget {
+    NodeId node = kInvalidNode;
+    HostPageId page = kInvalidHostPage;
+};
+
+// Result of begin_snapshot_write: the snapshot and the host slab that will receive its image.
+struct SnapshotWriteTarget {
+    SnapshotId id = kInvalidSnapshot;
+    HostPageId page = kInvalidHostPage;
+};
+
+// Result of begin_snapshot_restore: the snapshot, the device slot to fill, and the host slab to
+// read from. The caller enqueues the H2D copy and calls finish_snapshot_restore when done.
+struct SnapshotRestoreTarget {
+    SnapshotId id = kInvalidSnapshot;
+    SlotId slot = kInvalidSlot;
+    HostPageId page = kInvalidHostPage;
 };
 
 class PrefixIndex {
@@ -259,6 +297,59 @@ public:
     // are left untouched.
     void erase_subtree(NodeId node);
 
+    // Set the host slab pool for M2 write-through/restore. Must be called before any
+    // commit_block or match that involves host residency.
+    void set_host_pool(HostSlabPool* pool) noexcept { host_pool_ = pool; }
+
+    // --- M2 async fill APIs ---
+    //
+    // Each begin_* reserves its destination, marks the record Filling, and pins it (and, for a
+    // snapshot write, its anchor node) against eviction while the transfer is in flight. The
+    // caller enqueues the copies on its own streams and calls the matching finish_* exactly once;
+    // finish(ok=false) rolls the reservation back.
+
+    // Begin D2H write-through of a device-resident node that has no host copy yet. Allocates a
+    // host slab, marks host_state=Filling, pins the node and the slab against eviction. Returns
+    // the host page for the caller to enqueue the D2H copy, or kInvalidHostPage if not possible.
+    [[nodiscard]] HostWriteTarget begin_host_write(NodeId id);
+
+    // Complete (or abort) a D2H write-through. ok=true marks host_state=Host; ok=false releases
+    // the slab again. Unpins the node either way.
+    void finish_host_write(NodeId id, bool ok) noexcept;
+
+    // Begin H2D restore of a host-resident node to freshly allocated device pages. Caller supplies
+    // the pages (from pool.acquire_cache_pages). Marks device_state=Filling, pins the node and the
+    // source slab. No-op when the node is not device-absent.
+    void begin_device_fill(NodeId id, PoolPages pages) noexcept;
+
+    // Complete (or abort) an H2D restore. ok=true marks device_state=Resident and re-links the
+    // node into the eviction LRU; ok=false releases the pages through the sink.
+    void finish_device_fill(NodeId id, bool ok) noexcept;
+
+    // Begin D2H write-through of a snapshot image that has no host copy yet. Allocates a host
+    // slab, marks host_state=Filling, pins the snapshot and its anchor node against eviction.
+    // Returns the host page for the caller to enqueue the D2H copy, or kInvalidHostPage if not
+    // possible.
+    [[nodiscard]] SnapshotWriteTarget begin_snapshot_write(SnapshotId id);
+
+    // Complete (or abort) a snapshot image D2H write-through. ok=true marks host_state=Host;
+    // ok=false releases the slab again. Unpins the anchor node either way.
+    void finish_snapshot_write(SnapshotId id, bool ok) noexcept;
+
+    // Begin H2D restore of a snapshot image to a device slot. Acquires a slot (evicting per GDSF
+    // if needed), marks device_state=Filling, pins the snapshot and its source slab. Returns the
+    // slot and host page for the caller to enqueue the H2D copy, or kInvalidSlot if not possible.
+    [[nodiscard]] SnapshotRestoreTarget begin_snapshot_restore(SnapshotId id);
+
+    // Complete (or abort) a snapshot image H2D restore. ok=true marks device_state=Resident;
+    // ok=false returns the slot to the free list.
+    void finish_snapshot_restore(SnapshotId id, bool ok) noexcept;
+
+    // Pages the admission check may reclaim by calling evict_device_lru(): one entry per pool,
+    // counting LRU-linked nodes that own a page in that pool. Eviction returns exactly these pages
+    // to the pools (backed nodes demote, unbacked nodes erase), so the counts are a sound credit.
+    [[nodiscard]] std::array<std::uint32_t, kMaxPools> evictable_page_counts() const noexcept;
+
     [[nodiscard]] std::uint32_t evictable_pages() const noexcept { return evictable_pages_; }
 
 private:
@@ -281,12 +372,22 @@ private:
     // Remove a snapshot's bookkeeping and release its tail pages, returning its device slot
     // without releasing it (used when the slot is immediately reused by a newer snapshot).
     SlotId detach_snapshot(SnapshotId id);
+    // Release a snapshot's device slot and tail pages but keep it alive as host-resident. Used when
+    // the victim has a host copy that should survive the device-slot eviction. Returns the freed
+    // slot (caller clears slot_owner_ and returns it to the free list).
+    SlotId demote_snapshot_device(SnapshotId id);
     void delete_snapshot(SnapshotId id);
     void dec_live_below(NodeId node, std::uint32_t count) noexcept;
     void inc_live_below(NodeId node) noexcept;
 
+    // The slab pool evicted `page` to make room. Clear the owner's host reference (the slab is
+    // already freed by the pool, so it must NOT be released again) and, if the owner now holds no
+    // data anywhere and is unpinned, drop it (erase subtree / delete snapshot).
+    void reconcile_host_eviction(HostPageId page) noexcept;
+
     PrefixIndexOptions options_;
     PrefixPageSink* sink_ = nullptr;
+    HostSlabPool* host_pool_ = nullptr; // M2: pinned host memory for write-through/restore
 
     std::vector<BlockNode> nodes_;
     std::vector<Snapshot> snapshots_; // index + 1 == SnapshotId

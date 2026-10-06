@@ -307,6 +307,13 @@ int main(int argc, char** argv) {
         engine_options.use_cuda_graph = cli.use_cuda_graph;
         engine_options.load_progress  = load_progress.callback();
 
+        // Wire the hybrid prefix cache: --prefix-cache enables it explicitly, and a positive
+        // --host-cache-mib implies it as well (host tier sized in MiB; 0 = device-only).
+        if (cli.prefix_cache || cli.host_cache_mib > 0) {
+            engine_options.prefix_cache.enabled        = true;
+            engine_options.prefix_cache.host_cache_mib = cli.host_cache_mib;
+        }
+
         const auto load_started = Clock::now();
         ninfer::Engine engine(std::move(engine_options));
         const double load_wall = std::chrono::duration<double>(Clock::now() - load_started).count();

@@ -144,6 +144,11 @@ survive long sessions and multiple conversations.
 
 ### M1 — device-only block + snapshot cache
 
+Status: **complete.** Implemented and verified (see `ninfer_prefix_cache_index_test` and the
+OpenCode repro). One latent bug found during M2 review — `clear_lane` released *published* snapshot
+slots back to the free list even though the live snapshot still owned them — is fixed as part of M2
+(task T3, slot-release fix).
+
 Deliverables:
 
 - A block index over the paged KV: nodes keyed by `(parent, tokens[64])`, hash for lookup with exact
@@ -163,14 +168,127 @@ the rewritten tool block, and the prefill token count equals `n − F`.
 
 ### M2 — host tier
 
-Deliverables:
+Status: **code complete; GPU verification pending.** Tracked as tasks T0–T7 below. T0–T7 are done
+in-tree (uncommitted): the tree compiles, `ninfer_prefix_cache_host_test` and
+`ninfer_prefix_cache_index_test` are green, and the full build links. What remains is the T7 GPU
+exit criterion (host-reuse scenario + `--host-cache-mib=0` regression) on real weights.
 
-- Pinned host slab pool (`--host-cache-mib`), one allocator for KV blocks and snapshot images.
-- Async write-through of blocks and snapshot images on lane release; device eviction never copies.
-- Restore batches on a dedicated per-rank stream, ordered by forward-pass read order, overlapping
-  the restored lane's first prefill; node/tail/image `Filling` states and pins so no eviction frees
-  an in-flight destination.
-- Device LRU (tail-first) + host GDSF with superseded-first and dead-KV-first ordering.
+A review while landing T7 found and fixed a real bug: `finish_host_write` / `finish_snapshot_write`
+pinned their slab in `begin_*` to protect the in-flight transfer but only *un*pinned it on the
+failure path. A successful write-through therefore leaked the pin, and since `pick_victim` skips
+pinned slabs, the pool could never evict a successfully-cached slab — the host tier filled with
+permanently-pinned slabs and stopped making room. Both success paths now release the in-flight pin.
+
+#### Design decisions (locked)
+
+- **Host slab layout is rank-sliced.** A block slab holds `tp × per_rank_block_bytes` (rank `r` at
+  offset `r·per_rank_block_bytes`); a snapshot slab holds `tp × gdn_state_bytes`. Per-rank block
+  bytes = text-pool per-page bytes + backend-pool per-page bytes (both pools, all planes). Transfers
+  run on each rank's own device/stream into its slice.
+- **Snapshot image write-through is tap-time, async.** Right after a tap is captured
+  (`add_snapshot` in `advance_prefill`), the state image is D2H-copied to a host slab on the cache
+  stream (enqueued, not synced). This deviates from the original "on lane release" wording: a
+  snapshot slot is a scarce device resource that GDSF can evict *before* the request ends, so the
+  host copy must exist from the moment the snapshot is born to survive slot eviction. The slot is
+  exclusively owned by its snapshot record, so the D2H reads nothing contended. Completion is polled
+  at round boundaries; `restore_pins` (bumped in `begin_snapshot_write`) keeps GDSF from evicting a
+  snapshot whose write is still in flight (`acquire_slot` skips `restore_pins != 0`).
+- **Block write-through is lane-release, async.** On `clear_lane`, each path node that is
+  device-resident but has no host copy yet is D2H-copied to a host slab (enqueued, not synced).
+  Pages are cache-owned and protected by `restore_pins` while in flight. Best-effort: a transfer
+  failure rolls the node back to no-host-copy rather than failing the (noexcept) lane teardown.
+- **Restore (H2D) is synchronous.** At lane start, all missing blocks (text + backend, every rank)
+  and the snapshot image are H2D-copied on the per-rank cache stream, then each rank's stream is
+  synchronized once. There is no GPU work between enqueue and the first reader on this path, so
+  event-deferred overlap buys nothing; sync keeps restored nodes straight to `Resident` with no
+  lingering in-flight state.
+- **Device eviction never copies.** A backed node (host copy present) demotes: drop device pages,
+  keep host copy. An unbacked node erases its subtree. The earlier eviction-time write-through is
+  removed.
+- **Host-slab eviction reconciliation.** When the slab pool evicts a slab, the owner loses its host
+  copy; if the owner then has no data anywhere and is unpinned, it is erased (nodes) / deleted
+  (snapshots). In-flight slabs are `pinned` in the pool so they are never victims.
+- **Snapshot slot eviction demotes instead of deleting** when the victim has a host copy (stays
+  alive as host-resident; no `dec_live_below`).
+
+#### Tasks
+
+| # | Task | Scope | Status |
+|---|------|-------|--------|
+| T0 | Update tracking doc | Mark M1 done; add this M2 task table + design decisions | done |
+| T1 | Fix physical transfer layer | All-rank transfers, backend pages in block data, snapshot image = per-layer conv+recurrent segments, rank-sliced slab sizing; `PagedKVPool::copy_page_d2h/h2d` rewritten non-throwing on the kernel's real layout; `per_page_bytes()` from plane specs | done |
+| T2 | Fix PrefixIndex policy | LRU invariant in `link_lru_tail`; pin/unpin simplification; `begin_snapshot_write` pins anchor node; `delete_snapshot` defers while pinned; `detach_snapshot` releases slab; `hit()` updates GDSF metadata; `evictable_page_counts()`; dead-code removal | done |
+| T3 | Write-through (D2H) + slot fix | `issue_block_write_through` / `issue_snapshot_write_through` with per-rank events; `tick_prefix_cache()` polling; tap-loop slot settlement (consumed = `kInvalidSlot`); `clear_lane` write-through before unpin, releases only unconsumed slots | done (tick call sites partial — see WIP note) |
+| T4 | Restore (H2D) | Rewrite `start_prefill_lane` BlockSnapshot branch: batch H2D of missing blocks (text+backend, all ranks) + snapshot image via `begin_snapshot_restore`; sync per rank; borrow restored pages; admission in `request_plan_impl.h` picks deeper of `best_device`/`best_host` | done |
+| T5 | Wire device eviction to memory pressure | `can_admit_lane` counts evictable cache pages (`active_refs==0 && restore_pins==0`) as reclaimable; `reserve_sequence_kv` + restore-time `acquire_cache_pages` retry through `evict_device_lru()` on `bad_alloc`; fix `release_cached_pages` to release backend pages (all ranks) | done |
+| T6 | Config surface + docs | Serve `--host-cache-mib` (`serve_options.{h,cpp}`, `generation_service.cpp`); `docs/cli.md`, `docs/serving.md`; finalize this tracking section | code done; `docs/cli.md`/`docs/serving.md` prose pending |
+| T7 | Tests + verification | Extend `tests/test_prefix_cache_host.cpp` (demote-vs-erase, slab reconciliation, dead-KV/supersede marking, slot demote, best_host admission, slot-release fix); GPU host-reuse scenario + regression | unit tests done + green; **GPU scenario pending** |
+
+Dependency order: T0 → T2 → T1 → T3/T4 → T5 → T6 → T7 (T1/T2 near-independent).
+
+#### WIP status (session 2026-10-06, uncommitted)
+
+Done in-tree:
+
+- **T1 transfer layer** — Key discovery: every KV plane is physically `[page][head][token][leading]`
+  with leading fastest (`src/ops/kernel/paged_kv_address.cuh`); the `plane_order` enum is vestigial
+  for addressing (kernels hardcode template offsets). Old copy helpers used wrong `nb[]` stride math.
+  Rewritten: `PagedKVPool::copy_page_d2h/h2d` are non-throwing bool APIs (per plane: HE contiguous
+  runs of LE·PS·dsz bytes at offset LE·PS·(h + HE·p)); `per_page_bytes()` = Σ LE·PS·HE·dsz. Program
+  side: `rank_backend_cache(rank)`, `copy_cache_block(rank, text_page, backend_page, slab_base, d2h)`
+  (both pools, all ranks, rank-sliced slabs), `copy_snapshot_slot(rank, slot, slab_base, d2h)` (per
+  layer: conv BF16 + recurrent FP32; slot is the last dim so per-slot data is one contiguous run per
+  layer). Constructor slab sizing fixed: block slab = tp·(text+backend per-page bytes); snapshot slab
+  = tp·per-slot GDN bytes (NOT `gdn_state_bytes` — that member is the whole pool, all slots). Streams
+  created only when a pool exists. New members: `prefix_block_rank_bytes`, `prefix_snapshot_rank_bytes`,
+  `InflightCacheWrite` + `prefix_inflight_writes`.
+- **T2 index policy** — LRU invariant enforced in `link_lru_tail` (linked ⟺ Resident && active_refs==0
+  && restore_pins==0); pin/unpin simplified to bump counter then re-link. `begin_host_write` pins via
+  `pin_restore` and marks the slab dead if `live_snapshots_below==0`. All `finish_*` paths unpin;
+  `finish_device_fill(ok=false)` resets `device_pages`; `finish_snapshot_restore(ok=false)` releases
+  its slot internally. `begin_snapshot_write` pins the anchor node (prevents subtree erase mid-D2H);
+  `finish_snapshot_write` unpins it. `delete_snapshot` defers while `restore_pins != 0`.
+  `detach_snapshot` releases the host slab on full deletion. `hit()` updates GDSF metadata.
+  `evictable_page_counts()` added. Removed dead code: `mark_device_resident`/`mark_host_resident`,
+  `PrefixPageSink::write_through_block`. Added `HostSlabPool::clear_superseded()`.
+- **T3 write-through** — `issue_block_write_through(node)`: `begin_host_write` + D2H per rank + event
+  record + inflight tracking. `issue_snapshot_write_through(id)`: same for snapshot images.
+  `tick_prefix_cache()`: polls all ranks' cache events, finishes all pending writes when every rank is
+  ready (all-or-nothing drain). `advance_prefill` tap loop: after `add_snapshot`, settles the reserved
+  slot (releases it if a duplicate holds a different slot), marks consumed slots `kInvalidSlot`, issues
+  the snapshot write-through. `clear_lane`: issues block write-through for all pinned nodes before
+  unpinning; releases only unconsumed tap slots (fixes the M1 latent bug: published slots stay owned
+  by their live snapshot).
+
+Remaining (only the T7 GPU exit criterion):
+
+1. **GPU host-reuse scenario** (`CUDA_VISIBLE_DEVICES=1,2 GGML_CUDA_PDL=0`, TP2, MTP-3,
+   `--host-cache-mib` sized for ~1 conversation): run conversation A (~90k tokens) then B (different
+   prefix, ~90k) so A's blocks demote/evict from device; re-issue A's next turn → expect
+   `ReusedBlockSnapshot` with frontier < n and a continuation **identical** to a cold run of the same
+   prompt (greedy). See the Verification section below.
+2. **Regression:** `--host-cache-mib=0` byte-for-byte M1 behavior; decode tok/s parity on the
+   acceptance workload; TP4 smoke with the host tier enabled.
+
+All code tasks (T3 tick call sites, T4 restore, T5 eviction wiring, T6 serve config, T7 unit tests)
+are implemented in-tree and the build + unit tests are green. The pin-leak fix noted in the M2 status
+above was found while writing the T7 slab-reconciliation test.
+
+Facts the next session needs:
+
+- Qwen3.6-27B: kv_heads=4 total (TP2 → 2/rank), head_dim=256, 16 full-attn layers, 48 GDN layers;
+  GDN key_heads=16, value_heads=48, key/value_head_dim=128, conv_state_width=3.
+- `gdn_state_bytes` (program member) = the WHOLE linear-attention pool (all slots); per-slot bytes must
+  be computed from `LinearAttentionStatePoolSpec` (layers × (conv_channels·conv_width·dsz +
+  key_dim·value_heads·value_head_dim·4)) or divided by slot count.
+- `copy_kv_block_h2d` no longer exists; anything still referencing it is part of the broken T4 branch.
+- Build dir: `build-v100/` (ninja). GPU runs: `CUDA_VISIBLE_DEVICES=1,2 GGML_CUDA_PDL=0`, TP2, MTP-3.
+
+#### Verification (T7)
+
+- **Unit:** new index behaviors above; `ninfer_prefix_cache_host_test` and `ninfer_prefix_cache_index_test` stay green.
+- **GPU host-reuse scenario** (`CUDA_VISIBLE_DEVICES=1,2 GGML_CUDA_PDL=0`): TP2, MTP-3, `--host-cache-mib` sized to hold ~1 conversation's snapshots. Run conversation A (~90k tokens) then conversation B (different prefix, ~90k) so A's blocks are demoted/evicted from device; re-issue A's next turn → expect `ReusedBlockSnapshot` with frontier < n and continuation **identical** to a cold run of the same prompt (greedy). This is the M2 exit criterion ("device pool cannot hold every conversation still reuses the host tier").
+- **Regression:** `--host-cache-mib=0` byte-for-byte M1 behavior; decode tok/s parity on the acceptance workload vs current baseline; TP4 smoke with host tier enabled (multi-rank transfer correctness).
 
 Exit: a long agent session whose device pool cannot hold every conversation still reuses the host
 tier; TTFT for a returning session is dominated by H2D restore (~GB/s), not recompute; graph/eager
