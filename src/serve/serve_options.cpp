@@ -182,8 +182,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
-           "[--vision] [--cuda-graph|--no-cuda-graph] [--no-prefix-reuse] "
-            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+            "[--vision] [--cuda-graph|--no-cuda-graph] [--no-prefix-reuse] [--prefix-cache] "
+             "[--lm-head-draft] [--no-thinking] [--preserve-thinking] "
             "[--chat-template-kwargs JSON] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -385,6 +385,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             cuda_graph_explicit    = true;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--prefix-cache") {
+            options.prefix_cache_enabled = true;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {

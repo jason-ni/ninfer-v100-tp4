@@ -55,6 +55,7 @@ struct ServeOptions {
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
+    bool prefix_cache_enabled = false; // --prefix-cache: enable hybrid content-addressed prefix cache
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
