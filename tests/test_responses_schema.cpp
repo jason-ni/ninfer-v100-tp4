@@ -243,6 +243,27 @@ int test_preserve_thinking_options_and_inheritance() {
     failures += check(api_code([&] { (void)parse_responses_request(unknown, limits()); }) ==
                           "chat_template_option_not_supported",
                       "Responses unknown chat template option was accepted");
+
+    Json enable_kwargs                    = base;
+    enable_kwargs["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    failures +=
+        check(parse_responses_request(enable_kwargs, limits()).generation.enable_thinking == false,
+              "Responses chat_template_kwargs enable_thinking parsed");
+
+    Json effort_kwargs                    = base;
+    effort_kwargs["chat_template_kwargs"] = Json{{"reasoning_effort", "low"}};
+    failures += check(
+        parse_responses_request(effort_kwargs, limits()).generation.reasoning_effort ==
+            RequestedReasoningEffort::Low,
+        "Responses chat_template_kwargs reasoning_effort parsed");
+
+    // An explicit reasoning.effort is the Responses-native control and takes precedence.
+    Json effort_both                    = effort_kwargs;
+    effort_both["reasoning"]            = Json{{"effort", "medium"}};
+    failures += check(
+        parse_responses_request(effort_both, limits()).generation.reasoning_effort ==
+            RequestedReasoningEffort::Medium,
+        "Responses reasoning.effort did not take precedence over chat_template_kwargs");
     return failures;
 }
 

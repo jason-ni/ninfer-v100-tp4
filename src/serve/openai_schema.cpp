@@ -479,57 +479,97 @@ std::string sse_event(const Json& payload) { return "data: " + payload.dump() + 
 
 } // namespace
 
-std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
-    std::optional<bool> top_level;
-    if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
-        if (!body.at("preserve_thinking").is_boolean()) {
-            bad_request("preserve_thinking must be a boolean or null", "preserve_thinking");
-        }
-        top_level = body.at("preserve_thinking").get<bool>();
+namespace {
+
+// Top-level boolean template option, or nullopt when the key is absent or null.
+std::optional<bool> openai_template_bool(const Json& body, const char* key) {
+    if (!body.contains(key) || body.at(key).is_null()) { return std::nullopt; }
+    if (!body.at(key).is_boolean()) {
+        bad_request(std::string(key) + " must be a boolean or null", key);
+    }
+    return body.at(key).get<bool>();
+}
+
+std::optional<RequestedReasoningEffort> openai_template_effort(const Json& value, const char* param) {
+    if (!value.is_string()) {
+        bad_request(std::string(param) + " must be a string or null", param);
+    }
+    const std::optional<RequestedReasoningEffort> effort =
+        parse_requested_reasoning_effort(value.get<std::string>());
+    if (!effort) {
+        bad_request(std::string(param) +
+                        " must be one of none, minimal, low, medium, high, xhigh, or max",
+                    param);
+    }
+    return effort;
+}
+
+} // namespace
+
+RequestTemplateOptions parse_request_template_options(const Json& body) {
+    RequestTemplateOptions out;
+    out.preserve_thinking = openai_template_bool(body, "preserve_thinking");
+    out.enable_thinking   = openai_template_bool(body, "enable_thinking");
+    if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null()) {
+        out.reasoning_effort =
+            openai_template_effort(body.at("reasoning_effort"), "reasoning_effort");
+        out.reasoning_effort_param = "reasoning_effort";
     }
 
-    std::optional<bool> template_value;
-    if (body.contains("chat_template_kwargs")) {
-        const Json& kwargs = body.at("chat_template_kwargs");
-        if (!kwargs.is_object()) {
-            bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
-        }
-        for (auto it = kwargs.begin(); it != kwargs.end(); ++it) {
-            if (it.key() != "preserve_thinking" && !it.value().is_null()) {
-                bad_request("chat_template_kwargs." + it.key() + " is not supported",
-                            "chat_template_kwargs", "chat_template_option_not_supported");
-            }
-        }
-        if (kwargs.contains("preserve_thinking") && !kwargs.at("preserve_thinking").is_null()) {
-            if (!kwargs.at("preserve_thinking").is_boolean()) {
+    if (!body.contains("chat_template_kwargs")) { return out; }
+    const Json& kwargs = body.at("chat_template_kwargs");
+    if (!kwargs.is_object()) {
+        bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
+    }
+
+    std::optional<bool> kw_preserve;
+    std::optional<bool> kw_enable;
+    std::optional<RequestedReasoningEffort> kw_effort;
+    for (auto it = kwargs.begin(); it != kwargs.end(); ++it) {
+        // A null value is an explicit "not set": it asserts nothing and never counts as unknown.
+        if (it.value().is_null()) { continue; }
+        const std::string& key = it.key();
+        if (key == "preserve_thinking") {
+            if (!it.value().is_boolean()) {
                 bad_request("chat_template_kwargs.preserve_thinking must be a boolean or null",
                             "chat_template_kwargs");
             }
-            template_value = kwargs.at("preserve_thinking").get<bool>();
+            kw_preserve = it.value().get<bool>();
+        } else if (key == "enable_thinking") {
+            if (!it.value().is_boolean()) {
+                bad_request("chat_template_kwargs.enable_thinking must be a boolean or null",
+                            "chat_template_kwargs");
+            }
+            kw_enable = it.value().get<bool>();
+        } else if (key == "reasoning_effort") {
+            kw_effort = openai_template_effort(it.value(), "chat_template_kwargs.reasoning_effort");
+        } else {
+            bad_request("chat_template_kwargs." + key + " is not supported", "chat_template_kwargs",
+                        "chat_template_option_not_supported");
         }
     }
 
-    if (top_level && template_value && *top_level != *template_value) {
+    // The two spellings must agree when both are present.
+    if (out.preserve_thinking && kw_preserve && *out.preserve_thinking != *kw_preserve) {
         bad_request("conflicting preserve_thinking values", "preserve_thinking",
                     "conflicting_template_option");
     }
-    return template_value ? template_value : top_level;
-}
+    if (out.enable_thinking && kw_enable && *out.enable_thinking != *kw_enable) {
+        bad_request("conflicting enable_thinking values", "enable_thinking",
+                    "conflicting_template_option");
+    }
+    if (out.reasoning_effort && kw_effort && *out.reasoning_effort != *kw_effort) {
+        bad_request("conflicting reasoning_effort values", "reasoning_effort",
+                    "conflicting_template_option");
+    }
 
-void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
-    if (!body.contains("reasoning_effort") || body.at("reasoning_effort").is_null()) { return; }
-    if (!body.at("reasoning_effort").is_string()) {
-        bad_request("reasoning_effort must be a string or null", "reasoning_effort");
+    if (kw_preserve) { out.preserve_thinking = kw_preserve; }
+    if (kw_enable) { out.enable_thinking = kw_enable; }
+    if (kw_effort) {
+        out.reasoning_effort       = kw_effort;
+        out.reasoning_effort_param = "chat_template_kwargs.reasoning_effort";
     }
-    const std::string value = body.at("reasoning_effort").get<std::string>();
-    const std::optional<RequestedReasoningEffort> effort = parse_requested_reasoning_effort(value);
-    if (!effort) {
-        bad_request("reasoning_effort must be one of none, minimal, low, medium, high, xhigh, or "
-                    "max",
-                    "reasoning_effort");
-    }
-    out.reasoning_effort       = *effort;
-    out.reasoning_effort_param = "reasoning_effort";
+    return out;
 }
 
 GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
@@ -553,11 +593,11 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
-    if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
-        out.enable_thinking = get_bool(body, "enable_thinking", false);
-    }
-    parse_openai_reasoning_effort(body, out);
-    out.preserve_thinking = parse_openai_preserve_thinking(body);
+    const RequestTemplateOptions template_options = parse_request_template_options(body);
+    out.enable_thinking        = template_options.enable_thinking;
+    out.reasoning_effort       = template_options.reasoning_effort;
+    out.reasoning_effort_param = template_options.reasoning_effort_param;
+    out.preserve_thinking      = template_options.preserve_thinking;
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
     if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }

@@ -741,7 +741,17 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     parse_tools(body, out);
     parse_tool_choice(body, out);
     parse_reasoning(body, out);
-    out.generation.preserve_thinking = parse_openai_preserve_thinking(body);
+    const RequestTemplateOptions template_options = parse_request_template_options(body);
+    out.generation.preserve_thinking = template_options.preserve_thinking;
+    if (template_options.enable_thinking) {
+        out.generation.enable_thinking = template_options.enable_thinking;
+    }
+    // `reasoning.effort` is the Responses-native control; a chat_template_kwargs reasoning_effort
+    // only fills in when that field was omitted.
+    if (!out.generation.reasoning_effort && template_options.reasoning_effort) {
+        out.generation.reasoning_effort       = template_options.reasoning_effort;
+        out.generation.reasoning_effort_param = template_options.reasoning_effort_param;
+    }
 
     if (const std::optional<double> temperature = optional_number(body, "temperature")) {
         if (*temperature < 0.0 || *temperature > 2.0) {

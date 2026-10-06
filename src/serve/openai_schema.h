@@ -23,7 +23,18 @@ namespace ninfer::serve {
 GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
                                                 const RequestLimits& limits);
 
-std::optional<bool> parse_openai_preserve_thinking(const nlohmann::json& body);
+// Request-level chat-template options. A client may give each option at the top level of the body
+// or inside the llama.cpp-compatible `chat_template_kwargs` object; when both spellings are present
+// they must agree. The closed key set mirrors the server --chat-template-kwargs flag:
+// preserve_thinking, enable_thinking, reasoning_effort. Unknown non-null keys are rejected.
+struct RequestTemplateOptions {
+    std::optional<bool> preserve_thinking;
+    std::optional<bool> enable_thinking;
+    std::optional<RequestedReasoningEffort> reasoning_effort;
+    std::string reasoning_effort_param = "reasoning_effort";
+};
+
+RequestTemplateOptions parse_request_template_options(const nlohmann::json& body);
 
 // Non-streaming chat completion response body (JSON string). When `reasoning` is
 // non-empty it is attached as `message.reasoning_content` (the DeepSeek/vLLM-style

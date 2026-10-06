@@ -139,8 +139,9 @@ The endpoint supports:
 - `stream_options.include_usage`;
 - function tools, tool choices, assistant tool-call history, and tool-result messages;
 - the top-level `reasoning_effort` field;
-- the `enable_thinking` extension;
-- `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
+- the `enable_thinking` and `preserve_thinking` extensions, at the top level or inside
+  `chat_template_kwargs`;
+- `chat_template_kwargs.reasoning_effort`, the llama.cpp-compatible spelling of `reasoning_effort`.
 
 The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
@@ -165,9 +166,13 @@ select the corresponding template effort when available. The other OpenAI protoc
 `reasoning_effort` returns `conflicting_template_option`.
 
 `preserve_thinking` controls whether reasoning from closed assistant turns remains in later
-prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. If
-both OpenAI spellings are present they must carry the same boolean value. Unknown non-null
-`chat_template_kwargs` are rejected.
+prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. The
+`chat_template_kwargs` object accepts the same closed key set as the server `--chat-template-kwargs`
+flag — `preserve_thinking`, `enable_thinking`, and `reasoning_effort` — and mirrors those top-level
+spellings; when both spellings of one option are present they must agree, and any other non-null key
+is rejected with `chat_template_option_not_supported`. This lets clients that pass
+`chat_template_kwargs.enable_thinking` (the llama.cpp-compatible spelling) control the thinking
+switch directly.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
@@ -271,8 +276,8 @@ wire response contains typed `output` Items.
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
-| `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
-| `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
+| `chat_template_kwargs` | object accepting `preserve_thinking` (bool), `enable_thinking` (bool), and `reasoning_effort` (`none`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`); a `reasoning_effort` here only applies when `reasoning.effort` is absent; any other non-null key returns `chat_template_option_not_supported` |
+| `preserve_thinking` | top-level alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
 | `tools` | flat Responses function definitions; see below |
 | `tool_choice` | `auto` or `none` |

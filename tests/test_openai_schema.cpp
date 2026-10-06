@@ -176,6 +176,77 @@ int test_preserve_thinking_options() {
     return failures;
 }
 
+// A client (e.g. opencode) sends thinking controls inside `chat_template_kwargs` using the
+// llama.cpp-compatible spelling. The request body must accept the same closed key set as the server
+// --chat-template-kwargs flag: preserve_thinking, enable_thinking, reasoning_effort.
+int test_chat_template_kwargs_options() {
+    const Json base = {
+        {"model", "m"},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+    };
+    int failures = 0;
+
+    Json enable                    = base;
+    enable["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    const GenerationRequest enable_request =
+        parse_chat_completion_request(enable, default_limits());
+    failures += check(enable_request.enable_thinking == false,
+                      "chat_template_kwargs enable_thinking parsed");
+    failures += check(!translate(enable_request).options.enable_thinking,
+                      "resolved enable_thinking=false reached PromptInput");
+
+    Json effort                    = base;
+    effort["chat_template_kwargs"] = Json{{"reasoning_effort", "low"}};
+    const GenerationRequest effort_request =
+        parse_chat_completion_request(effort, default_limits());
+    failures += check(effort_request.reasoning_effort == RequestedReasoningEffort::Low &&
+                          effort_request.reasoning_effort_param ==
+                              "chat_template_kwargs.reasoning_effort",
+                      "chat_template_kwargs reasoning_effort parsed");
+    const ninfer::PromptInput effort_prompt = translate(effort_request);
+    failures += check(effort_prompt.options.enable_thinking &&
+                          effort_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "chat_template_kwargs reasoning_effort reached PromptInput");
+
+    Json agree                    = base;
+    agree["enable_thinking"]      = false;
+    agree["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    failures +=
+        check(parse_chat_completion_request(agree, default_limits()).enable_thinking == false,
+              "matching top-level and kwargs enable_thinking rejected");
+
+    Json conflict                    = base;
+    conflict["enable_thinking"]      = true;
+    conflict["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(conflict, default_limits());
+                      }) == "conflicting_template_option",
+                      "conflicting enable_thinking values accepted");
+
+    Json effort_conflict                    = base;
+    effort_conflict["reasoning_effort"]     = "low";
+    effort_conflict["chat_template_kwargs"] = Json{{"reasoning_effort", "medium"}};
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(effort_conflict, default_limits());
+                      }) == "conflicting_template_option",
+                      "conflicting reasoning_effort values accepted");
+
+    Json bad_enable                    = base;
+    bad_enable["chat_template_kwargs"] = Json{{"enable_thinking", "yes"}};
+    failures += check(throws_api([&] {
+                          (void)parse_chat_completion_request(bad_enable, default_limits());
+                      }),
+                      "non-boolean kwargs enable_thinking accepted");
+
+    Json bad_effort                    = base;
+    bad_effort["chat_template_kwargs"] = Json{{"reasoning_effort", "ultra"}};
+    failures += check(throws_api([&] {
+                          (void)parse_chat_completion_request(bad_effort, default_limits());
+                      }),
+                      "invalid kwargs reasoning_effort accepted");
+    return failures;
+}
+
 int test_reasoning_effort() {
     const Json base = {
         {"model", "m"},
@@ -729,6 +800,7 @@ int main() {
     int failures = 0;
     failures += test_parse_string_content();
     failures += test_preserve_thinking_options();
+    failures += test_chat_template_kwargs_options();
     failures += test_reasoning_effort();
     failures += test_parse_parts_and_flatten();
     failures += test_instruction_roles_preserved();
