@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "runtime/prefix_cache/tap_planner.h"
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
@@ -191,10 +192,39 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
+    // Hybrid content-addressed admission: take the deepest device-resident snapshot on the matched
+    // block path. Falls through to the legacy owner/checkpoint logic when the index has no usable
+    // hit, so the cache is purely additive to the existing reuse paths.
+    const auto admit_block_snapshot = [&]() -> bool {
+        if (prefix_index == nullptr || prompt.block_hashes.empty()) {
+            return false;
+        }
+        const ninfer::prefix_cache::PrefixMatch match =
+            prefix_index->match(prompt.token_ids, prompt.block_hashes, prompt.block_extras);
+        if (match.best_device == ninfer::prefix_cache::kInvalidSnapshot) { return false; }
+        const ninfer::prefix_cache::Snapshot* snap = prefix_index->snapshot(match.best_device);
+        const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
+        if (snap == nullptr || snap->frontier == 0 || snap->frontier > n - 1 ||
+            !snap->device_resident()) {
+            return false;
+        }
+        plan->reuse             = ReusePath::BlockSnapshot;
+        plan->reuse_base        = snap->frontier;
+        plan->reuse_reason      = PrefixReuseReason::ReusedBlockSnapshot;
+        plan->block_snapshot    = match.best_device;
+        plan->block_path        = match.path;
+        plan->block_path_blocks = static_cast<std::uint32_t>(match.matched_blocks);
+        return true;
+    };
+
     if (!base.allow_prefix_reuse) {
         plan->reuse_reason = PrefixReuseReason::ReuseDisabled;
     } else if (!prompt.identity.reusable) {
         plan->reuse_reason = PrefixReuseReason::PromptNotReusable;
+    } else if (admit_block_snapshot()) {
+        // Hybrid block-snapshot reuse selected by the helper; plan fields are already populated.
+        // Content-addressed reuse does not depend on a retained owner sequence, so it is tried
+        // before the legacy owner checks.
     } else if (!sequence.retained) {
         plan->reuse_reason = PrefixReuseReason::NoRetainedSequence;
     } else {
@@ -240,7 +270,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const bool checkpoint_ready = is_rewrite_checkpoint_restore(plan->reuse) &&
                                       decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
                                       sequence.mtp_kv_valid >= plan->reuse_base - 1;
-        if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
+        if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready &&
+            plan->reuse != ReusePath::BlockSnapshot) {
             if (plan->reuse == ReusePath::AppendAtFrontier && !sequence.tail_hidden_valid) {
                 plan->reuse_reason = PrefixReuseReason::MtpTailHiddenInvalid;
             } else if (decoder->mtp_cache() == nullptr) {
@@ -294,11 +325,33 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
                                     ? MtpBridgeMode::BeforeSuffix
                                     : MtpBridgeMode::AfterExactHit;
-        } else if (is_rewrite_checkpoint_restore(plan->reuse)) {
+        } else if (is_rewrite_checkpoint_restore(plan->reuse) ||
+                   plan->reuse == ReusePath::BlockSnapshot) {
             plan->prepare_mtp = true;
             plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
                                     ? MtpBridgeMode::BeforeSuffix
                                     : MtpBridgeMode::AfterExactHit;
+        }
+    }
+
+    // Hybrid prefix cache: plan the tap positions to capture during this request's prefill.
+    // The planner produces the prompt tail + geometric ladder, which is sufficient for the
+    // OpenCode repro (the geometric ladder covers edits at various depths, and the prompt tail
+    // covers the full-length case).
+    if (prefix_index != nullptr && !prompt.block_hashes.empty()) {
+        ninfer::prefix_cache::TapHint hints;
+        ninfer::prefix_cache::TapPlanOptions options;
+        options.prompt_tokens  = plan->summary.prompt_tokens;
+        options.base_frontier  = plan->reuse_base;
+        options.ladder_tokens  = prefix_ladder_tokens;
+        options.min_gap_tokens = prefix_min_gap;
+        options.max_new_taps   = prefix_max_new_taps;
+        const std::vector<ninfer::prefix_cache::PlannedTap> taps =
+            ninfer::prefix_cache::plan_taps(options, hints);
+        plan->prefix_taps.clear();
+        plan->prefix_taps.reserve(taps.size());
+        for (const auto& tap : taps) {
+            plan->prefix_taps.push_back(tap.position);
         }
     }
 

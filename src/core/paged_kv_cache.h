@@ -112,8 +112,21 @@ public:
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     [[nodiscard]] std::uint32_t free_pages() const noexcept;
+    [[nodiscard]] std::uint32_t cached_pages() const noexcept;
     [[nodiscard]] bool can_reserve(std::uint32_t page_entitlement) const noexcept;
     [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement);
+
+    // Cache-owned physical pages. They are removed from the free list and counted against pool
+    // capacity but are not owned by any sequence allocation; callers hand the raw page ids to the
+    // prefix cache and return them here when the cache releases the block.
+    [[nodiscard]] std::vector<std::int32_t> acquire_cache_pages(std::uint32_t count);
+    void release_cache_pages(std::span<const std::int32_t> page_ids) noexcept;
+
+    // Transfers already-mapped pages from an allocation to the prefix cache in place: the page ids
+    // stay published and keep their contents, but the pool now counts them as cache-owned rather
+    // than sequence-mapped. The owning allocation must stop returning them (see
+    // PagedKVAllocation::promote_owned_pages).
+    void promote_to_cache(std::span<const std::int32_t> page_ids);
 
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
@@ -139,6 +152,7 @@ private:
     std::vector<bool> row_in_use_;
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;
+    std::uint32_t cached_pages_   = 0;
 };
 
 class PagedKVAllocation {
@@ -154,10 +168,23 @@ public:
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] std::uint32_t page_entitlement() const noexcept;
     [[nodiscard]] std::uint32_t mapped_page_count() const noexcept;
+    [[nodiscard]] std::uint32_t owned_page_count() const noexcept;
+    [[nodiscard]] std::uint32_t borrowed_page_count() const noexcept;
     [[nodiscard]] std::uint32_t mapped_token_capacity() const noexcept;
     [[nodiscard]] std::int32_t bound_row() const noexcept;
     [[nodiscard]] std::span<const std::int32_t> page_ids() const noexcept;
     [[nodiscard]] bool belongs_to(const PagedKVPool& pool) const noexcept;
+
+    // Prepends cache-owned physical pages borrowed from the prefix cache, before any page of this
+    // allocation is materialized. Borrowed pages are counted in mapped_page_count() and published
+    // in the block table, but the allocation never returns them to the pool and page_entitlement()
+    // continues to bound only owned pages.
+    void borrow_prefix(std::span<const std::int32_t> page_ids);
+
+    // Promotes the first `count` owned pages into the prefix cache in place and folds them into the
+    // borrowed prefix, so release()/trim() never return them. The pages must already be mapped and
+    // are expected to form the complete leading blocks handed to the cache.
+    void promote_owned_pages(std::uint32_t count);
 
     void set_page_entitlement(std::uint32_t pages);
     void cancel_unmapped_entitlement() noexcept;
@@ -184,6 +211,7 @@ private:
     PagedKVPool* pool_ = nullptr;
     std::vector<std::int32_t> page_ids_;
     std::uint32_t page_entitlement_ = 0;
+    std::uint32_t borrowed_pages_   = 0;
     std::int32_t bound_row_         = -1;
 };
 

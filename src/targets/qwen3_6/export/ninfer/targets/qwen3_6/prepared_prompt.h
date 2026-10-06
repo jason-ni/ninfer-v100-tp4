@@ -103,6 +103,11 @@ struct PreparedPromptData {
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
     bool starts_in_reasoning = false;
+    // Content-addressed prefix-cache keys: one chained lookup hash per complete 64-token block of
+    // token_ids, plus the matching per-block media key (0 without Vision). Empty when the prompt has
+    // fewer than one full block. Computed by the frontend; the engine never re-derives them.
+    std::vector<std::uint64_t> block_hashes;
+    std::vector<std::uint64_t> block_extras;
     PrepareStats prepare;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;

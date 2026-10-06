@@ -3172,8 +3172,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const std::array<Tensor, 
         if (logits == nullptr || draft_token == nullptr) {
             throw std::invalid_argument("MTP logits and draft_token outputs are required");
         }
-        for (const Tensor& destination : *logits) {
-            require_tensor_shape(destination, DType::BF16, {kCfg.vocab, 1}, "MTP logits");
+        for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
+            require_tensor_shape((*logits)[r], DType::BF16, {kCfg.vocab, 1}, "MTP logits");
         }
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP draft token");
     }

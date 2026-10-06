@@ -92,6 +92,16 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
     return builder.add_tensor(dtype, shape, kArenaAlign, label);
 }
 
+// Number of cached prefix state-image slots the hybrid prefix cache reserves alongside the lanes.
+// Zero disables the cache and reproduces the pre-hybrid layout byte-for-byte.
+std::uint32_t prefix_cache_snapshot_slots(const SequencePlanImpl& plan) {
+    if (!plan.prefix_cache.enabled) {
+        return 0;
+    }
+    return plan.prefix_cache.snapshot_slots != 0 ? plan.prefix_cache.snapshot_slots
+                                                 : plan.max_concurrency + 1U;
+}
+
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // ONE device's persistent state. At tp > 1 this device owns 1/tp of the attention KV heads,
     // 1/tp of the GDN value heads and 1/tp of the GDN conv channels -- the exact split the per-GPU
@@ -102,8 +112,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if (tp != 1 && tp != 2 && tp != 4) {
         throw std::invalid_argument("sequence plan tp must be 1, 2, or 4");
     }
-    const std::int32_t linear_state_slots =
-        LinearStateSlots::state_slot_count(plan.max_concurrency);
+    const std::int32_t linear_state_slots = LinearStateSlots::state_slot_count(
+        plan.max_concurrency, prefix_cache_snapshot_slots(plan));
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
@@ -238,6 +248,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.rewrite_checkpoint_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "rewrite checkpoint hidden");
+    const std::uint32_t prefix_slots = prefix_cache_snapshot_slots(plan);
+    if (prefix_slots != 0) {
+        out.prefix_snapshot_hidden = add_tensor(
+            builder, DType::BF16,
+            {TextConfig::hidden, static_cast<std::int32_t>(prefix_slots)},
+            "prefix snapshot hidden");
+    }
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
@@ -725,6 +742,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
+    impl->prefix_cache        = inputs.prefix_cache;
     impl->rope_mode           = inputs.rope_mode;
     impl->yarn_factor         = inputs.yarn_factor;
     impl->yarn_origin         = inputs.yarn_origin;
@@ -830,6 +848,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
+        .prefix_cache   = options.prefix_cache,
         .rope_mode      = options.rope_mode,
         .yarn_factor    = options.yarn_factor,
         .yarn_origin    = options.yarn_origin,

@@ -8,6 +8,7 @@
 #include <iostream>
 #include <new>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -263,6 +264,96 @@ int main() {
     failures += expect_size(bundle[0].page_entitlement(), 2, "failed resize main entitlement");
     failures += expect_size(bundle[1].mapped_page_count(), 2, "failed resize backend mapping");
     failures += expect_size(bundle[1].page_entitlement(), 2, "failed resize backend entitlement");
+
+    auto cache_plan = plan_paged_cache(6, 6, 1, {{ninfer::DType::BF16, 16, 1}});
+    ninfer::DeviceArena cache_arena(cache_plan.bytes);
+    ninfer::PagedKVPool cache_pool({cache_arena.base(), cache_arena.capacity()}, cache_plan.layout);
+
+    std::vector<std::int32_t> cached = cache_pool.acquire_cache_pages(2);
+    failures += expect_page_ids(cached, {0, 1}, "cache-owned pages");
+    failures += expect_size(cache_pool.cached_pages(), 2, "cached page count");
+    failures += expect_size(cache_pool.free_pages(), 4, "free pages after cache ownership");
+    if (cache_pool.can_reserve(5) || !cache_pool.can_reserve(4)) {
+        ++failures;
+        std::cerr << "Cache-owned pages were not subtracted from reservable capacity\n";
+    }
+
+    auto borrowed = cache_pool.reserve(2);
+    borrowed.borrow_prefix(cached);
+    borrowed.materialize_pages(4);
+    failures += expect_size(borrowed.borrowed_page_count(), 2, "borrowed prefix pages");
+    failures += expect_size(borrowed.owned_page_count(), 2, "owned suffix pages");
+    failures += expect_size(borrowed.mapped_page_count(), 4, "borrowed mapped pages");
+    failures += expect_page_ids(borrowed.page_ids(), {0, 1, 2, 3}, "borrowed page order");
+    borrowed.bind_row(0);
+    failures += expect_device_page_ids(borrowed.block_table(), {0, 1, 2, 3}, "borrowed block table");
+
+    bool trim_rejected = false;
+    try {
+        borrowed.trim_pages(1);
+    } catch (const std::invalid_argument&) {
+        trim_rejected = true;
+    }
+    if (!trim_rejected) {
+        ++failures;
+        std::cerr << "Trimming into the borrowed prefix was not rejected\n";
+    }
+    borrowed.trim_pages(2);
+    failures += expect_page_ids(borrowed.page_ids(), {0, 1}, "trim keeps borrowed prefix");
+    borrowed.unbind_row();
+    borrowed.release();
+    failures +=
+        expect_size(cache_pool.free_pages(), 4, "borrowed pages were not returned to the pool");
+    failures += expect_size(cache_pool.cached_pages(), 2, "borrowed release dropped cache pages");
+
+    cache_pool.release_cache_pages(cached);
+    failures += expect_size(cache_pool.cached_pages(), 0, "cache release count");
+    failures += expect_size(cache_pool.free_pages(), 6, "cache release restored free pages");
+
+    cached    = cache_pool.acquire_cache_pages(2);
+    auto share_a = cache_pool.reserve(1);
+    auto share_b = cache_pool.reserve(1);
+    share_a.borrow_prefix(cached);
+    share_b.borrow_prefix(cached);
+    share_a.materialize_pages(3);
+    share_b.materialize_pages(3);
+    failures += expect_page_ids(share_a.page_ids(), {0, 1, 2}, "shared borrower A");
+    failures += expect_page_ids(share_b.page_ids(), {0, 1, 3}, "shared borrower B");
+    share_a.release();
+    failures += expect_size(cache_pool.free_pages(), 3, "shared borrower A release");
+    failures += expect_size(cache_pool.cached_pages(), 2, "shared borrower A kept cache pages");
+
+    share_b.unbind_row();
+    share_b.release();
+    failures += expect_size(cache_pool.free_pages(), 4, "shared borrower B release");
+
+    auto promoter = cache_pool.reserve(3);
+    promoter.borrow_prefix(cached);
+    promoter.materialize_pages(4);
+    failures += expect_page_ids(promoter.page_ids(), {0, 1, 2, 3}, "promoter page order");
+    bool promote_rejected = false;
+    try {
+        promoter.promote_owned_pages(3);
+    } catch (const std::invalid_argument&) {
+        promote_rejected = true;
+    }
+    if (!promote_rejected) {
+        ++failures;
+        std::cerr << "Promoting more pages than owned was not rejected\n";
+    }
+    promoter.promote_owned_pages(2);
+    failures += expect_size(promoter.borrowed_page_count(), 4, "promoted pages joined the prefix");
+    failures += expect_size(promoter.owned_page_count(), 0, "promotion left no owned pages");
+    failures += expect_size(cache_pool.cached_pages(), 4, "promotion counted cache pages");
+    promoter.unbind_row();
+    promoter.release();
+    failures +=
+        expect_size(cache_pool.free_pages(), 2, "promoted pages were not returned to the pool");
+    failures += expect_size(cache_pool.cached_pages(), 4, "promoted pages stayed cache-owned");
+    const std::int32_t all_promoted[] = {0, 1, 2, 3};
+    cache_pool.release_cache_pages(all_promoted);
+    failures += expect_size(cache_pool.cached_pages(), 0, "promoted cache release");
+    failures += expect_size(cache_pool.free_pages(), 6, "promoted cache release restored free pages");
 
     return failures == 0 ? 0 : fail("kv cache test failed");
 }

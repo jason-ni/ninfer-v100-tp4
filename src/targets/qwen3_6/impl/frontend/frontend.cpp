@@ -9,6 +9,7 @@
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 #include "text/unicode.h"
+#include "runtime/prefix_cache/prefix_index.h"
 
 #include <nlohmann/json.hpp>
 
@@ -964,6 +965,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
+    result.block_hashes = ninfer::prefix_cache::chain_block_hashes(result.token_ids);
+    result.block_extras.assign(result.block_hashes.size(), 0);
     result.identity.reusable   = true;
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
@@ -1037,6 +1040,8 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
     assign_text_positions(result);
+    result.block_hashes = ninfer::prefix_cache::chain_block_hashes(result.token_ids);
+    result.block_extras.assign(result.block_hashes.size(), 0);
     result.identity.reusable = allow_prefix_identity;
     result.prepare.seconds   = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));

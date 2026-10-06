@@ -44,6 +44,7 @@ struct PersistentLayout {
     TensorLayout sampling_config;
     TensorLayout tail_hidden;
     TensorLayout rewrite_checkpoint_hidden;
+    TensorLayout prefix_snapshot_hidden;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
 };
@@ -70,6 +71,7 @@ struct SequencePlanningInputs {
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
+    PrefixCacheOptions prefix_cache;
     // Rotary regime. Nothing in the persistent or workspace layout depends on these:
     // the YaRN table is a 32-float per-device buffer the Program owns outside the planned arenas,
     // so a native plan is byte-identical to the pre-YaRN one. They are carried here only so the
@@ -106,6 +108,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
+    PrefixCacheOptions prefix_cache;
     // See SequencePlanningInputs: rope regime carried through the plan, layout-neutral.
     RopeMode rope_mode                  = RopeMode::Native;
     double yarn_factor                  = 0.0;

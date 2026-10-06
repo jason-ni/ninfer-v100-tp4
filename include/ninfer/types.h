@@ -82,6 +82,23 @@ struct SpeculativeOptions {
     ProposalHead proposal_head = ProposalHead::Full;
 };
 
+// Content-addressed prefix-cache configuration. The cache stores reusable sequence states along
+// the prompt's block path so any request sharing a prefix can resume from the deepest surviving
+// boundary, independent of which session created it. This is device-only in the current milestone;
+// when `enabled` is false the engine uses only the legacy owner/checkpoint reuse paths.
+struct PrefixCacheOptions {
+    bool enabled                 = false;
+    // Extra per-lane state-image slots reserved for cache snapshots. Zero derives
+    // `max_concurrency + 1` at startup.
+    std::uint32_t snapshot_slots = 0;
+    // Cap on new snapshots captured per request. Zero derives `2` without a host tier.
+    std::uint32_t max_new_taps   = 0;
+    // Geometric ladder spacing in tokens. Zero derives `max(4096, 2 * prefill_chunk)`.
+    std::uint32_t ladder_tokens  = 0;
+    // Minimum token gap between ladder taps. Zero derives `max(1024, prefill_chunk)`.
+    std::uint32_t min_gap        = 0;
+};
+
 struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
@@ -115,6 +132,7 @@ struct EngineOptions {
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    PrefixCacheOptions prefix_cache;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
     // Zero selects a bounded worker count from the detected host concurrency.
@@ -424,6 +442,7 @@ enum class PrefixReusePath : std::uint8_t {
     AppendAtFrontier,
     RestoreTurnCheckpoint,
     RestoreResponseCheckpoint,
+    BlockSnapshot,
 };
 
 // Diagnostic explanation of `PrefixReusePath`. A successful reuse reports which continuation state
@@ -434,6 +453,7 @@ enum class PrefixReuseReason : std::uint8_t {
     ReusedFrontier,
     ReusedTurnCheckpoint,
     ReusedResponseCheckpoint,
+    ReusedBlockSnapshot,
     ReuseDisabled,
     PromptNotReusable,
     NoRetainedSequence,

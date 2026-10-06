@@ -20,6 +20,23 @@
 #include <utility>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+
+// Evicted prefix-cache pages return to every rank's text-KV pool; snapshot slots are statically
+// partitioned from the linear-attention pool, so releasing one is bookkeeping only.
+struct ProgramImplCore::PrefixCacheSink final : ninfer::prefix_cache::PrefixPageSink {
+    explicit PrefixCacheSink(ProgramImplCore& core) noexcept : core_(core) {}
+    void release_block_pages(const ninfer::prefix_cache::PoolPages& pages) noexcept override {
+        core_.release_cached_pages(pages);
+    }
+    void release_tail_pages(const ninfer::prefix_cache::PoolPages& pages) noexcept override {
+        core_.release_cached_pages(pages);
+    }
+    void release_snapshot_slot(ninfer::prefix_cache::SlotId) noexcept override {}
+
+private:
+    ProgramImplCore& core_;
+};
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -379,6 +396,9 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
     sampling_config                 = plan.persistent.sampling_config.bind(backing);
     tail_hidden_store               = plan.persistent.tail_hidden.bind(backing);
     rewrite_checkpoint_hidden_store = plan.persistent.rewrite_checkpoint_hidden.bind(backing);
+    if (plan.prefix_cache.enabled) {
+        prefix_snapshot_hidden_store = plan.persistent.prefix_snapshot_hidden.bind(backing);
+    }
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         SequenceState& sequence = sequences[lane];
         sequence.lane           = lane;
@@ -504,6 +524,34 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+    if (plan.prefix_cache.enabled) {
+        prefix_snapshot_slots = plan.prefix_cache.snapshot_slots != 0
+                                    ? plan.prefix_cache.snapshot_slots
+                                    : max_concurrency + 1U;
+        prefix_sink  = std::make_unique<PrefixCacheSink>(*this);
+        prefix_index = std::make_unique<ninfer::prefix_cache::PrefixIndex>(
+            ninfer::prefix_cache::PrefixIndexOptions{.device_snapshot_slots = prefix_snapshot_slots},
+            prefix_sink.get());
+        prefix_max_new_taps =
+            plan.prefix_cache.max_new_taps != 0 ? plan.prefix_cache.max_new_taps : 2U;
+        prefix_ladder_tokens = plan.prefix_cache.ladder_tokens != 0
+                                   ? plan.prefix_cache.ladder_tokens
+                                   : std::max(4096U, 2U * plan.prefill_chunk);
+        prefix_min_gap = plan.prefix_cache.min_gap != 0 ? plan.prefix_cache.min_gap
+                                                        : std::max(1024U, plan.prefill_chunk);
+    }
+}
+
+void ProgramImplCore::release_cached_pages(const ninfer::prefix_cache::PoolPages& pages) noexcept {
+    const std::int32_t text_page = pages.page[0];
+    if (text_page < 0) {
+        return;
+    }
+    const std::int32_t ids[1] = {text_page};
+    decoder->text_kv.pool().release_cache_pages(ids);
+    for (int rank = 1; rank < tp; ++rank) {
+        peer[static_cast<std::size_t>(rank)]->decoder->text_kv.pool().release_cache_pages(ids);
+    }
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
@@ -630,6 +678,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
     if (request_plan.reuse != ReusePath::FullReset &&
+        request_plan.reuse != ReusePath::BlockSnapshot &&
         (!sequence.retained ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           request_plan.reuse_base))) {
@@ -760,8 +809,122 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             }
             if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
             sequence.ledger.resize(base);
+        } else if (request_plan.reuse == ReusePath::BlockSnapshot) {
+            if (prefix_index == nullptr || !sequence.kv) {
+                throw std::logic_error("hybrid block snapshot has no KV allocation bundle");
+            }
+            const ninfer::prefix_cache::Snapshot* snap =
+                prefix_index->snapshot(request_plan.block_snapshot);
+            if (snap == nullptr || snap->frontier != base || !snap->device_resident()) {
+                throw std::logic_error("planned block snapshot is unavailable");
+            }
+            // Drop any state inherited from a previous owner on this lane; hybrid reuse is
+            // content-addressed and does not depend on a retained sequence.
+            sequence.kv.reset();
+            ordered_reset(sequence);
+            sequence.ledger.clear();
+            sequence.text_kv_valid = 0;
+            sequence.mtp_kv_valid  = 0;
+
+            std::vector<std::int32_t> text_pages;
+            std::vector<std::int32_t> backend_pages;
+            // Only borrow the pages up to the snapshot frontier, not the full block path.
+            const std::uint32_t frontier_pages = (base + 63) / 64;
+            for (std::size_t i = 1; i < request_plan.block_path.size() && (i - 1) < frontier_pages; ++i) {
+                const ninfer::prefix_cache::BlockNode* node =
+                    prefix_index->node(request_plan.block_path[i]);
+                if (node == nullptr ||
+                    node->device_state != ninfer::prefix_cache::Residency::Resident) {
+                    throw std::logic_error("planned block path is not resident");
+                }
+                if (node->device_pages.page[0] >= 0) {
+                    text_pages.push_back(node->device_pages.page[0]);
+                }
+                if (node->device_pages.page[1] >= 0) {
+                    backend_pages.push_back(node->device_pages.page[1]);
+                }
+            }
+            const auto owned_text    = static_cast<std::uint32_t>(text_pages.size());
+            const auto owned_backend = static_cast<std::uint32_t>(backend_pages.size());
+            const std::uint32_t text_entitlement =
+                request_plan.text_kv_page_entitlement > owned_text
+                    ? request_plan.text_kv_page_entitlement - owned_text
+                    : 1U;
+            const std::uint32_t backend_entitlement =
+                backend_kv_cache() == nullptr
+                    ? 0U
+                    : (request_plan.backend_kv_page_entitlement > owned_backend
+                           ? request_plan.backend_kv_page_entitlement - owned_backend
+                           : 1U);
+            reserve_sequence_kv(sequence, text_entitlement, backend_entitlement);
+            if (!text_pages.empty()) {
+                sequence.kv->text.borrow_prefix(text_pages);
+                if (sequence.kv->backend && !backend_pages.empty()) {
+                    sequence.kv->backend->borrow_prefix(backend_pages);
+                }
+                for (int rank = 1; rank < tp; ++rank) {
+                    const auto slot = static_cast<std::size_t>(rank);
+                    if (sequence.kv->text_peer[slot]) {
+                        sequence.kv->text_peer[slot]->borrow_prefix(text_pages);
+                    }
+                    if (sequence.kv->backend_peer[slot] && !backend_pages.empty()) {
+                        sequence.kv->backend_peer[slot]->borrow_prefix(backend_pages);
+                    }
+                }
+            }
+            for (ninfer::prefix_cache::NodeId id : request_plan.block_path) {
+                prefix_index->pin_node(id);
+            }
+            prefix_index->pin_snapshot(request_plan.block_snapshot);
+            sequence.prefix_pinned_nodes = request_plan.block_path;
+            sequence.prefix_snapshot     = request_plan.block_snapshot;
+            sequence.prefix_borrowed     = true;
+            sequence.text_kv_valid       = base;
+            if (speculative_backend == SpeculativeBackend::Mtp) {
+                sequence.mtp_kv_valid = base == 0 ? 0 : base - 1;
+            }
+            const std::int32_t snapshot_slot = LinearStateSlots::snapshot_state_slot(
+                static_cast<std::uint32_t>(snap->device_slot), max_concurrency,
+                prefix_snapshot_slots);
+            decoder->linear_attention.copy_slot(
+                snapshot_slot, LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                device.stream);
+            for (int rank = 1; rank < tp; ++rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                const ScopedDevice scope(peer[slot]->device.device);
+                peer[slot]->decoder->linear_attention.copy_slot(
+                    snapshot_slot,
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                    peer[slot]->device.stream);
+            }
+            sequence.ledger.resize(base);
         } else {
             throw std::logic_error("request plan has an invalid prefix reuse path");
+        }
+
+        // Hybrid prefix cache: initialize the capture state from the plan.
+        if (prefix_index != nullptr && !request_plan.prefix_taps.empty()) {
+            sequence.prefix_tap_positions = request_plan.prefix_taps;
+            sequence.prefix_tap_slots.reserve(request_plan.prefix_taps.size());
+            for (std::uint32_t position : request_plan.prefix_taps) {
+                (void)position;
+                const ninfer::prefix_cache::SlotId slot = prefix_index->reserve_snapshot_slot(0);
+                if (slot == ninfer::prefix_cache::kInvalidSlot) { break; }
+                sequence.prefix_tap_slots.push_back(slot);
+            }
+            sequence.prefix_tap_positions.resize(sequence.prefix_tap_slots.size());
+            sequence.prefix_tap_next     = 0;
+            sequence.prefix_taps_planned = true;
+            sequence.prefix_capture      = true;
+            sequence.prefix_matched_blocks = request_plan.block_path_blocks;
+            sequence.prefix_pinned_nodes = request_plan.block_path;
+            if (sequence.prefix_pinned_nodes.empty()) {
+                sequence.prefix_pinned_nodes.push_back(prefix_index->root());
+            }
+            sequence.prefix_parent = sequence.prefix_pinned_nodes.back();
+            sequence.prefix_prompt_tokens = prompt.token_ids;
+            sequence.prefix_block_hashes  = prompt.block_hashes;
+            sequence.prefix_block_extras  = prompt.block_extras;
         }
 
         trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
@@ -1116,6 +1279,32 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
+    if (prefix_index != nullptr) {
+        for (ninfer::prefix_cache::SlotId slot : sequence.prefix_tap_slots) {
+            if (slot != ninfer::prefix_cache::kInvalidSlot) {
+                prefix_index->release_reserved_slot(slot);
+            }
+        }
+        if (sequence.prefix_snapshot != ninfer::prefix_cache::kInvalidSnapshot) {
+            prefix_index->unpin_snapshot(sequence.prefix_snapshot);
+        }
+        for (ninfer::prefix_cache::NodeId id : sequence.prefix_pinned_nodes) {
+            prefix_index->unpin_node(id);
+        }
+    }
+    sequence.prefix_pinned_nodes.clear();
+    sequence.prefix_tap_positions.clear();
+    sequence.prefix_tap_slots.clear();
+    sequence.prefix_tap_next      = 0;
+    sequence.prefix_taps_planned  = false;
+    sequence.prefix_capture       = false;
+    sequence.prefix_matched_blocks = 0;
+    sequence.prefix_parent         = ninfer::prefix_cache::kInvalidNode;
+    sequence.prefix_prompt_tokens.clear();
+    sequence.prefix_block_hashes.clear();
+    sequence.prefix_block_extras.clear();
+    sequence.prefix_snapshot = ninfer::prefix_cache::kInvalidSnapshot;
+    sequence.prefix_borrowed = false;
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
     sequence.execution_frontier = 0;
@@ -2412,6 +2601,84 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
+            }
+
+            // Hybrid prefix cache: commit newly completed blocks and capture tap snapshots at
+            // chunk boundaries. Runs for both cold and reused prefills so the cache grows as
+            // conversations progress.
+            if (prefix_index != nullptr && sequence.prefix_capture) {
+                const std::uint32_t cursor = staged.cursor;
+                const std::uint32_t completed = cursor / ninfer::prefix_cache::kBlockTokens;
+                // Promote the newly committed pages into the cache before handing them over.
+                const std::uint32_t already_committed =
+                    sequence.prefix_pinned_nodes.size() - 1;
+                if (completed > already_committed && sequence.kv) {
+                    const std::uint32_t new_blocks = completed - already_committed;
+                    sequence.kv->text.promote_owned_pages(new_blocks);
+                    if (sequence.kv->backend) {
+                        sequence.kv->backend->promote_owned_pages(new_blocks);
+                    }
+                }
+                // Commit newly completed blocks.
+                while (sequence.prefix_pinned_nodes.size() - 1 < completed) {
+                    const std::uint32_t b = sequence.prefix_pinned_nodes.size() - 1; // 0-indexed block number.
+                    const std::uint32_t parent = sequence.prefix_pinned_nodes[b];    // node for block (b-1), or root if b=0.
+                    const std::int32_t text_page = sequence.kv->text.page_ids()[b];
+                    const std::int32_t backend_page =
+                        sequence.kv->backend ? sequence.kv->backend->page_ids()[b] : -1;
+                    const std::span<TokenId> block_tokens =
+                        std::span<TokenId>(sequence.prefix_prompt_tokens).subspan(b * 64, 64);
+                    const ninfer::prefix_cache::PoolPages pages{
+                        .page = {text_page, backend_page}};
+                    bool adopted = false;
+                    const ninfer::prefix_cache::NodeId node = prefix_index->commit_block(
+                        ninfer::prefix_cache::BlockCommit{
+                            .parent      = parent,
+                            .lookup_hash = sequence.prefix_block_hashes[b],
+                            .extra       = sequence.prefix_block_extras[b],
+                            .tokens      = block_tokens,
+                            .pages       = pages},
+                        adopted);
+                    if (node != ninfer::prefix_cache::kInvalidNode) {
+                        sequence.prefix_pinned_nodes.push_back(node);
+                        prefix_index->pin_node(node);
+                    } else {
+                        break; // avoid an infinite loop if the commit is rejected
+                    }
+                }
+                // Capture tap snapshots at chunk boundaries.
+                while (sequence.prefix_tap_next < sequence.prefix_tap_slots.size() &&
+                       sequence.prefix_tap_positions[sequence.prefix_tap_next] <= cursor) {
+                    const std::uint32_t position = sequence.prefix_tap_positions[sequence.prefix_tap_next];
+                    const ninfer::prefix_cache::SlotId slot =
+                        sequence.prefix_tap_slots[sequence.prefix_tap_next];
+                    const std::int32_t state_slot = LinearStateSlots::snapshot_state_slot(
+                        static_cast<std::uint32_t>(slot), max_concurrency, prefix_snapshot_slots);
+                    decoder->linear_attention.copy_slot(
+                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                        state_slot, device.stream);
+                    for (int rank = 1; rank < tp; ++rank) {
+                        const auto peer_slot = static_cast<std::size_t>(rank);
+                        const ScopedDevice scope(peer[peer_slot]->device.device);
+                        peer[peer_slot]->decoder->linear_attention.copy_slot(
+                            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                            state_slot, peer[peer_slot]->device.stream);
+                    }
+                    // anchor for snapshot at cursor (block-aligned) = last full block below cursor =
+                    // block (completed-1). anchor node = prefix_pinned_nodes[completed].
+                    const ninfer::prefix_cache::NodeId anchor =
+                        sequence.prefix_pinned_nodes[completed];
+                    // Snap the frontier to the last full block boundary so tail_len=0 for a tap snapshot.
+                    const std::uint32_t frontier = completed * ninfer::prefix_cache::kBlockTokens;
+                    const auto snap_id = prefix_index->add_snapshot(ninfer::prefix_cache::SnapshotRequest{
+                        .anchor        = anchor,
+                        .frontier      = frontier,
+                        .kind          = ninfer::prefix_cache::SnapshotKind::Tap,
+                        .priority      = 0,
+                        .reserved_slot = slot});
+                    (void)position;
+                    sequence.prefix_tap_next++;
+                }
             }
 
             if (!result.finalized) {

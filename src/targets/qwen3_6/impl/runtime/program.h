@@ -13,6 +13,7 @@
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "runtime/prefix_cache/prefix_index.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -88,6 +89,14 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+
+    // Hybrid block-snapshot admission (see PrefixCacheOptions). `block_snapshot` is the chosen
+    // resident snapshot, `block_path` the matched block-tree path (index 0 is the root), and
+    // `prefix_taps` the chunk-aligned positions to capture during this request's prefill.
+    ninfer::prefix_cache::SnapshotId block_snapshot = ninfer::prefix_cache::kInvalidSnapshot;
+    std::vector<ninfer::prefix_cache::NodeId> block_path;
+    std::uint32_t block_path_blocks = 0;
+    std::vector<std::uint32_t> prefix_taps;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -183,6 +192,23 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     RewriteCheckpoint rewrite_checkpoint;
+
+    // Hybrid content-addressed prefix cache. Nodes/pages borrowed for this lane's life, plus the
+    // tap state images captured into the reserved snapshot slots at chunk boundaries.
+    std::vector<ninfer::prefix_cache::NodeId> prefix_pinned_nodes;
+    std::vector<std::uint32_t> prefix_tap_positions;
+    std::vector<ninfer::prefix_cache::SlotId> prefix_tap_slots;
+    std::uint32_t prefix_tap_next = 0;
+    bool prefix_taps_planned      = false;
+    bool prefix_capture           = false;
+    std::uint32_t prefix_matched_blocks = 0;
+    ninfer::prefix_cache::NodeId prefix_parent = ninfer::prefix_cache::kInvalidNode;
+    std::vector<TokenId> prefix_prompt_tokens;
+    std::vector<std::uint64_t> prefix_block_hashes;
+    std::vector<std::uint64_t> prefix_block_extras;
+    ninfer::prefix_cache::SnapshotId prefix_snapshot =
+        ninfer::prefix_cache::kInvalidSnapshot;
+    bool prefix_borrowed = false;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -210,6 +236,7 @@ struct RequestControl {
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
         PrefixReuseReason reuse_reason   = PrefixReuseReason::None;
         PrefixDivergence reuse_divergence;
+        std::vector<std::uint32_t> prefix_taps;
     };
 
     std::optional<Prefill> prefill;
@@ -358,6 +385,21 @@ public:
 
     PinnedHostBuffer round_host;
     TokenId* host_tokens = nullptr;
+
+    // Hybrid prefix cache (opt-in via SequencePlanImpl::prefix_cache). `prefix_index` owns the
+    // content-addressed block tree over this Program's committed text-KV pages and the cached
+    // prefix state-image slots. `prefix_sink` returns evicted pages to every rank's pool. Both are
+    // null unless the cache is enabled, so the default path is byte-identical to the legacy one.
+    struct PrefixCacheSink;
+    std::unique_ptr<PrefixCacheSink> prefix_sink;
+    std::unique_ptr<ninfer::prefix_cache::PrefixIndex> prefix_index;
+    std::uint32_t prefix_snapshot_slots = 0;
+    std::uint32_t prefix_max_new_taps   = 0;
+    std::uint32_t prefix_ladder_tokens  = 0;
+    std::uint32_t prefix_min_gap        = 0;
+    // Continuation hidden captured with each tap state image; column `slot` matches the
+    // LinearStateSlots snapshot slot. Empty unless the cache is enabled.
+    Tensor prefix_snapshot_hidden_store;
     // Debug-only capture of the round's full-vocabulary logits, raw BF16 bits. OFF by default and
     // completely inert until enable_logits_capture(true) allocates the host buffer: with it off,
     // copy_round_logits() is a predictable branch and nothing is allocated or copied, so no
@@ -433,6 +475,8 @@ public:
     }
 
 private:
+    // Returns cache-owned pages to every rank's text-KV pool (page ids are identical across ranks).
+    void release_cached_pages(const ninfer::prefix_cache::PoolPages& pages) noexcept;
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();

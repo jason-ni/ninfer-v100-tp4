@@ -113,6 +113,8 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
         return "restore_turn_checkpoint";
     case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
         return "restore_response_checkpoint";
+    case ninfer::PrefixReusePath::BlockSnapshot:
+        return "block_snapshot";
     }
     return "unknown";
 }
@@ -127,6 +129,8 @@ const char* prefix_reuse_reason_name(ninfer::PrefixReuseReason reason) {
         return "reused_turn_checkpoint";
     case ninfer::PrefixReuseReason::ReusedResponseCheckpoint:
         return "reused_response_checkpoint";
+    case ninfer::PrefixReuseReason::ReusedBlockSnapshot:
+        return "reused_block_snapshot";
     case ninfer::PrefixReuseReason::ReuseDisabled:
         return "reuse_disabled";
     case ninfer::PrefixReuseReason::PromptNotReusable:
