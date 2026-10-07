@@ -131,6 +131,8 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
          added(4, "nk>\n\nanswer"), added(5, "```rust\n</think>\nlet x = 1;\n```\n"),
          added(6, "<eos>", true), added(7, "<0.0 seconds>"),
          added(8, "</think>\n\nfinal answer"),
+         added(33, "nk>\n<tool_call>\n<function=f>\n</function>\n</tool_call>"),
+         added(34, "nk><tool_call>\n<function=f>\n</function>\n</tool_call>"),
          added(30, "user\n"), added(31, "assistant\n"), added(32, "\n"),
          added(248045, "<|im_start|>", true), added(248046, "<|im_end|>", true),
          added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
@@ -1129,6 +1131,40 @@ int test_code_block_think_tag_routing(const Frontend& frontend) {
     return failures;
 }
 
+// A tool call is the one answer the model does not separate from the close with a blank line, so
+// `</think>` followed by a single newline (or none) and `<tool_call>` is still the structural
+// close. Before this the blank-line rule left the entire tool call on the Reasoning channel, so
+// the client saw the call as thought and received no tool_calls.
+// Token set: 33 = close + one newline + tool call, 34 = close + tool call.
+int test_tool_call_think_close_routing(const Frontend& frontend) {
+    int failures = 0;
+    for (const ninfer::TokenId close_token : {33, 34}) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.add_generation_prompt = true;
+        input.options.enable_thinking       = true;
+        auto prompt                         = frontend.prepare(std::move(input));
+        auto session                        = frontend.make_output_session(prompt, {});
+        const std::array<ninfer::TokenId, 2> tokens{3, close_token};
+        const auto decision = session.preview(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                              ninfer::FinishReason::OutputLimit);
+        failures += check(decision.accepted_tokens == tokens.size(),
+                          "tool-call think-close sequence did not accept");
+        const auto output = session.commit_preview();
+        failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
+                          "a tool call after the close leaked into the reasoning channel");
+        failures += check(
+            channel_text(output, ninfer::OutputChannel::Content) ==
+                "<tool_call>\n<function=f>\n</function>\n</tool_call>",
+            "a tool call after the close was not published on the content channel");
+    }
+    return failures;
+}
+
 int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto prompt             = frontend.prepare_tokens({0});
     auto session            = frontend.make_output_session(prompt, {});
@@ -1475,6 +1511,7 @@ int main() {
     failures += test_reasoning_split(frontend);
     failures += test_quoted_think_tag_routing(frontend);
     failures += test_code_block_think_tag_routing(frontend);
+    failures += test_tool_call_think_close_routing(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_invalid_utf8_is_replaced(frontend);
     failures += test_media_cache_reuses_immutable_payload();

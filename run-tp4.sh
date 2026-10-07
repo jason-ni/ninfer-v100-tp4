@@ -20,13 +20,29 @@ export NINFER_V100X2_SERVE_MAX_CONTEXT=${NINFER_V100X2_SERVE_MAX_CONTEXT:-262144
 export NINFER_V100X2_SERVE_MAX_CONCURRENCY=${NINFER_V100X2_SERVE_MAX_CONCURRENCY:-4}
 # Round-trip the model's reasoning in assistant history so prefix reuse resumes at the exact
 # generated frontier (append_frontier) instead of the conservative turn-closure checkpoint.
-export NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS=${NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS:-'{"preserve_thinking": true, "reasoning_effort":"low"}'}
+export NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS=${NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS:-'{"preserve_thinking": true, "reasoning_effort":"medium"}'}
 
 # Enable the hybrid prefix cache with the pinned host tier (M2): KV blocks and snapshot images that
 # no longer fit on device are demoted to pinned host RAM instead of dropped, so an evicted
 # conversation can still be restored without recomputing. Each snapshot slab is ~147 MiB, so the
 # pool is sized to hold several conversations' taps; override with NINFER_V100X2_SERVE_HOST_CACHE_MIB.
 host_cache_mib=${NINFER_V100X2_SERVE_HOST_CACHE_MIB:-28192}
+
+# Vision needs the native-FP16 Vision build: the sharded binder binds the tower matrices as FP16 and
+# rejects the original quantized-Vision artifact at load. When --vision is requested, default the
+# artifact to the FP16-vision file so the caller does not have to set NINFER_V100X2_SERVE_ARTIFACT
+# by hand. An explicit NINFER_V100X2_SERVE_ARTIFACT still wins; override the default with
+# NINFER_V100X2_SERVE_VISION_ARTIFACT.
+vision_requested=0
+for arg in "$@"; do
+    if [[ "${arg}" == "--vision" ]]; then
+        vision_requested=1
+    fi
+done
+if [[ "${vision_requested}" -eq 1 && -z "${NINFER_V100X2_SERVE_ARTIFACT:-}" ]]; then
+    vision_artifact_default=/media/zt/models/orcarouter/conv_fp16vision/qwen3_8_27b_nvfp4.ninfer
+    export NINFER_V100X2_SERVE_ARTIFACT="${NINFER_V100X2_SERVE_VISION_ARTIFACT:-${vision_artifact_default}}"
+fi
 
 exec "$(dirname -- "${BASH_SOURCE[0]}")/tools/v100/ninfer-v100x2-serve.sh" \
     --prefix-cache --host-cache-mib "${host_cache_mib}" "$@"

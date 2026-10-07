@@ -14,8 +14,8 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHeadDim = 72;
-constexpr std::int32_t kHeads   = 16;
+constexpr std::int32_t kHeadDim   = 72;
+constexpr std::int32_t kFullHeads = 16; // total heads; a TP rank runs kFullHeads / tp of them
 
 std::int32_t scratch_tiles(std::int32_t patches, std::int32_t segments) {
     if (segments == 1) { return 0; }
@@ -49,18 +49,19 @@ struct VisionFlashWorkspace {
 // launches, so there is no mask, and the kernel clamps its last KV iteration to
 // ne11, so the key extent is not padded either.
 template <class Allocator>
-VisionFlashWorkspace allocate_vision_flash_workspace(Allocator& allocator, std::int32_t patches) {
+VisionFlashWorkspace allocate_vision_flash_workspace(Allocator& allocator, std::int32_t patches,
+                                                     std::int32_t heads) {
     constexpr std::int32_t d       = detail::kVisionFlashPaddedHeadDim;
     const std::int32_t staged_rows = detail::vision_attention_volta_flash_staged_rows(patches);
 
     return {
-        allocator.alloc(DType::FP32, {d, kHeads, staged_rows}),
-        allocator.alloc(DType::FP16, {d, kHeads, patches}),
-        allocator.alloc(DType::FP16, {d, kHeads, patches}),
-        allocator.alloc(DType::FP32, {d, kHeads, staged_rows}),
+        allocator.alloc(DType::FP32, {d, heads, staged_rows}),
+        allocator.alloc(DType::FP16, {d, heads, patches}),
+        allocator.alloc(DType::FP16, {d, heads, patches}),
+        allocator.alloc(DType::FP32, {d, heads, staged_rows}),
         allocator.alloc(DType::FP32,
                         {2, static_cast<std::int32_t>(
-                                detail::vision_attention_volta_flash_meta_elements(patches))}),
+                                detail::vision_attention_volta_flash_meta_elements(patches, heads))}),
     };
 }
 
@@ -101,14 +102,14 @@ std::vector<std::int32_t> uniform_segment_bounds(std::int32_t patches,
 }
 #endif // NINFER_VOLTA_BUILD
 
-void require_qkv(const Tensor& tensor, std::int32_t patches, const char* name) {
-    if (tensor.dtype != DType::BF16 || tensor.ne[0] != kHeadDim || tensor.ne[1] != kHeads ||
+void require_qkv(const Tensor& tensor, std::int32_t patches, std::int32_t heads, const char* name) {
+    if (tensor.dtype != DType::BF16 || tensor.ne[0] != kHeadDim || tensor.ne[1] != heads ||
         tensor.ne[2] != patches || tensor.ne[3] != 1) {
         throw std::invalid_argument(std::string("vision_attention: invalid ") + name + " shape");
     }
     constexpr std::int64_t elem = 2;
     if (tensor.nb[0] != elem || tensor.nb[1] != elem * kHeadDim ||
-        tensor.nb[2] < elem * kHeadDim * kHeads || (tensor.nb[2] % elem) != 0) {
+        tensor.nb[2] < elem * kHeadDim * heads || (tensor.nb[2] % elem) != 0) {
         throw std::invalid_argument(std::string("vision_attention: invalid ") + name + " strides");
     }
     if (tensor.data == nullptr) {
@@ -122,7 +123,8 @@ void require_qkv(const Tensor& tensor, std::int32_t patches, const char* name) {
 std::size_t vision_attention_workspace_capacity_bytes(std::int32_t min_patches,
                                                       std::int32_t max_patches,
                                                       std::int32_t min_segments,
-                                                      std::int32_t max_segments) {
+                                                      std::int32_t max_segments,
+                                                      std::int32_t heads) {
     if (min_patches <= 0 || max_patches < min_patches || min_segments <= 0 ||
         max_segments < min_segments || min_segments > max_patches) {
         throw std::invalid_argument("vision_attention workspace: invalid execution envelope");
@@ -133,10 +135,12 @@ std::size_t vision_attention_workspace_capacity_bytes(std::int32_t min_patches,
     // The Volta route replaces the descriptor path outright rather than adding to
     // it, so the query must mirror that exactly: no tile descriptors, staging
     // only. Reporting both would over-declare and break the high-water contract
-    // the caller checks.
+    // the caller checks. The FP32/FP16 staging is linear in the head count, so a
+    // head-sharded rank (heads = kFullHeads / tp) reserves proportionally less.
     (void)segments;
-    (void)allocate_vision_flash_workspace(layout, max_patches);
+    (void)allocate_vision_flash_workspace(layout, max_patches, heads);
 #else
+    (void)heads;
     (void)allocate_workspace(layout, max_patches, segments);
 #endif // NINFER_VOLTA_BUILD
     return layout.peak_bytes(1);
@@ -146,11 +150,16 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const T
                       WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     const std::int32_t patches  = q.ne[2];
     const std::int32_t segments = cu_seqlens.ne[0] - 1;
+    const std::int32_t heads    = q.ne[1];
     if (patches <= 0) { throw std::invalid_argument("vision_attention: P must be positive"); }
-    require_qkv(q, patches, "q");
-    require_qkv(k, patches, "k");
-    require_qkv(v, patches, "v");
-    require_qkv(out, patches, "out");
+    if (heads <= 0 || kFullHeads % heads != 0) {
+        throw std::invalid_argument(
+            "vision_attention: head count must divide the full head count (16)");
+    }
+    require_qkv(q, patches, heads, "q");
+    require_qkv(k, patches, heads, "k");
+    require_qkv(v, patches, heads, "v");
+    require_qkv(out, patches, heads, "out");
     if (!out.is_contiguous()) {
         throw std::invalid_argument("vision_attention: out must be contiguous");
     }
@@ -163,7 +172,7 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const T
 #ifdef NINFER_VOLTA_BUILD
     // The Ampere+ kernel is ldmatrix/mma-based and traps below sm_80, so this is
     // the only vision attention path on Volta rather than a faster alternative.
-    VisionFlashWorkspace staging = allocate_vision_flash_workspace(workspace, patches);
+    VisionFlashWorkspace staging = allocate_vision_flash_workspace(workspace, patches, heads);
     const std::vector<std::int32_t> bounds =
         host_segment_bounds(cu_seqlens, segments, patches, stream);
     detail::vision_attention_volta_flash_launch(q, k, v, bounds.data(), segments, staging.q_f32,
@@ -180,11 +189,16 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                       std::int32_t segment_length, WorkspaceArena& workspace, Tensor& out,
                       cudaStream_t stream) {
     const std::int32_t patches = q.ne[2];
+    const std::int32_t heads   = q.ne[1];
     if (patches <= 0) { throw std::invalid_argument("vision_attention: P must be positive"); }
-    require_qkv(q, patches, "q");
-    require_qkv(k, patches, "k");
-    require_qkv(v, patches, "v");
-    require_qkv(out, patches, "out");
+    if (heads <= 0 || kFullHeads % heads != 0) {
+        throw std::invalid_argument(
+            "vision_attention: head count must divide the full head count (16)");
+    }
+    require_qkv(q, patches, heads, "q");
+    require_qkv(k, patches, heads, "k");
+    require_qkv(v, patches, heads, "v");
+    require_qkv(out, patches, heads, "out");
     if (!out.is_contiguous()) {
         throw std::invalid_argument("vision_attention: out must be contiguous");
     }
@@ -193,7 +207,7 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
 #ifdef NINFER_VOLTA_BUILD
     auto scratch_scope           = workspace.scope();
-    VisionFlashWorkspace staging = allocate_vision_flash_workspace(workspace, patches);
+    VisionFlashWorkspace staging = allocate_vision_flash_workspace(workspace, patches, heads);
     const std::vector<std::int32_t> bounds = uniform_segment_bounds(patches, segment_length);
     detail::vision_attention_volta_flash_launch(q, k, v, bounds.data(),
                                                 patches / segment_length, staging.q_f32,

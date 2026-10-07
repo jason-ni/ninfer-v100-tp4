@@ -16,7 +16,7 @@ import torch
 
 from tools.convert.common.safetensors import ShardReader
 
-from .inventory import FP32, TensorSpec, VISION_LAYERS
+from .inventory import FP16, FP32, TensorSpec, VISION_LAYERS
 
 
 SOURCE_DTYPE = "BF16"
@@ -202,15 +202,32 @@ def expression_sources(expression: Expression) -> tuple[SourceTensor, ...]:
 
 
 def build_vision_recipes(text_width: int) -> tuple[TensorRecipe, ...]:
-    """Build checkpoint-invariant Vision recipes for a target text width."""
+    """Build checkpoint-invariant Vision recipes for a target text width.
 
+    Vision linear matrices are stored as native FP16 (a cast from the BF16
+    source); biases, norms, and the position embedding stay BF16.
+    """
+
+    vision_matrices = frozenset(
+        (
+            "attention/qkv",
+            "attention/output",
+            "mlp/fc1",
+            "mlp/fc2",
+            "fc1",
+            "fc2",
+        )
+    )
     source_prefix = "model.visual."
     recipes: list[TensorRecipe] = [
         TensorRecipe(
             "vision/patch_embedding",
-            Reshape(
-                source(source_prefix + "patch_embed.proj.weight", (1152, 3, 2, 16, 16)),
-                (1152, 1536),
+            Cast(
+                Reshape(
+                    source(source_prefix + "patch_embed.proj.weight", (1152, 3, 2, 16, 16)),
+                    (1152, 1536),
+                ),
+                FP16,
             ),
         ),
         TensorRecipe(
@@ -240,27 +257,23 @@ def build_vision_recipes(text_width: int) -> tuple[TensorRecipe, ...]:
             ("norm2/weight", "norm2.weight", (1152,)),
             ("norm2/bias", "norm2.bias", (1152,)),
         ):
-            recipes.append(
-                TensorRecipe(
-                    object_layer + object_suffix,
-                    source(source_layer + source_suffix, shape),
-                )
-            )
+            expression: Expression = source(source_layer + source_suffix, shape)
+            if object_suffix in vision_matrices:
+                expression = Cast(expression, FP16)
+            recipes.append(TensorRecipe(object_layer + object_suffix, expression))
 
     for object_suffix, source_suffix, shape in (
-        ("fc1", "linear_fc1.weight", (4608, 4608)),
-        ("fc1_bias", "linear_fc1.bias", (4608,)),
-        ("fc2", "linear_fc2.weight", (text_width, 4608)),
-        ("fc2_bias", "linear_fc2.bias", (text_width,)),
-        ("norm/weight", "norm.weight", (1152,)),
-        ("norm/bias", "norm.bias", (1152,)),
+        ("fc1", "merger.linear_fc1.weight", (4608, 4608)),
+        ("fc1_bias", "merger.linear_fc1.bias", (4608,)),
+        ("fc2", "merger.linear_fc2.weight", (text_width, 4608)),
+        ("fc2_bias", "merger.linear_fc2.bias", (text_width,)),
+        ("norm/weight", "merger.norm.weight", (1152,)),
+        ("norm/bias", "merger.norm.bias", (1152,)),
     ):
-        recipes.append(
-            TensorRecipe(
-                "vision/merger/" + object_suffix,
-                source(source_prefix + "merger." + source_suffix, shape),
-            )
-        )
+        expression = source(source_prefix + source_suffix, shape)
+        if object_suffix in vision_matrices:
+            expression = Cast(expression, FP16)
+        recipes.append(TensorRecipe("vision/merger/" + object_suffix, expression))
     return tuple(recipes)
 
 
@@ -364,9 +377,11 @@ def materialize_expression(
 
     if isinstance(expression, Cast):
         tensor = materialize_expression(expression.source, reader, derived_tensors)
-        if expression.dtype != FP32:
-            raise ValueError(f"unsupported direct cast target {expression.dtype}")
-        return tensor.to(torch.float32)
+        if expression.dtype == FP32:
+            return tensor.to(torch.float32)
+        if expression.dtype == FP16:
+            return tensor.to(torch.float16)
+        raise ValueError(f"unsupported direct cast target {expression.dtype}")
 
     if isinstance(expression, DraftHeadTokenIds):
         if derived_tensors is None or "text/draft_head_token_ids" not in derived_tensors:

@@ -269,17 +269,18 @@ def preflight_inventory() -> None:
         raise ValueError(f"target inventory is incomplete: {counts}")
     if inventory.FORMAT_COUNTS != {
         inventory.BF16: 487,
+        inventory.FP16: 111,
         inventory.FP32: 60,
         inventory.I32: 1,
-        inventory.Q4: 95,
-        inventory.Q5: 91,
-        inventory.Q6: 5,
-        inventory.W8: 195,
+        inventory.Q4: 41,
+        inventory.Q5: 37,
+        inventory.Q6: 4,
+        inventory.W8: 193,
     }:
         raise ValueError(f"target format counts drifted: {inventory.FORMAT_COUNTS}")
     if inventory.LAYOUT_COUNTS != {
-        inventory.CONTIGUOUS_LAYOUT: 548,
-        inventory.ROW_SPLIT_LAYOUT: 386,
+        inventory.CONTIGUOUS_LAYOUT: 659,
+        inventory.ROW_SPLIT_LAYOUT: 275,
     }:
         raise ValueError(f"target layout counts drifted: {inventory.LAYOUT_COUNTS}")
     if family_conversion.tensor_payload_bytes(inventory.TENSOR_SPECS) != EXPECTED_TENSOR_BYTES:

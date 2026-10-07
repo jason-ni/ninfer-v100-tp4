@@ -14,6 +14,7 @@ namespace {
 StorageLayout storage_layout_for(NumericFormat format) {
     switch (format) {
     case NumericFormat::BF16:
+    case NumericFormat::FP16:
     case NumericFormat::FP32:
     case NumericFormat::I32:
         return StorageLayout::ContiguousLeV1;
@@ -36,6 +37,8 @@ QType qtype_for(NumericFormat format) {
     switch (format) {
     case NumericFormat::BF16:
         return QType::BF16_CTRL;
+    case NumericFormat::FP16:
+        return QType::FP16_CTRL;
     case NumericFormat::FP32:
         return QType::FP32_CTRL;
     case NumericFormat::I32:
@@ -62,6 +65,8 @@ DType dtype_for(NumericFormat format) {
     switch (format) {
     case NumericFormat::BF16:
         return DType::BF16;
+    case NumericFormat::FP16:
+        return DType::FP16;
     case NumericFormat::FP32:
         return DType::FP32;
     case NumericFormat::I32:

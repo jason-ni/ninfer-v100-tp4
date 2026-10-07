@@ -27,8 +27,8 @@ constexpr ReductionCriterion kVisionAttentionBf16Criterion{
     .gross_relative_to_max_reference = 2.8e-3,
 };
 
-std::size_t index_of(int token, int head, int d) {
-    return (static_cast<std::size_t>(token) * kHeads + static_cast<std::size_t>(head)) * kDim +
+std::size_t index_of(int token, int head, int d, int heads) {
+    return (static_cast<std::size_t>(token) * heads + static_cast<std::size_t>(head)) * kDim +
            static_cast<std::size_t>(d);
 }
 
@@ -40,7 +40,7 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
 
 void vision_attention_oracle(const std::vector<float>& q, const std::vector<float>& k,
                              const std::vector<float>& v, const std::vector<int>& cu_seqlens,
-                             std::vector<double>& out) {
+                             int heads, std::vector<double>& out) {
     constexpr double scale = 1.0 / std::sqrt(72.0);
     out.assign(q.size(), 0.0);
 
@@ -49,13 +49,13 @@ void vision_attention_oracle(const std::vector<float>& q, const std::vector<floa
         const int end   = cu_seqlens[segment + 1];
         std::vector<double> scores(static_cast<std::size_t>(end - begin));
         for (int query = begin; query < end; ++query) {
-            for (int head = 0; head < kHeads; ++head) {
+            for (int head = 0; head < heads; ++head) {
                 double max_score = -std::numeric_limits<double>::infinity();
                 for (int key = begin; key < end; ++key) {
                     double dot = 0.0;
                     for (int d = 0; d < kDim; ++d) {
-                        dot += static_cast<double>(q[index_of(query, head, d)]) *
-                               static_cast<double>(k[index_of(key, head, d)]);
+                        dot += static_cast<double>(q[index_of(query, head, d, heads)]) *
+                               static_cast<double>(k[index_of(key, head, d, heads)]);
                     }
                     const double score                            = dot * scale;
                     scores[static_cast<std::size_t>(key - begin)] = score;
@@ -71,9 +71,9 @@ void vision_attention_oracle(const std::vector<float>& q, const std::vector<floa
                     double numerator = 0.0;
                     for (int key = begin; key < end; ++key) {
                         numerator += scores[static_cast<std::size_t>(key - begin)] *
-                                     static_cast<double>(v[index_of(key, head, d)]);
+                                     static_cast<double>(v[index_of(key, head, d, heads)]);
                     }
-                    out[index_of(query, head, d)] = numerator / denominator;
+                    out[index_of(query, head, d, heads)] = numerator / denominator;
                 }
             }
         }
@@ -110,9 +110,9 @@ const char* entry_name(PublicEntry entry) {
 }
 
 int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProfile storage_profile,
-             PublicEntry entry, InputProfile input_profile = InputProfile::Random) {
+             PublicEntry entry, int heads, InputProfile input_profile = InputProfile::Random) {
     const int patches             = cu_seqlens.back();
-    const std::size_t token_plane = static_cast<std::size_t>(kHeads) * kDim;
+    const std::size_t token_plane = static_cast<std::size_t>(heads) * kDim;
     const std::size_t value_count = static_cast<std::size_t>(patches) * token_plane;
     std::vector<float> q(value_count);
     std::vector<float> k(value_count);
@@ -136,7 +136,7 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     round_to_bf16(v);
 
     std::vector<double> reference;
-    vision_attention_oracle(q, k, v, cu_seqlens, reference);
+    vision_attention_oracle(q, k, v, cu_seqlens, heads, reference);
 
     const auto q_expected = bf16_bits(q);
     const auto k_expected = bf16_bits(k);
@@ -155,9 +155,9 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
         q_storage = to_device(q_expected);
         k_storage = to_device(k_expected);
         v_storage = to_device(v_expected);
-        q_tensor  = Tensor(q_storage.p, DType::BF16, {kDim, kHeads, patches});
-        k_tensor  = Tensor(k_storage.p, DType::BF16, {kDim, kHeads, patches});
-        v_tensor  = Tensor(v_storage.p, DType::BF16, {kDim, kHeads, patches});
+        q_tensor  = Tensor(q_storage.p, DType::BF16, {kDim, heads, patches});
+        k_tensor  = Tensor(k_storage.p, DType::BF16, {kDim, heads, patches});
+        v_tensor  = Tensor(v_storage.p, DType::BF16, {kDim, heads, patches});
     } else {
         interleaved_expected.resize(value_count * 3);
         for (int token = 0; token < patches; ++token) {
@@ -171,7 +171,7 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
                         interleaved_expected.data() + target + token_plane * 2);
         }
         interleaved_storage = to_device(interleaved_expected);
-        q_tensor            = Tensor(interleaved_storage.p, DType::BF16, {kDim, kHeads, patches});
+        q_tensor            = Tensor(interleaved_storage.p, DType::BF16, {kDim, heads, patches});
         q_tensor.nb[2]      = static_cast<std::int64_t>(token_plane * 3 * sizeof(std::uint16_t));
         k_tensor            = q_tensor;
         v_tensor            = q_tensor;
@@ -185,11 +185,11 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     Tensor cu_tensor(d_cu_seqlens.p, DType::I32, {static_cast<std::int32_t>(cu_seqlens.size())});
     GuardedDeviceBuffer d_out(value_count * sizeof(std::uint16_t));
     d_out.fill(0x7f);
-    Tensor out_tensor(d_out.data(), DType::BF16, {kDim, kHeads, patches});
+    Tensor out_tensor(d_out.data(), DType::BF16, {kDim, heads, patches});
 
     const std::int32_t segments = static_cast<std::int32_t>(cu_seqlens.size()) - 1;
     const std::size_t workspace_bytes =
-        ops::vision_attention_workspace_capacity_bytes(patches, patches, segments, segments);
+        ops::vision_attention_workspace_capacity_bytes(patches, patches, segments, segments, heads);
     DeviceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     if (entry == PublicEntry::CuSeqlensArena) {
@@ -249,26 +249,55 @@ int main() {
     }
 
     int failures = 0;
-    if (ops::vision_attention_workspace_capacity_bytes(4, 194, 1, 1) != 0 ||
-        ops::vision_attention_workspace_capacity_bytes(4, 194, 1, 3) !=
-            ops::vision_attention_workspace_capacity_bytes(194, 194, 3, 3)) {
+    // Route-independent invariant: a rectangular envelope resolves to its maximal legal pair's
+    // capacity. (The descriptor route additionally reserves nothing for a single segment, but the
+    // Volta flash route always stages q/k/v, so that route-specific fact is not asserted here.)
+    if (ops::vision_attention_workspace_capacity_bytes(4, 194, 1, 3, kHeads) !=
+        ops::vision_attention_workspace_capacity_bytes(194, 194, 3, 3, kHeads)) {
         std::cerr << "vision_attention rectangular capacity missed its maximal legal pair\n";
         ++failures;
     }
     try {
-        (void)ops::vision_attention_workspace_capacity_bytes(1, 2, 3, 4);
+        (void)ops::vision_attention_workspace_capacity_bytes(1, 2, 3, 4, kHeads);
         std::cerr << "vision_attention accepted an envelope without a legal segment pair\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
-    failures += run_case({0, 4}, 1u, StorageProfile::Contiguous, PublicEntry::CuSeqlensArena);
+    // Full head count (tp == 1) -- the pre-existing behaviour.
+    failures += run_case({0, 4}, 1u, StorageProfile::Contiguous, PublicEntry::CuSeqlensArena, kHeads);
     failures += run_case({0, 4, 11}, 7u, StorageProfile::InterleavedQkv,
-                         PublicEntry::CuSeqlensArena, InputProfile::SegmentIsolation);
+                         PublicEntry::CuSeqlensArena, kHeads, InputProfile::SegmentIsolation);
     failures += run_case({0, 64, 129, 194}, 31u, StorageProfile::InterleavedQkv,
-                         PublicEntry::CuSeqlensArena);
+                         PublicEntry::CuSeqlensArena, kHeads);
     failures +=
-        run_case({0, 68, 136}, 101u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
+        run_case({0, 68, 136}, 101u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments, kHeads);
     failures +=
-        run_case({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
+        run_case({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena, kHeads);
+    // Head-sharded (option C): a TP rank runs only its local heads. tp=2 -> 8 heads, tp=4 -> 4
+    // heads. Each must reproduce the per-head oracle for exactly those heads, and a head count that
+    // does not divide 16 must be rejected.
+    failures += run_case({0, 64, 129, 194}, 31u, StorageProfile::InterleavedQkv,
+                         PublicEntry::CuSeqlensArena, kHeads / 2);
+    failures += run_case({0, 68, 136}, 101u, StorageProfile::InterleavedQkv,
+                         PublicEntry::UniformSegments, kHeads / 4);
+    {
+        bool rejected = false;
+        try {
+            // heads=6 does not divide the full 16: build a minimal q and expect a throw.
+            DeviceBuffer qbuf = to_device(std::vector<std::uint16_t>(kDim * 6 * 4, 0x3c00));
+            Tensor bad(qbuf.p, DType::BF16, {kDim, 6, 4});
+            GuardedDeviceBuffer obuf(static_cast<std::size_t>(kDim) * 6 * 4 * sizeof(std::uint16_t));
+            Tensor bout(obuf.data(), DType::BF16, {kDim, 6, 4});
+            DeviceArena ws(256);
+            std::vector<int> cu = {0, 4};
+            DeviceBuffer cbuf = to_device_i32(cu);
+            Tensor ct(cbuf.p, DType::I32, {2});
+            ops::vision_attention(bad, bad, bad, ct, ws, bout, nullptr);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) {
+            std::cerr << "vision_attention accepted a head count that does not divide 16\n";
+            ++failures;
+        }
+    }
 
     if (failures != 0) {
         std::cerr << "vision_attention failures=" << failures << '\n';

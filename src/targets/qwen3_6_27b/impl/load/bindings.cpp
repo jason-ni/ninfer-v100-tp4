@@ -559,6 +559,22 @@ void append_vocab_rows(ShardPlan& plan, std::uint64_t rows, int tp, std::string_
     append_column_block(plan, 0, rows, tp, rows, object, /*check_nvfp4_tile_alignment=*/false);
 }
 
+// Appends one Shard per device for a split of `total` into `tp` contiguous parts, each a multiple
+// of 8, distributing the remainder in whole 8-units. The FP16 GEMM requires its contraction to be
+// a multiple of 8 (select_fp16_launch), so a row-parallel K split and its matching column-parallel
+// N split (vision fc1/fc2, merger fc1/fc2) both use this to stay kernel-aligned at every supported
+// tp. The per-device extent is `qwen3_6::vision_mod8_shard_count`, the SAME helper the per-device
+// materialization uses, so the two can never disagree. See docs/maintainer/fp16-vision-plan.md §5.4.
+void append_mod8_split(ShardPlan& plan, std::uint64_t total, int tp, std::string_view object) {
+    require(total % 8 == 0, object, "mod-8 split total must be a multiple of 8");
+    std::uint64_t offset = 0;
+    for (int device = 0; device < tp; ++device) {
+        const std::uint64_t count = qwen3_6::vision_mod8_shard_count(total, tp, device);
+        plan.push_back(Shard{device, offset, count});
+        offset += count;
+    }
+}
+
 // The family dispatch behind both `plan_for` and `shard_mapping_for`, so the axis and the shard
 // boundaries can never disagree about a family. `tp >= 2` here; the tp<1 / tp==1 contract lives in
 // the two public entry points.
@@ -605,6 +621,69 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
     // split Qwen path; keeping the draft payload replicated avoids inventing a second shard
     // geometry for its selector/codebooks and costs less than one Q4 target layer per rank.
     if (object.find("dflash/") != std::string_view::npos) { return {}; }
+
+    // Vision tower (option C; docs/maintainer/fp16-vision-plan.md §5). The residual stream stays
+    // full-width on every rank: patch_embedding is replicated so the first op produces a full x,
+    // and the only collective is allreduce_sum (the row-parallel joins below). Geometry comes from
+    // VisionBackboneConfig. Scoped to vision/ names so the text suffix rules below are untouched --
+    // this block must run BEFORE them, because e.g. "vision/layers/0/attention/output" would
+    // otherwise match the text o_proj rule and be split by the wrong width.
+    if (object.starts_with("vision/")) {
+        using V = qwen3_6::VisionBackboneConfig;
+        // qkv: column-parallel by head -- three q|k|v planes, each split by its 16-head count so
+        // every rank gets (16/tp) whole heads per plane. Contraction K=hidden is unchanged, so no
+        // mod-8 constraint on the N split (it is bounds-checked in the kernel).
+        if (ends("attention/qkv")) {
+            for (std::uint64_t plane = 0; plane < 3; ++plane) {
+                append_column_block(plan, plane * V::hidden, V::hidden, tp, V::heads, object, false);
+            }
+            return by_rows(std::move(plan));
+        }
+        // qkv_bias: the column-parallel N bias, split exactly like the qkv weight (three q|k|v
+        // planes by head) so each rank's bias width equals its sharded qkv output width.
+        if (ends("attention/qkv_bias")) {
+            for (std::uint64_t plane = 0; plane < 3; ++plane) {
+                append_column_block(plan, plane * V::hidden, V::hidden, tp, V::heads, object, false);
+            }
+            return by_rows(std::move(plan));
+        }
+        // o_proj: row-parallel over the hidden-wide attention output. Even at every supported tp.
+        if (ends("attention/output")) {
+            append_mod8_split(plan, V::hidden, tp, object);
+            return by_columns(std::move(plan));
+        }
+        // MLP: fc1 column-parallel (N split) and fc2 row-parallel (K split) share the SAME mod-8
+        // per-device extent so fc2's contraction width equals fc1's output width on every rank.
+        if (ends("mlp/fc1")) {
+            append_mod8_split(plan, V::intermediate, tp, object);
+            return by_rows(std::move(plan));
+        }
+        // fc1_bias: column-parallel N bias, split exactly like the fc1 weight (mod-8 intermediate).
+        if (ends("mlp/fc1_bias")) {
+            append_mod8_split(plan, V::intermediate, tp, object);
+            return by_rows(std::move(plan));
+        }
+        if (ends("mlp/fc2")) {
+            append_mod8_split(plan, V::intermediate, tp, object);
+            return by_columns(std::move(plan));
+        }
+        // Merger: fc1 column-parallel (N=merger_hidden), fc2 row-parallel (K=merger_hidden); even.
+        if (ends("merger/fc1")) {
+            append_mod8_split(plan, V::merger_hidden, tp, object);
+            return by_rows(std::move(plan));
+        }
+        if (ends("merger/fc1_bias")) {
+            append_mod8_split(plan, V::merger_hidden, tp, object);
+            return by_rows(std::move(plan));
+        }
+        if (ends("merger/fc2")) {
+            append_mod8_split(plan, V::merger_hidden, tp, object);
+            return by_columns(std::move(plan));
+        }
+        // Everything else under vision/ is elementwise (row-parallel output biases, norms,
+        // patch_embedding, position embedding) and stays replicated: a full copy on every rank.
+        return {};
+    }
 
     // GDN depthwise conv1d weight: channel-split, NOT replicated.
     //
@@ -898,11 +977,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                     std::to_string(tp));
     }
     if (tp > 1) {
-        if (features.vision) {
-            // The vision tower is out of scope for TP2 and has no shard map, so reject here
-            // rather than silently replicating a 4.6 GB backbone onto both devices.
-            throw std::invalid_argument("qwen3_6_27b: vision is not supported with tp > 1");
-        }
+        // The vision tower is sharded at tp > 1 too: its objects are resolved by the same
+        // `shard_placement` (see the vision/ block in `shard_mapping`), so no separate rejection.
         const TextConfig config{};
         binder.set_shard_resolver([config, tp, weights_profile](std::string_view name) {
             return shard_placement(name, tp, config, weights_profile);
@@ -1043,7 +1119,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
     out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
     out.vision_merger_fc2   = artifact::bind_tensor(
-        binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608}, vision_placement);
+        binder, "vision/merger/fc2", NumericFormat::FP16, {5120, 4608}, vision_placement);
     out.vision_merger_fc2_bias = artifact::bind_tensor(
         binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
     out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
@@ -1263,17 +1339,20 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
     }
 
     if (plan.features.vision) {
-        if (tp != 1) {
-            throw std::invalid_argument(
-                "qwen3_6_27b: Vision has no tensor-parallel forward path yet");
-        }
-        auto& vision  = runtime.vision.emplace();
+        // Per-rank vision shard. At tp == 1 this is the whole tower on device 0; at tp > 1 each
+        // rank's arena holds only its own rows/columns, with extents matching `shard_mapping`'s
+        // vision/ block (the shared `vision_mod8_shard_count` helper). The forward path that
+        // consumes these shards is the sharded encode (docs/maintainer/fp16-vision-plan.md §5.5).
+        auto& vision = runtime.vision.emplace();
         vision.common = qwen3_6::materialize_vision_common(
-            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
+            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm,
+            device, tp);
+        const std::int32_t merger_fc2_cols = static_cast<std::int32_t>(
+            qwen3_6::vision_mod8_shard_count(qwen3_6::VisionBackboneConfig::merger_hidden, tp, device));
         vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
-                                                               NumericFormat::W8G32_F16S, 5120, 4608);
+                                                                 NumericFormat::FP16, 5120, merger_fc2_cols, device);
         vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
-                                                               NumericFormat::BF16, {5120});
+                                                                NumericFormat::BF16, {5120}, device);
     }
 }
 

@@ -1,19 +1,20 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the nine persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the ten persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. Container framing, physical byte layouts, checkpoint
 assignment, kernels, and runtime-state codecs are defined separately.
 
 ## 1. Registered formats
 
-NInfer has exactly nine persistent numeric tensor formats in four categories.
+NInfer has exactly ten persistent numeric tensor formats in four categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
 | Canonical name | Category | Logical width | Logical meaning |
 |---|---|---:|---|
 | `BF16` | direct floating point | 16 | bfloat16 bit encoding |
+| `FP16` | direct floating point | 16 | IEEE-754 binary16 |
 | `FP32` | direct floating point | 32 | IEEE-754 binary32 |
 | `I32` | direct signed integer | 32 | 32-bit two's-complement integer |
 
@@ -48,7 +49,7 @@ The row-scaled floating-point weight format is:
 | `FP8_E4M3FN_ROW_BF16S` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
 
 This is a closed registry, not a template from which arbitrary scalar types, bit widths, and group
-sizes may be constructed. In particular, `FP16`, bare `FP8_E4M3FN`, `I64`, `Q4G32_F16S`,
+sizes may be constructed. In particular, bare `FP8_E4M3FN`, `I64`, `Q4G32_F16S`,
 `Q6G128_F16S`, and `W8G64_F16S` do not become valid merely because their components look familiar.
 The use of a floating-point type for a scale or code plane does not register that type as a direct
 tensor format.
@@ -163,7 +164,7 @@ exactly the same direct words or logical codes and scales. The currently registe
 `contiguous-le-v1` for direct words, `row-split-k128-v1` for grouped signed-integer formats, and
 `blockscale-k16-m128x4-v1` for `NVFP4`, and `row-scale-v1` for
 `FP8_E4M3FN_ROW_BF16S`. Their byte order, plane packing, padding, swizzle, divisor placement, and
-alignment rules belong to the layout registry, not to these nine numeric formats.
+alignment rules belong to the layout registry, not to these ten numeric formats.
 
 ### 2.7 Compute profile and kernel support
 
@@ -216,6 +217,27 @@ Whether a particular model tensor permits non-finite values is a checkpoint-reci
 a different BF16 format. A compute operation is not required to preserve a NaN payload unless its
 compute profile says so.
 
+#### FP16
+
+`FP16` is IEEE-754 binary16: one sign bit at bit 15, a 5-bit exponent at bits 14 through 10 with
+bias 15, and a 10-bit trailing fraction at bits 9 through 0.
+
+Its value classes are:
+
+- exponent zero and fraction zero: positive or negative zero according to the sign bit;
+- exponent zero and nonzero fraction: a subnormal value
+  `(-1)^sign * fraction * 2^-24`;
+- exponent 1 through 30: a normal value
+  `(-1)^sign * 2^(exponent-15) * (1 + fraction/2^10)`;
+- exponent 31 and fraction zero: positive or negative infinity;
+- exponent 31 and nonzero fraction: NaN, including its sign, quiet/signaling bit, and payload.
+
+All 65,536 logical FP16 words are valid at the format layer; signed zeros, infinities, and NaN
+payloads remain distinct persistent words, exactly as for BF16. The finite normal magnitude range is
+`[2^-14, 65504]`. `FP16` is a direct format in its own right and is not a second name for `BF16`: a
+BF16 source value narrowed to FP16 is exact only within FP16's exponent range, and the checkpoint
+recipe owns that conversion and its rounding (see the common rules below).
+
 #### FP32
 
 `FP32` is IEEE-754 binary32: one sign bit at bit 31, an 8-bit exponent at bits 30 through 23 with
@@ -253,7 +275,8 @@ Byte order is likewise a layout property and must never be inferred from host-na
 
 Persistence from the same source type is bitwise identity at the logical-word boundary. A conversion
 between different source and target types is not implicit. The checkpoint recipe must define it,
-including rounding for FP32-to-BF16 and range/integrality checks for any conversion to I32. A
+including rounding for FP32-to-BF16 and BF16-to-FP16, and range/integrality checks for any
+conversion to I32. A
 producer must not silently wrap, truncate, or saturate a value merely because the destination word
 has a fixed width.
 
@@ -711,7 +734,7 @@ meanings defined here.
 
 ## 9. Checkpoint and model boundary
 
-This registry does not say where any of the nine formats are used. A checkpoint numeric-format
+This registry does not say where any of the ten formats are used. A checkpoint numeric-format
 document must separately define, for every persisted source tensor or derived tensor:
 
 - its source checkpoint identity and source tensor or derivation;
@@ -737,7 +760,7 @@ current execution platform.
 
 The registry contains no implicit or reserved support for:
 
-- other direct scalar types, including `FP16`, `FP64`, signed widths other than `I32`, and unsigned
+- other direct scalar types, including `FP64`, signed widths other than `I32`, and unsigned
   integers;
 - other integer widths, including Q2 and Q3;
 - alternate group sizes for the four accepted code widths;
@@ -755,8 +778,9 @@ numeric or storage contracts, or no demonstrated need in a selected NInfer targe
 in llama.cpp, TensorRT-LLM, vLLM, a model release, or a hardware library is research evidence only;
 it does not create a NInfer registry entry, loader branch, conversion option, or kernel obligation.
 
-Binary16 remains the scale component denoted by `F16S`; that use does not imply a direct `FP16`
-format. Likewise, the internal execution dtype `FP8_E4M3FN` is not a persistent direct format. The
+Binary16 remains the scale component denoted by `F16S`; an `F16S` scale does not imply the tensor's
+own direct format is `FP16` (registered for direct use in Section 1, but independently of `F16S`).
+Likewise, the internal execution dtype `FP8_E4M3FN` is not a persistent direct format. The
 internal execution names `BF16_CTRL`, `FP32_CTRL`, and `I32_CTRL` are not persistent registry
 identities.
 

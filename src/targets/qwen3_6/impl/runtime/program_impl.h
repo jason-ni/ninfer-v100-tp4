@@ -1170,8 +1170,23 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
         if (staged.vision_plan) {
-            staged.vision = std::make_unique<schedule::VisionPrefillSession>(
-                device, model, work, staged.prompt, *staged.vision_plan, staged.transient);
+            if (tp > 1) {
+                // Drive the vision tower sharded across the same group as the text tower: every rank
+                // owns a private scratch arena and its sharded weights, and the row-parallel
+                // projections reduce over the shared collective.
+                schedule::VisionTpSetup vtp;
+                vtp.ec     = &execution;
+                vtp.events = &*collective_comms;
+                for (int r = 1; r < tp; ++r) {
+                    vtp.peer_models[static_cast<std::size_t>(r)] =
+                        &peer[static_cast<std::size_t>(r)]->model;
+                }
+                staged.vision = std::make_unique<schedule::VisionPrefillSession>(
+                    device, model, work, staged.prompt, *staged.vision_plan, staged.transient, &vtp);
+            } else {
+                staged.vision = std::make_unique<schedule::VisionPrefillSession>(
+                    device, model, work, staged.prompt, *staged.vision_plan, staged.transient);
+            }
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle      = Lifecycle::Prefilling;

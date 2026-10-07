@@ -50,7 +50,9 @@ namespace {
 
 constexpr int kVisionHeadDim = 72;  // real feature width
 constexpr int kPaddedHeadDim = 128; // what the kernel is instantiated for
-constexpr int kVisionHeads   = 16;
+// The head count is runtime: a TP rank runs only its local heads (kFullHeads / tp of the tower's
+// 16). Every staging offset, grid dimension, and the vendored kernel's ne03/ne13 below take it as
+// an argument rather than assuming the full 16.
 
 constexpr int kNcols2 = 1; // gqa_ratio == 1
 constexpr int kNcols1 = 32; // ncols1*ncols2 must be >= 32 on Volta
@@ -64,14 +66,15 @@ constexpr int kNcols  = kNcols1 * kNcols2;
 // for the query block starting at first_token. The kernel indexes Q as float2;
 // feature lanes 72..127 are written zero so they contribute nothing to any score.
 __global__ void vision_pad_q_kernel(const __nv_bfloat16* __restrict__ q, std::int64_t token_stride,
-                                    float* __restrict__ out, int first_token, int rows) {
+                                    float* __restrict__ out, int first_token, int rows,
+                                    int heads) {
     const int row  = blockIdx.x;
     const int head = blockIdx.y;
     const int d    = threadIdx.x;
     if (row >= rows) { return; }
 
     const std::int64_t dst =
-        static_cast<std::int64_t>(d) + kPaddedHeadDim * (head + static_cast<std::int64_t>(kVisionHeads) * row);
+        static_cast<std::int64_t>(d) + kPaddedHeadDim * (head + static_cast<std::int64_t>(heads) * row);
     if (d >= kVisionHeadDim) {
         out[dst] = 0.0f;
         return;
@@ -86,14 +89,14 @@ __global__ void vision_pad_q_kernel(const __nv_bfloat16* __restrict__ q, std::in
 __global__ void vision_pad_kv_kernel(const __nv_bfloat16* __restrict__ k,
                                      const __nv_bfloat16* __restrict__ v, std::int64_t token_stride,
                                      half* __restrict__ k_out, half* __restrict__ v_out,
-                                     int patches) {
+                                     int patches, int heads) {
     const int token = blockIdx.x;
     const int head  = blockIdx.y;
     const int d     = threadIdx.x;
     if (token >= patches) { return; }
 
     const std::int64_t dst =
-        static_cast<std::int64_t>(d) + kPaddedHeadDim * (head + static_cast<std::int64_t>(kVisionHeads) * token);
+        static_cast<std::int64_t>(d) + kPaddedHeadDim * (head + static_cast<std::int64_t>(heads) * token);
     if (d >= kVisionHeadDim) {
         k_out[dst] = __float2half(0.0f);
         v_out[dst] = __float2half(0.0f);
@@ -108,17 +111,17 @@ __global__ void vision_pad_kv_kernel(const __nv_bfloat16* __restrict__ k,
 // FP32 [128,16,rows] -> BF16 [72,16,P] contiguous, dropping the padded lanes and
 // placing the query block back at first_token.
 __global__ void vision_unpad_out_kernel(const float* __restrict__ in, __nv_bfloat16* __restrict__ out,
-                                        int first_token, int rows) {
+                                        int first_token, int rows, int heads) {
     const int row  = blockIdx.x;
     const int head = blockIdx.y;
     const int d    = threadIdx.x;
     if (row >= rows || d >= kVisionHeadDim) { return; }
 
     const std::int64_t src =
-        static_cast<std::int64_t>(d) + kPaddedHeadDim * (head + static_cast<std::int64_t>(kVisionHeads) * row);
+        static_cast<std::int64_t>(d) + kPaddedHeadDim * (head + static_cast<std::int64_t>(heads) * row);
     const std::int64_t dst =
         static_cast<std::int64_t>(d) +
-        kVisionHeadDim * (head + static_cast<std::int64_t>(kVisionHeads) * (first_token + row));
+        kVisionHeadDim * (head + static_cast<std::int64_t>(heads) * (first_token + row));
     out[dst] = __float2bfloat16(in[src]);
 }
 
@@ -189,11 +192,11 @@ std::int32_t vision_attention_volta_flash_staged_rows(std::int32_t patches) {
     return std::min(patches, kVisionFlashQBlockPatches);
 }
 
-std::size_t vision_attention_volta_flash_meta_elements(std::int32_t patches) {
+std::size_t vision_attention_volta_flash_meta_elements(std::int32_t patches, std::int32_t heads) {
     const VisionFlashConfig& c = vision_flash_config();
     const int rows             = vision_attention_volta_flash_staged_rows(patches);
     const int ntiles_x         = (rows + kNcols1 - 1) / kNcols1;
-    const int ntiles_dst       = ntiles_x * kVisionHeads;
+    const int ntiles_dst       = ntiles_x * heads;
     const int nblocks          = std::max(c.blocks_per_sm * c.nsm, ntiles_dst);
     return static_cast<std::size_t>(nblocks) * kNcols * (2 + kPaddedHeadDim / 2);
 }
@@ -206,20 +209,21 @@ void vision_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const
     const VisionFlashConfig& c = vision_flash_config();
 
     const std::int32_t patches = q.ne[2];
+    const std::int32_t heads   = q.ne[1]; // local heads for this rank (kFullHeads / tp)
 
     // Token stride in elements; the caller may hand us a padded qkv plane.
     const std::int64_t token_stride = q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
 
     // K/V are staged whole and once: a query block attends its entire segment, and
     // segments are slices of this one buffer.
-    vision_pad_kv_kernel<<<dim3(patches, kVisionHeads), kPaddedHeadDim, 0, stream>>>(
+    vision_pad_kv_kernel<<<dim3(patches, heads), kPaddedHeadDim, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
-        token_stride, static_cast<half*>(k_f16.data), static_cast<half*>(v_f16.data), patches);
+        token_stride, static_cast<half*>(k_f16.data), static_cast<half*>(v_f16.data), patches, heads);
 
-    const std::int32_t nb01 = kPaddedHeadDim * kVisionHeads * sizeof(float);
-    const std::int32_t nb02 = kPaddedHeadDim                * sizeof(float);
-    const std::int32_t nb11 = kPaddedHeadDim * kVisionHeads * sizeof(half);
-    const std::int32_t nb12 = kPaddedHeadDim                * sizeof(half);
+    const std::int32_t nb01 = kPaddedHeadDim * heads * sizeof(float);
+    const std::int32_t nb02 = kPaddedHeadDim          * sizeof(float);
+    const std::int32_t nb11 = kPaddedHeadDim * heads * sizeof(half);
+    const std::int32_t nb12 = kPaddedHeadDim          * sizeof(half);
 
     // 1/sqrt(72) over the real feature width, not the padded one.
     const float scale = 1.0f / sqrtf(static_cast<float>(kVisionHeadDim));
@@ -232,20 +236,20 @@ void vision_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const
     const auto launch_block = [&](std::int32_t key_begin, std::int32_t keys,
                                   std::int32_t query_begin, std::int32_t queries) {
         const std::int64_t key_row =
-            static_cast<std::int64_t>(key_begin) * kVisionHeads * kPaddedHeadDim;
+            static_cast<std::int64_t>(key_begin) * heads * kPaddedHeadDim;
         const std::int64_t staged_elements =
-            static_cast<std::int64_t>(queries) * kVisionHeads * kPaddedHeadDim;
+            static_cast<std::int64_t>(queries) * heads * kPaddedHeadDim;
 
-        vision_pad_q_kernel<<<dim3(queries, kVisionHeads), kPaddedHeadDim, 0, stream>>>(
+        vision_pad_q_kernel<<<dim3(queries, heads), kPaddedHeadDim, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), token_stride,
-            static_cast<float*>(q_f32.data), query_begin, queries);
+            static_cast<float*>(q_f32.data), query_begin, queries, heads);
 
         cudaMemsetAsync(out_f32.data, 0, static_cast<std::size_t>(staged_elements) * sizeof(float),
                         stream);
 
         // Stream-K decomposition, matching launch_fattn.
         const int ntiles_x   = (queries + kNcols1 - 1) / kNcols1;
-        const int ntiles_dst = ntiles_x * kVisionHeads;
+        const int ntiles_dst = ntiles_x * heads;
         const int ntiles_KV  = (keys + c.nbatch_fa - 1) / c.nbatch_fa;
         const int max_blocks = c.blocks_per_sm * c.nsm;
 
@@ -265,25 +269,25 @@ void vision_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const
                 nullptr, nullptr, static_cast<float*>(out_f32.data),
                 static_cast<float2*>(dst_meta.data),
                 scale, 0.0f, 1.0f, 1.0f, /*n_head_log2=*/16u, 0.0f,
-                kPaddedHeadDim, ne01_fd, kVisionHeads, 1, nb01, nb02, 0,
-                kPaddedHeadDim, keys, kVisionHeads, 1, nb11, nb12, 0,
+                kPaddedHeadDim, ne01_fd, heads, 1, nb01, nb02, 0,
+                kPaddedHeadDim, keys, heads, 1, nb11, nb12, 0,
                 nb11, nb12, 0,
                 queries, 1, 1,
                 0, 0, 0);
 
         if (nblocks % ntiles_dst == 0 && nblocks > ntiles_dst) {
-            const uint3 fd0 = init_fastdiv_values(ntiles_x * kVisionHeads);
+            const uint3 fd0 = init_fastdiv_values(ntiles_x * heads);
             const uint3 fd1 = init_fastdiv_values(ntiles_x);
             const uint3 fd2 = init_fastdiv_values(ntiles_x);
 
             flash_attn_stream_k_fixup_uniform<kPaddedHeadDim, kNcols1, kNcols2>
                 <<<dim3((unsigned) ntiles_dst, kNcols1, kNcols2), dim3(kPaddedHeadDim, 1, 1), 0, stream>>>(
                     static_cast<float*>(out_f32.data), static_cast<float2*>(dst_meta.data),
-                    queries, kVisionHeads, kVisionHeads, nblocks, 1, nblocks / ntiles_dst, fd0, fd1, fd2);
+                    queries, heads, heads, nblocks, 1, nblocks / ntiles_dst, fd0, fd1, fd2);
         } else if (ntiles_dst % nblocks != 0) {
             const int total_work = ntiles_KV * ntiles_dst;
 
-            const uint3 fd_k_j_z_ne12 = init_fastdiv_values(ntiles_KV * ntiles_x * kVisionHeads);
+            const uint3 fd_k_j_z_ne12 = init_fastdiv_values(ntiles_KV * ntiles_x * heads);
             const uint3 fd_k_j_z      = init_fastdiv_values(ntiles_KV * ntiles_x);
             const uint3 fd_k_j        = init_fastdiv_values(ntiles_KV * ntiles_x);
             const uint3 fd_k          = init_fastdiv_values(ntiles_KV);
@@ -291,12 +295,12 @@ void vision_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const
             flash_attn_stream_k_fixup_general<kPaddedHeadDim, kNcols1, kNcols2>
                 <<<dim3((unsigned) nblocks, kNcols1, kNcols2), dim3(kPaddedHeadDim, 1, 1), 0, stream>>>(
                     static_cast<float*>(out_f32.data), static_cast<float2*>(dst_meta.data),
-                    queries, kVisionHeads, 1, total_work, fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
+                    queries, heads, 1, total_work, fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
 
-        vision_unpad_out_kernel<<<dim3(queries, kVisionHeads), kPaddedHeadDim, 0, stream>>>(
+        vision_unpad_out_kernel<<<dim3(queries, heads), kPaddedHeadDim, 0, stream>>>(
             static_cast<const float*>(out_f32.data), static_cast<__nv_bfloat16*>(out.data),
-            query_begin, queries);
+            query_begin, queries, heads);
     };
 
     for (std::int32_t segment = 0; segment < segments; ++segment) {

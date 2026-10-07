@@ -6,6 +6,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include <ninfer/ops/allreduce.h>
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "runtime/contract/transient_region.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -42,13 +43,38 @@ struct VisionScheduleConfig {
 
 class VisionContext {
 public:
+    // Single-device construction (tp == 1). The vision tower runs entirely on `device`; the
+    // sharded members below stay empty and `encode` uses the one-arena overload.
     VisionContext(DeviceContext& device, const LoadedModelData& model);
+
+    // Tensor-parallel construction (tp > 1). `ec` carries every rank's DeviceContext and the group
+    // width; `events` is the shared allreduce collective; `peer_weights[r]` is rank r's own sharded
+    // model view (index 0 is unused -- rank 0 binds from `model`). Rank 0's device is `ec.dev[0]`,
+    // which must be the same object as `device`.
+    VisionContext(DeviceContext& device, const LoadedModelData& model, const ExecutionContext& ec,
+                  const ops::CollectiveComms& events,
+                  const std::array<const LoadedModelData*, kMaximumDevices>& peer_weights);
 
     [[nodiscard]] static std::size_t output_transient_bytes(std::size_t merged_tokens);
     [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::VisionItemControl& item);
+    // Per-rank scratch capacity for the widest supported vision item. `tp` sizes for a sharded
+    // encode (max over ranks, since tp == 4's mod-8 split is uneven); tp == 1 is the single-device
+    // value and is unchanged from before this parameter existed.
     [[nodiscard]] static std::size_t workspace_capacity_bytes(std::uint32_t max_merged_tokens,
-                                                              std::uint32_t max_segments);
+                                                               std::uint32_t max_segments,
+                                                               std::size_t tp = 1);
+    // Single-device encode (tp == 1).
     void encode(const VisionItemView& item, Tensor& output, WorkspaceArena& workspace) const;
+    // Sharded encode (tp > 1). `out[r]` is rank r's [H,V] BF16 destination (the replicated result
+    // after the final row-parallel reduce), resident on ec.dev[r]; `work[r]` is rank r's scratch
+    // arena. Rank 0's destination is normally the caller's transient; peers use private buffers so
+    // each rank can scatter its own local copy without a cross-device copy. All ranks are driven
+    // from the same host thread (the collective orders them).
+    void encode(const VisionItemView& item, const std::array<Tensor, kMaximumDevices>& out,
+                const std::array<WorkspaceArena*, kMaximumDevices>& work) const;
+
+    [[nodiscard]] int tp_width() const noexcept { return tp_count_; }
+    [[nodiscard]] bool tensor_parallel() const noexcept { return tp_count_ > 1; }
 
 private:
     struct BlockW {
@@ -75,12 +101,29 @@ private:
         const Tensor* fc2_bias    = nullptr;
     };
 
+    // One rank's full set of vision weight bindings. For tp == 1 only index 0 is populated and
+    // holds the tower at full width; for tp > 1 index r holds rank r's sharded view (qkv/o_proj/
+    // fc2/merger_fc2 row-parallel, fc1/merger_fc1 column-parallel, everything else replicated).
+    struct VisionWeights {
+        const Weight* patch_embed      = nullptr;
+        const Tensor* patch_embed_bias = nullptr;
+        const Tensor* position_embed   = nullptr;
+        std::array<BlockW, VisionScheduleConfig::layers> blocks{};
+        MergerW merger{};
+    };
+
+    void bind_rank(int rank, const LoadedModelData& model);
+    [[nodiscard]] const VisionWeights& weights_for(int rank) const {
+        return ranks_[static_cast<std::size_t>(rank)];
+    }
+
     DeviceContext& ctx_;
-    const Weight* patch_embed_      = nullptr;
-    const Tensor* patch_embed_bias_ = nullptr;
-    const Tensor* position_embed_   = nullptr;
-    std::array<BlockW, VisionScheduleConfig::layers> blocks_{};
-    MergerW merger_{};
+    std::array<VisionWeights, kMaximumDevices> ranks_{};
+    // Tensor-parallel execution context (empty for tp == 1). `ec` owns every rank's DeviceContext;
+    // `events` is the shared allreduce collective reused by every row-parallel projection.
+    const ExecutionContext* ec_     = nullptr;
+    const ops::CollectiveComms* events_ = nullptr;
+    int tp_count_                    = 1;
 };
 
 struct VisionChunk {
@@ -89,15 +132,35 @@ struct VisionChunk {
     Tensor embeddings;
 };
 
+// Tensor-parallel setup for a VisionPrefillSession. `ec` owns every rank's DeviceContext and the
+// group width; `events` is the shared allreduce collective; `peer_models[r]` is rank r's sharded
+// model view (index 0 unused -- rank 0 binds from the session's primary model). Null means the
+// single-device path.
+struct VisionTpSetup {
+    const ExecutionContext* ec = nullptr;
+    const ops::CollectiveComms* events = nullptr;
+    std::array<const LoadedModelData*, kMaximumDevices> peer_models{};
+};
+
 class VisionPrefillSession {
 public:
     VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
                          WorkspaceArena& workspace, qwen3_6::PreparedPromptData& prompt,
-                         const VisionPrefillPlan& plan, runtime::TransientRegion transient);
+                         const VisionPrefillPlan& plan, runtime::TransientRegion transient,
+                         const VisionTpSetup* tp = nullptr);
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
     void release_encoded_media_payloads() noexcept;
     [[nodiscard]] double elapsed_seconds() const;
+    [[nodiscard]] int tp_width() const noexcept { return tp_count_; }
+    [[nodiscard]] bool tensor_parallel() const noexcept { return tp_count_ > 1; }
+    // Per-rank [H,V] BF16 views of the last encoded item's (replicated) embeddings, valid after a
+    // prepare_chunk that encoded an item. Rank 0 is the caller's transient; peers are this session's
+    // private buffers, so a tensor-parallel text prefill scatters each rank's local copy without a
+    // cross-device transfer. Only meaningful when tensor_parallel().
+    [[nodiscard]] const std::array<Tensor, kMaximumDevices>& tp_embeddings() const noexcept {
+        return tp_embeddings_;
+    }
 
 private:
     DeviceContext& device_;
@@ -105,10 +168,20 @@ private:
     qwen3_6::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
     runtime::TransientRegion transient_;
-    VisionContext context_;
+    // Optional because the single-device and tensor-parallel constructors differ in arity; exactly
+    // one is emplaced at construction.
+    std::optional<VisionContext> context_;
     std::optional<std::uint32_t> active_item_;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;
     std::vector<CudaEventTimer> timers_;
+    // Tensor-parallel state (empty for tp == 1). Each rank owns a private vision scratch arena so
+    // the sharded encode never aliases the text workspaces; sized to the widest item in the plan.
+    int tp_count_ = 1;
+    std::array<std::optional<WorkspaceArena>, kMaximumDevices> tp_work{};
+    // Private per-rank destinations for the replicated final embeddings (peers only; rank 0 uses the
+    // caller's transient). Sized to the widest item so a per-chunk [H, merged_count] view fits.
+    std::array<std::optional<DeviceBuffer>, kMaximumDevices> tp_embed_storage{};
+    std::array<Tensor, kMaximumDevices> tp_embeddings_{};
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

@@ -20,6 +20,7 @@ public:
 
 enum class NumericFormat {
     BF16,
+    FP16,
     FP32,
     I32,
     Q4G64_F16S,

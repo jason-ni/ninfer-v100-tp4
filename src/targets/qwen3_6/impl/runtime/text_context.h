@@ -354,7 +354,8 @@ public:
                            const std::array<Tensor, kMaximumDevices>& rope_positions,
                            ops::GqaExecutionEnvelope envelope,
                            const std::array<Tensor, kMaximumDevices>& mtp_hidden, int logits_column,
-                           const std::array<Tensor, kMaximumDevices>* logits, Tensor* draft_token);
+                           const std::array<Tensor, kMaximumDevices>* logits, Tensor* draft_token,
+                           const std::array<Tensor, kMaximumDevices>* input_embeddings = nullptr);
     void mtp_forward_ar_step(const Tensor& token, const std::array<Tensor, kMaximumDevices>& previous_hidden,
                              const std::array<Tensor, kMaximumDevices>& position,
                              ops::GqaExecutionEnvelope envelope,
@@ -450,7 +451,8 @@ private:
     // rank 1's the NORMALIZED HIDDEN half, so device 1 never embeds a token in the MTP stem.
     void mtp_forward_stem_parallel(const Tensor& ids, const std::array<Tensor, kMaximumDevices>& hidden,
                               std::array<Tensor, kMaximumDevices>& x, std::array<Tensor, kMaximumDevices>& ah,
-                              const std::array<Tensor, kMaximumDevices>& staging);
+                              const std::array<Tensor, kMaximumDevices>& staging,
+                              const std::array<Tensor, kMaximumDevices>* input_embeddings = nullptr);
     void mtp_forward_tail_parallel(std::array<Tensor, kMaximumDevices>& x, const std::array<Tensor, kMaximumDevices>& ah,
                               const std::array<Tensor, kMaximumDevices>& positions,
                               const std::array<Tensor, kMaximumDevices>& rope_positions,
@@ -461,7 +463,8 @@ private:
                               const std::array<Tensor, kMaximumDevices>& positions,
                               const std::array<Tensor, kMaximumDevices>& rope_positions,
                               ops::GqaExecutionEnvelope envelope,
-                              const std::array<Tensor, kMaximumDevices>& mtp_hidden);
+                              const std::array<Tensor, kMaximumDevices>& mtp_hidden,
+                              const std::array<Tensor, kMaximumDevices>* input_embeddings = nullptr);
     void mtp_prefill_chunk_parallel(const Tensor& ids, const std::array<Tensor, kMaximumDevices>& hidden,
                                const std::array<Tensor, kMaximumDevices>& positions,
                                const std::array<Tensor, kMaximumDevices>& rope_positions,
@@ -525,9 +528,10 @@ private:
     // The tp2 text prefill. Declared here rather than beside its siblings above because it names
     // TextPrefill, which is declared just above this line.
     [[nodiscard]] PrefillChunkResult prefill_impl_parallel(std::span<const int> ids,
-                                                 const TextPrefill& text_prefill,
-                                                 bool finalize_at_end,
-                                                 DFlashFeatureSink* dflash_sink = nullptr);
+                                                  const TextPrefill& text_prefill,
+                                                  bool finalize_at_end,
+                                                  DFlashFeatureSink* dflash_sink = nullptr,
+                                                  const MultimodalPrefill* multimodal = nullptr);
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;

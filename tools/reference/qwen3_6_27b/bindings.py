@@ -32,6 +32,7 @@ ROW_SPLIT = "row-split-k128-v1"
 RESOURCE_ENCODING = "raw-bytes-v1"
 
 BF16 = "BF16"
+FP16 = "FP16"
 FP32 = "FP32"
 I32 = "I32"
 Q4 = "Q4G64_F16S"
@@ -343,7 +344,7 @@ def _mtp_contract() -> tuple[_ExpectedTensor, ...]:
 
 def _vision_contract() -> tuple[_ExpectedTensor, ...]:
     tensors: list[_ExpectedTensor] = [
-        _tensor("vision/patch_embedding", (1152, 1536), Q6),
+        _tensor("vision/patch_embedding", (1152, 1536), FP16),
         _tensor("vision/patch_embedding_bias", (1152,), BF16),
         _tensor("vision/position_embedding", (2304, 1152), BF16),
     ]
@@ -351,13 +352,13 @@ def _vision_contract() -> tuple[_ExpectedTensor, ...]:
         prefix = f"vision/layers/{layer}/"
         tensors.extend(
             (
-                _tensor(prefix + "attention/qkv", (3456, 1152), Q4),
+                _tensor(prefix + "attention/qkv", (3456, 1152), FP16),
                 _tensor(prefix + "attention/qkv_bias", (3456,), BF16),
-                _tensor(prefix + "attention/output", (1152, 1152), Q5),
+                _tensor(prefix + "attention/output", (1152, 1152), FP16),
                 _tensor(prefix + "attention/output_bias", (1152,), BF16),
-                _tensor(prefix + "mlp/fc1", (4304, 1152), Q4),
+                _tensor(prefix + "mlp/fc1", (4304, 1152), FP16),
                 _tensor(prefix + "mlp/fc1_bias", (4304,), BF16),
-                _tensor(prefix + "mlp/fc2", (1152, 4304), Q5),
+                _tensor(prefix + "mlp/fc2", (1152, 4304), FP16),
                 _tensor(prefix + "mlp/fc2_bias", (1152,), BF16),
                 _tensor(prefix + "norm1/weight", (1152,), BF16),
                 _tensor(prefix + "norm1/bias", (1152,), BF16),
@@ -367,9 +368,9 @@ def _vision_contract() -> tuple[_ExpectedTensor, ...]:
         )
     tensors.extend(
         (
-            _tensor("vision/merger/fc1", (4608, 4608), W8),
-            _tensor("vision/merger/fc1_bias", (4608,), BF16),
-            _tensor("vision/merger/fc2", (5120, 4608), W8),
+_tensor("vision/merger/fc1", (4608, 4608), FP16),
+        _tensor("vision/merger/fc1_bias", (4608,), BF16),
+        _tensor("vision/merger/fc2", (5120, 4608), FP16),
             _tensor("vision/merger/fc2_bias", (5120,), BF16),
             _tensor("vision/merger/norm/weight", (1152,), BF16),
             _tensor("vision/merger/norm/bias", (1152,), BF16),

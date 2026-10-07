@@ -68,13 +68,15 @@ void expect_equal(std::uint64_t actual, std::uint64_t expected, const std::strin
 
 // --- tp1 baseline, captured from the pre-change build ------------------------------------------
 // Artifact: qwen3_8_27b_nvfp4.ninfer (identity qwen3.8-27b/nvfp4, WeightsProfile::Qwen38Nvfp4).
-// Features: vision + MTP + optimized proposal, i.e. every optional object resident.
+// Features: vision + MTP + optimized proposal, i.e. every optional object resident. The baseline
+// is re-captured when the vision matrices moved from quantized (Q4/Q5/W8) to native FP16: the
+// object counts are unchanged but the single-device arena grows by ~625 MiB (the FP16 tower).
 constexpr std::size_t kTp1ObjectCount        = 1124;
 constexpr std::size_t kTp1DeviceObjects      = 1006;
 constexpr std::size_t kTp1HostObjects        = 6;
-constexpr std::uint64_t kTp1ArenaBytes       = 21'479'648'768ULL;
-constexpr std::uint64_t kTp1PlacementBytes   = 21'479'606'624ULL;
-constexpr std::uint64_t kTp1PlacementChecksum = 11'222'044'810'855'605'826ULL;
+constexpr std::uint64_t kTp1ArenaBytes       = 22'105'392'128ULL;
+constexpr std::uint64_t kTp1PlacementBytes   = 22'105'355'168ULL;
+constexpr std::uint64_t kTp1PlacementChecksum = 10'129'608'292'870'720'725ULL;
 
 // The original design budget: "Weights (split) 9.49 GiB" per GPU for an 18.98 GiB no-vision
 // artifact. Both halves of that are wrong against the real artifact -- it measures 18.99 GiB, and
@@ -189,6 +191,20 @@ int verify_tp1(const std::filesystem::path& path) {
         bind_artifact(binder, Package::resolve_weights(reader.identity()), features(true));
     const MaterializationPlan& materialization = plan.materialization;
 
+    // The single-device layout is only materializable on a GPU large enough to hold the whole
+    // model. On a smaller card (a 16 GB V100, where the ~20 GiB arena cannot fit) the upload would
+    // OOM, so skip this byte-identity half and let the caller run the two-device half, which fits.
+    {
+        std::size_t free_bytes = 0, total_bytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        if (materialization.device_capacity_bytes[0] > total_bytes) {
+            std::cout << "SKIP: tp1 single-device arena (" << std::fixed << std::setprecision(2)
+                      << gib(materialization.device_capacity_bytes[0]) << " GiB) exceeds device "
+                      "memory (" << gib(total_bytes) << " GiB); running the two-device half only\n";
+            return 77;
+        }
+    }
+
     expect_equal(materialization.object_count, kTp1ObjectCount, "tp1 object count");
     expect_equal(materialization.device_objects.size(), kTp1DeviceObjects, "tp1 device objects");
     expect_equal(materialization.host_objects.size(), kTp1HostObjects, "tp1 host objects");
@@ -231,16 +247,36 @@ int verify_tp2(const std::filesystem::path& path) {
 
     expect_equal(materialization.device_count, 2, "tp2 device count");
 
-    // Vision has no shard map (the tower is out of scope for TP2), so binding
-    // it for two devices must be refused rather than silently replicating the backbone.
+    // Vision is sharded at tp > 1 (docs/maintainer/fp16-vision-plan.md §5): binding it for two
+    // devices must SUCCEED, and a vision matrix must land as a proper shard on each device (fewer
+    // bytes than the whole object), not as a replicated copy. The full per-byte vision audit runs
+    // in the re-converted-artifact pass; here we check the placement shape from the plan alone.
     {
         ninfer::artifact::Binder vision_binder(reader, 2);
-        bool rejected = false;
-        try {
-            (void)bind_artifact(vision_binder, Package::resolve_weights(reader.identity()),
-                                features(true), 2);
-        } catch (const std::exception&) { rejected = true; }
-        expect(rejected, "tp2 + vision was not rejected at bind time");
+        const ArtifactLoadPlan vision_plan =
+            bind_artifact(vision_binder, Package::resolve_weights(reader.identity()),
+                          features(true), 2);
+        const auto& vmat = vision_plan.materialization;
+        const auto* fc1 = reader.find("vision/layers/0/mlp/fc1");
+        expect(fc1 != nullptr, "tp2 + vision: the artifact has no vision/layers/0/mlp/fc1");
+        if (fc1 != nullptr) {
+            const std::size_t fc1_index = static_cast<std::size_t>(fc1 - reader.objects().data());
+            const std::uint64_t full_bytes = ninfer::artifact::object_bytes(*fc1);
+            std::uint64_t dev0 = 0, dev1 = 0;
+            int placements = 0;
+            for (const auto& placement : vmat.device_objects) {
+                if (placement.object.index == fc1_index) {
+                    ++placements;
+                    if (placement.device == 0) { dev0 = placement.bytes; }
+                    else if (placement.device == 1) { dev1 = placement.bytes; }
+                }
+            }
+            expect_equal(static_cast<std::uint64_t>(placements), 2,
+                         "tp2 + vision: fc1 must be placed on both devices");
+            expect(dev0 < full_bytes && dev1 < full_bytes,
+                   "tp2 + vision: fc1 shard is not smaller than the whole object (replicated?)");
+            expect_equal(dev0, dev1, "tp2 + vision: fc1 shards differ between devices");
+        }
     }
 
     // --- per-family audit table ---
@@ -706,7 +742,10 @@ int main() {
     }
     CUDA_CHECK(count_error);
     try {
-        if (const int result = verify_tp1(path); result != 0) { return result; }
+        // A skipped tp1 (77, e.g. the arena does not fit on one card) still lets the two-device
+        // half run; only a genuine failure short-circuits.
+        const int tp1 = verify_tp1(path);
+        if (tp1 != 0 && tp1 != 77) { return tp1; }
         const int result = verify_tp2(path);
         if (result == 77 && g_failures == 0) { return 77; }
         if (result != 0 && result != 77) { return result; }

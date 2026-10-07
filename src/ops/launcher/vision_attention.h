@@ -42,7 +42,7 @@ inline constexpr std::int32_t kVisionFlashQBlockPatches = 8192;
 // item when it is smaller.
 std::int32_t vision_attention_volta_flash_staged_rows(std::int32_t patches);
 
-std::size_t vision_attention_volta_flash_meta_elements(std::int32_t patches);
+std::size_t vision_attention_volta_flash_meta_elements(std::int32_t patches, std::int32_t heads);
 
 // segment_bounds is a HOST array of segments+1 ascending offsets, starting at 0
 // and ending at q.ne[2] -- the same content cu_seqlens carries on the device. The

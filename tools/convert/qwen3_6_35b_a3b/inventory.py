@@ -10,6 +10,7 @@ from tools.convert.qwen3_6.common.inventory import (
     BF16,
     CONTIGUOUS_LAYOUT,
     FORMAT_NAMES,
+    FP16,
     FP32,
     I32,
     LAYOUT_NAMES,

@@ -12,6 +12,7 @@ WEIGHTS_ID = "nvfp4"
 TARGET_KEY = base.TARGET_KEY
 
 BF16 = base.BF16
+FP16 = base.FP16
 FP32 = base.FP32
 I32 = base.I32
 Q4 = base.Q4
@@ -73,7 +74,7 @@ def _replacement_format(name: str, original: str) -> str:
 
 
 def _tensor(name: str, shape: tuple[int, ...], numeric_format: str) -> TensorSpec:
-    if numeric_format in (BF16, FP32, I32):
+    if numeric_format in (BF16, FP16, FP32, I32):
         layout = CONTIGUOUS_LAYOUT
     elif numeric_format == NVFP4:
         layout = BLOCK_SCALE_LAYOUT
@@ -151,7 +152,7 @@ TENSOR_SPECS = (
 )
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
-FORMAT_NAMES = (BF16, FP32, I32, Q4, Q5, Q6, W8, NVFP4)
+FORMAT_NAMES = (BF16, FP16, FP32, I32, Q4, Q5, Q6, W8, NVFP4)
 LAYOUT_NAMES = (CONTIGUOUS_LAYOUT, ROW_SPLIT_LAYOUT, BLOCK_SCALE_LAYOUT)
 FORMAT_COUNTS = {
     numeric_format: sum(spec.format == numeric_format for spec in TENSOR_SPECS)
@@ -256,18 +257,19 @@ def validate_inventory() -> None:
         raise ValueError("registered NVFP4 inventory is incomplete")
     if FORMAT_COUNTS != {
         BF16: 591,
+        FP16: 111,
         FP32: 343,
         I32: 1,
-        Q4: 55,
-        Q5: 54,
-        Q6: 1,
-        W8: 9,
+        Q4: 1,
+        Q5: 0,
+        Q6: 0,
+        W8: 7,
         NVFP4: 247,
     }:
         raise ValueError(f"unexpected NVFP4 format allocation: {FORMAT_COUNTS}")
     if LAYOUT_COUNTS != {
-        CONTIGUOUS_LAYOUT: 935,
-        ROW_SPLIT_LAYOUT: 119,
+        CONTIGUOUS_LAYOUT: 1046,
+        ROW_SPLIT_LAYOUT: 8,
         BLOCK_SCALE_LAYOUT: 247,
     }:
         raise ValueError(f"unexpected NVFP4 layout allocation: {LAYOUT_COUNTS}")

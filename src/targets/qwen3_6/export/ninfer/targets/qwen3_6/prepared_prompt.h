@@ -14,7 +14,14 @@ namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
 inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
-inline constexpr std::uint64_t kMaximumVisionTokens       = 32'768;
+// The per-request Vision budget is a fraction of the context window: the processor sums
+// `t*h*w/4` over every media item in the request, so a long agentic image history is bounded by
+// `--max-context` rather than a fixed constant. Half the window is reserved for Vision, leaving
+// the rest for text. `kMaximumVisionTokens` is now only the `ProcessorOptions` fallback default
+// for callers that construct the processor directly; the Frontend always derives the live budget
+// from the context window.
+inline constexpr std::uint64_t kVisionTokenContextDivisor = 2;
+inline constexpr std::uint64_t kMaximumVisionTokens        = 32'768;
 inline constexpr std::uint64_t kMaximumVisionRawPatches =
     kMaximumVisionTokens * kRawPatchesPerVisionToken;
 

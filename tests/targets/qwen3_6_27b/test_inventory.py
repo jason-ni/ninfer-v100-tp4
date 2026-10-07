@@ -44,16 +44,17 @@ def test_complete_full_only_inventory_and_canonical_order() -> None:
 def test_format_layout_counts_and_key_signatures() -> None:
     assert inventory.FORMAT_COUNTS == {
         "BF16": 582,
+        "FP16": 111,
         "FP32": 96,
         "I32": 1,
-        "Q4G64_F16S": 183,
-        "Q5G64_F16S": 246,
-        "Q6G64_F16S": 3,
-        "W8G32_F16S": 7,
+        "Q4G64_F16S": 129,
+        "Q5G64_F16S": 192,
+        "Q6G64_F16S": 2,
+        "W8G32_F16S": 5,
     }
     assert inventory.LAYOUT_COUNTS == {
-        "contiguous-le-v1": 679,
-        "row-split-k128-v1": 439,
+        "contiguous-le-v1": 790,
+        "row-split-k128-v1": 328,
     }
     tensors = _tensor_by_name()
     assert tensors["text/token_embedding"] == inventory.TensorSpec(

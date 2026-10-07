@@ -555,16 +555,30 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
                  best_match);
 }
 
-// A `</think>` closes the reasoning channel only when it is the model's structural close, which
-// is the exact sequence `\n</think>\n\n`: the tag ends a line and the line boundary that ends the
-// tag line is itself followed by a blank line. The identical tag appears as ordinary text whenever
-// the model quotes it and, in a coding turn, the most common copy is a `</think>` alone on a line
-// inside a Python or Rust code block the model is writing or echoing back. That quoted copy also
-// ends a line, so merely requiring one trailing line boundary (the earlier rule) closed reasoning
-// early and leaked the quoted tag and the rest of the code onto the content channel. The blank
-// line after the tag line is what separates the structural close (blank line, then the answer)
-// from a quoted code line (followed by more code).
+// A `</think>` closes the reasoning channel only when it is the model's structural close. The
+// tag is byte-identical to the text the model writes whenever it quotes or echoes it (its context
+// carries the tag whenever a tool result or user message contains it), so the decision is made
+// from what follows the tag:
+//   - the canonical close is `</think>\n\n` (blank line, then the answer); a quoted `</think>`
+//     that ends a line inside a Python or Rust code block is followed by more code, and the
+//     earlier one-line-boundary rule closed reasoning early and leaked the code onto content;
+//   - a tool call is the one answer the model never separates from the close with a blank line,
+//     so `<tool_call>` after at most one line boundary is also the structural close. Without
+//     this the whole tool call was routed onto the reasoning channel.
+// A deciding byte that is still in flight holds the tag for the next feed.
 bool is_line_boundary(char c) { return c == '\n' || c == '\r'; }
+
+constexpr std::string_view kToolCallOpen = "<tool_call>";
+
+enum class ToolCallPrefix { No, Partial, Yes };
+
+ToolCallPrefix tool_call_prefix(std::string_view text, std::size_t pos) {
+    const std::string_view tail = text.substr(pos);
+    if (tail.size() >= kToolCallOpen.size()) {
+        return tail.starts_with(kToolCallOpen) ? ToolCallPrefix::Yes : ToolCallPrefix::No;
+    }
+    return kToolCallOpen.starts_with(tail) ? ToolCallPrefix::Partial : ToolCallPrefix::No;
+}
 
 void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
@@ -578,49 +592,51 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
     for (;;) {
         const std::size_t marker = state.think_marker_pending.find(kThinkClose);
         if (marker == std::string::npos) { break; }
-        const std::size_t end = marker + kThinkClose.size();
-        // The model's structural close is `</think>\n\n`: a line boundary ends the tag line and is
-        // itself followed by the blank line that precedes the answer. A quoted copy that ends a
-        // line (most often a `</think>` alone on a line inside a Python or Rust code block) is
-        // followed by more code, so the second line boundary is what distinguishes the close. A
-        // deciding byte that is still in flight holds the tag for the next feed.
-        if (end >= state.think_marker_pending.size()) {
+        const std::size_t end            = marker + kThinkClose.size();
+        const std::string_view pending   = state.think_marker_pending;
+
+        bool close = false;
+        bool wait  = false;
+        if (end >= pending.size()) {
             // The byte after the tag has not arrived; it decides line-end vs. mid-line.
-            feed_channel(state, OutputChannel::Reasoning,
-                         std::string_view(state.think_marker_pending).substr(0, marker), policy,
+            wait = true;
+        } else if (!is_line_boundary(pending[end])) {
+            // Mid-line. Only a tool call makes this a structural close.
+            switch (tool_call_prefix(pending, end)) {
+            case ToolCallPrefix::Yes: close = true; break;
+            case ToolCallPrefix::Partial: wait = true; break;
+            case ToolCallPrefix::No: break;
+            }
+        } else if (end + 1 >= pending.size()) {
+            // The tag ends a line but the byte deciding the blank line has not arrived.
+            wait = true;
+        } else if (is_line_boundary(pending[end + 1])) {
+            // Blank line after the tag line: the canonical structural close.
+            close = true;
+        } else {
+            // One line boundary, then more text: the close only if that text is a tool call.
+            switch (tool_call_prefix(pending, end + 1)) {
+            case ToolCallPrefix::Yes: close = true; break;
+            case ToolCallPrefix::Partial: wait = true; break;
+            case ToolCallPrefix::No: break;
+            }
+        }
+
+        if (wait) {
+            feed_channel(state, OutputChannel::Reasoning, pending.substr(0, marker), policy,
                          emitted, committed_tokens, best_match);
             state.think_marker_pending.erase(0, marker);
             return;
         }
-        if (!is_line_boundary(state.think_marker_pending[end])) {
-            // Mid-line: the model quoted the tag as text, not a structural close. Publish it on the
-            // Reasoning channel and keep scanning.
-            feed_channel(state, OutputChannel::Reasoning,
-                         std::string_view(state.think_marker_pending).substr(0, end), policy,
-                         emitted, committed_tokens, best_match);
+        if (!close) {
+            // Quoted copy: publish the tag on the Reasoning channel and keep scanning.
+            feed_channel(state, OutputChannel::Reasoning, pending.substr(0, end), policy, emitted,
+                         committed_tokens, best_match);
             state.think_marker_pending.erase(0, end);
             continue;
         }
-        if (end + 1 >= state.think_marker_pending.size()) {
-            // The tag ends a line but the byte deciding the blank line has not arrived; hold it.
-            feed_channel(state, OutputChannel::Reasoning,
-                         std::string_view(state.think_marker_pending).substr(0, marker), policy,
-                         emitted, committed_tokens, best_match);
-            state.think_marker_pending.erase(0, marker);
-            return;
-        }
-        if (!is_line_boundary(state.think_marker_pending[end + 1])) {
-            // Ends a line but is followed by more code rather than the close's blank line: a
-            // `</think>` quoted inside a code block. Publish it and keep scanning.
-            feed_channel(state, OutputChannel::Reasoning,
-                         std::string_view(state.think_marker_pending).substr(0, end), policy,
-                         emitted, committed_tokens, best_match);
-            state.think_marker_pending.erase(0, end);
-            continue;
-        }
-        feed_channel(state, OutputChannel::Reasoning,
-                     std::string_view(state.think_marker_pending).substr(0, marker), policy,
-                     emitted, committed_tokens, best_match);
+        feed_channel(state, OutputChannel::Reasoning, pending.substr(0, marker), policy, emitted,
+                     committed_tokens, best_match);
         close_channel(state, OutputChannel::Reasoning, emitted);
         std::string content = state.think_marker_pending.substr(end);
         state.think_marker_pending.clear();
@@ -703,8 +719,11 @@ public:
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
-        const std::uint64_t vision_tokens =
-            std::min<std::uint64_t>(options.max_context, kMaximumVisionTokens);
+        // Bound the request's summed Vision tokens by the context window, not a fixed constant: a
+        // long agentic history of images must fit the same `--max-context` as its text. Half the
+        // window is the Vision budget; the rest stays available for text.
+        const std::uint64_t vision_tokens = std::max<std::uint64_t>(
+            1, static_cast<std::uint64_t>(options.max_context) / kVisionTokenContextDivisor);
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
         if (vision_enabled) {

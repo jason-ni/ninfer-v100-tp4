@@ -45,32 +45,19 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
 //   * DFlash uses its own TP2 proposal/verification path. Proposal features are kept rank-local,
 //     the vocabulary head is column-parallel, and only rank 0 consumes the gathered selector
 //     image. This avoids treating the drafter as a whole-width single-device graph.
+//   * Vision is replicated, not split. The Vision tower is a self-contained ViT with no
+//     tensor-parallel head/channel axis, so the artifact replicates the BF16 tower on every rank
+//     (same mechanism as the token embedding and the DFlash draft payload). Every rank runs its
+//     own Vision encode and scatters the per-rank result into its own full-width `x` before the
+//     column/row parallel text leaves; no cross-rank collective is added, and the output is
+//     bit-identical to the single-device path by construction.
 //
-// The blanket `--tp 2` throw that once hid both backends is gone; this check is deliberately
-// written as its own independent statement so that a future Vision restriction cannot silently
-// disable the split speculative routes.
-void require_supported_tp_features(const EngineOptions& options) {
-    if (options.tp <= 1) { return; }
-    // MTP is split-aware: the stem's fc is row-parallel over the two unpacked norm halves, the
-    // MTP layer's attention/post-mixer are the same column/row-parallel pair the text layers use,
-    // the draft head is vocabulary-split with an allgather before the proposal argmax, and the GDN
-    // verify round records and folds per device. DFlash has a separate split-aware proposal path;
-    // its rank-0-only selector gather is deliberately not a full bidirectional all-gather.
-    // The Vision encoder runs entirely on the primary device against replicated weights and has no
-    // split path; the target layer states the same rule (layouts_impl.h validate_target_options).
-    if (options.enable_vision) {
-        throw std::invalid_argument("--tp > 1 does not support Vision in this build; use --tp 1");
-    }
-}
-
-// Resolves EngineOptions.tp/.device/.devices into the device id list ExecutionContext should
-// construct. ExecutionContext itself validates that the ids exist, are DISTINCT, and share a
-// compute capability.
+// There is currently no `tp > 1` restriction on this target; the speculative routes above are the
+// only things this file still validates.
 std::vector<int> resolve_execution_device_ids(const EngineOptions& options) {
     if (options.tp != 1 && options.tp != 2 && options.tp != 4) {
         throw std::invalid_argument("EngineOptions.tp must be 1, 2, or 4");
     }
-    require_supported_tp_features(options);
     if (options.devices.empty()) {
         if (options.tp != 1) {
             throw std::invalid_argument("--tp > 1 requires an explicit --devices list");

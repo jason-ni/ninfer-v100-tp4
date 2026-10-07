@@ -201,10 +201,14 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
-media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
-has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is therefore
-`min(--max-context, 32768)`. There is no fixed image/video item-count limit: item count is admitted
-through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
+media-token expansion, the result must fit Engine `--max-context`. The request's summed Vision budget
+is a fraction of that same window — currently half — so the per-request cap `t*h*w/4` over every
+image and video is `--max-context / 2` merged tokens (at `--max-context 262144`, 131,072 merged
+tokens or 524,288 raw patches). `--media-live-mib` must hold that maximum request payload (each
+merged Vision token needs 4 raw patches × 1536 BF16 features = 12,288 bytes, so half of a 262144
+window is ~1.5 GiB and the 2048 MiB default suffices); startup rejects a live budget that cannot.
+There is no fixed image/video item-count limit: item count is admitted through aggregate
+source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
 
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
 pool. Prepared payloads are keyed by SHA-256 of the acquired bytes plus modality, so repeated media

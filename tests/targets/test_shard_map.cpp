@@ -267,6 +267,101 @@ int main() {
     expect_plan(plan_for("mtp/input_projection", 2, config, profile),
                ShardPlan{Shard{0, 0, 5120}, Shard{1, 5120, 5120}}, "mtp input_projection");
 
+    // --- Vision tower (option C; docs/maintainer/fp16-vision-plan.md §5). Geometry: hidden=1152,
+    // intermediate=4304, heads=16, head_dim=72, merger_hidden=4608. patch_embedding, the row-
+    // parallel OUTPUT biases (o_proj/fc2), and every norm/position embedding are replicated; qkv is
+    // column-parallel by head; o_proj/fc2/merger_fc2 are row-parallel; fc1/merger_fc1 are
+    // column-parallel. A column-parallel N bias is sharded exactly like the weight that produces
+    // its output (qkv_bias by head, fc1_bias/merger_fc1_bias by mod-8), because the per-rank
+    // `add_bias` consumes the sharded projection width. The mod-8 split keeps every FP16
+    // contraction a multiple of 8 (select_fp16_launch), and becomes uneven at tp=4 for the
+    // 4304-wide MLP (4304/4=1076 is not 8-aligned): [1080,1080,1072,1072]. ---
+    {
+        const auto even = [](std::uint64_t offset, std::uint64_t size, int tp) {
+            ShardPlan out;
+            const std::uint64_t chunk = size / static_cast<std::uint64_t>(tp);
+            for (int d = 0; d < tp; ++d) { out.push_back(Shard{d, offset + chunk * d, chunk}); }
+            return out;
+        };
+        // Replicated elementwise objects (full copy on every rank). The row-parallel OUTPUT biases
+        // (attention/output_bias, mlp/fc2_bias) stay full width on every rank: their projection's
+        // allreduce reconstructs the full width before the bias is applied. The column-parallel
+        // biases are sharded with their weight and asserted below, not here.
+        for (std::string_view object :
+             {"vision/patch_embedding", "vision/position_embedding",
+              "vision/layers/0/norm1/weight", "vision/layers/0/norm2/bias",
+              "vision/layers/0/attention/output_bias", "vision/layers/0/mlp/fc2_bias",
+              "vision/merger/norm/weight"}) {
+            expect_empty(plan_for(object, 2, config, profile),
+                         std::string("vision replicated ") + std::string(object));
+        }
+        // qkv: three head-aligned planes, each 1152 rows split by its 16-head count.
+        {
+            const ShardPlan expected_tp2 =
+                concat(concat(even(0, 1152, 2), even(1152, 1152, 2)), even(2304, 1152, 2));
+            expect_plan(plan_for("vision/layers/0/attention/qkv", 2, config, profile), expected_tp2,
+                        "vision qkv tp2");
+            const ShardPlan expected_tp4 =
+                concat(concat(even(0, 1152, 4), even(1152, 1152, 4)), even(2304, 1152, 4));
+            expect_plan(plan_for("vision/layers/0/attention/qkv", 4, config, profile), expected_tp4,
+                        "vision qkv tp4");
+            // qkv_bias is the column-parallel N bias: the identical three-plane head split, so its
+            // per-rank width equals the sharded qkv output width that add_bias consumes.
+            expect_plan(plan_for("vision/layers/0/attention/qkv_bias", 2, config, profile),
+                        expected_tp2, "vision qkv_bias tp2");
+            expect_plan(plan_for("vision/layers/0/attention/qkv_bias", 4, config, profile),
+                        expected_tp4, "vision qkv_bias tp4");
+        }
+        // o_proj: row-parallel over the 1152-wide attention output.
+        expect_plan(plan_for("vision/layers/0/attention/output", 2, config, profile),
+                    ShardPlan{Shard{0, 0, 576}, Shard{1, 576, 576}}, "vision o_proj tp2");
+        expect_plan(plan_for("vision/layers/0/attention/output", 4, config, profile),
+                    ShardPlan{Shard{0, 0, 288}, Shard{1, 288, 288}, Shard{2, 576, 288},
+                              Shard{3, 864, 288}},
+                    "vision o_proj tp4");
+        // MLP fc1 (N) / fc2 (K): mod-8 split of 4304. Even at tp2 (2152), uneven at tp4.
+        expect_plan(plan_for("vision/layers/0/mlp/fc1", 2, config, profile),
+                    ShardPlan{Shard{0, 0, 2152}, Shard{1, 2152, 2152}}, "vision fc1 tp2");
+        expect_plan(plan_for("vision/layers/0/mlp/fc2", 2, config, profile),
+                    ShardPlan{Shard{0, 0, 2152}, Shard{1, 2152, 2152}}, "vision fc2 tp2");
+        expect_plan(plan_for("vision/layers/0/mlp/fc1", 4, config, profile),
+                    ShardPlan{Shard{0, 0, 1080}, Shard{1, 1080, 1080}, Shard{2, 2160, 1072},
+                              Shard{3, 3232, 1072}},
+                    "vision fc1 tp4 (mod-8 uneven)");
+        expect_plan(plan_for("vision/layers/0/mlp/fc2", 4, config, profile),
+                    ShardPlan{Shard{0, 0, 1080}, Shard{1, 1080, 1080}, Shard{2, 2160, 1072},
+                              Shard{3, 3232, 1072}},
+                    "vision fc2 tp4 (mod-8 uneven)");
+        // fc1_bias is the column-parallel N bias: the same mod-8 split as fc1, so its per-rank
+        // width equals the sharded fc1 output width.
+        expect_plan(plan_for("vision/layers/0/mlp/fc1_bias", 2, config, profile),
+                    ShardPlan{Shard{0, 0, 2152}, Shard{1, 2152, 2152}}, "vision fc1_bias tp2");
+        expect_plan(plan_for("vision/layers/0/mlp/fc1_bias", 4, config, profile),
+                    ShardPlan{Shard{0, 0, 1080}, Shard{1, 1080, 1080}, Shard{2, 2160, 1072},
+                              Shard{3, 3232, 1072}},
+                    "vision fc1_bias tp4 (mod-8 uneven)");
+        // Merger fc1 (N) / fc2 (K): mod-8 split of 4608, even at every supported tp.
+        expect_plan(plan_for("vision/merger/fc1", 2, config, profile),
+                    ShardPlan{Shard{0, 0, 2304}, Shard{1, 2304, 2304}}, "vision merger fc1 tp2");
+        expect_plan(plan_for("vision/merger/fc2", 2, config, profile),
+                    ShardPlan{Shard{0, 0, 2304}, Shard{1, 2304, 2304}}, "vision merger fc2 tp2");
+        expect_plan(plan_for("vision/merger/fc1", 4, config, profile),
+                    ShardPlan{Shard{0, 0, 1152}, Shard{1, 1152, 1152}, Shard{2, 2304, 1152},
+                              Shard{3, 3456, 1152}},
+                    "vision merger fc1 tp4");
+        expect_plan(plan_for("vision/merger/fc2", 4, config, profile),
+                    ShardPlan{Shard{0, 0, 1152}, Shard{1, 1152, 1152}, Shard{2, 2304, 1152},
+                              Shard{3, 3456, 1152}},
+                    "vision merger fc2 tp4");
+        // merger_fc1_bias is the column-parallel N bias: the same mod-8 split as merger_fc1.
+        expect_plan(plan_for("vision/merger/fc1_bias", 2, config, profile),
+                    ShardPlan{Shard{0, 0, 2304}, Shard{1, 2304, 2304}}, "vision merger fc1_bias tp2");
+        expect_plan(plan_for("vision/merger/fc1_bias", 4, config, profile),
+                    ShardPlan{Shard{0, 0, 1152}, Shard{1, 1152, 1152}, Shard{2, 2304, 1152},
+                              Shard{3, 3456, 1152}},
+                    "vision merger fc1_bias tp4");
+    }
+
     // --- k128 row-split-k128-v1 group boundary (row-parallel objects): standalone validator. ---
     if (!is_row_parallel_boundary_valid(0, 128)) { fail("k128 validator: (0,128) should be valid"); }
     if (is_row_parallel_boundary_valid(100, 100)) {
@@ -314,8 +409,10 @@ int main() {
     // --- tp < 1 is rejected outright. ---
     expect_throws([&] { (void)plan_for("text/token_embedding", 0, config, profile); }, "tp=0");
 
-    // --- unrecognized object family is rejected outright (not silently replicated). ---
-    expect_throws([&] { (void)plan_for("vision/merger/fc2", 2, config, profile); }, "unrecognized object");
+    // --- unrecognized object family is rejected outright (not silently replicated). A vision/
+    // name that matches no known vision leaf is still recognized as the tower's replicated default,
+    // so use a non-vision name here to exercise the fall-through throw. ---
+    expect_throws([&] { (void)plan_for("bogus/object", 2, config, profile); }, "unrecognized object");
 
     // --- shard_mapping_for: the axis the loader slices along. plan_for delegates to it, so the
     // two can never disagree about a family's boundaries; this pins the axis half. Rows narrows
@@ -342,18 +439,31 @@ int main() {
               "text/layers/3/gdn/query_key", "text/layers/3/gdn/value_z",
               "text/layers/3/gdn/a_projection", "text/layers/3/gdn/a_b_projection",
               "text/layers/3/gdn/a_log", "text/layers/3/gdn/dt_bias", "text/layers/5/mlp/gate_up",
-              "text/output_head", "text/draft_head"}) {
+              "text/output_head", "text/draft_head",
+              // Vision column-parallel (output/row dimension split): qkv by head, fc1, merger fc1,
+              // plus their column-parallel N biases (qkv_bias, fc1_bias, merger_fc1_bias).
+              "vision/layers/0/attention/qkv_bias", "vision/layers/0/attention/qkv",
+              "vision/layers/0/mlp/fc1_bias", "vision/layers/0/mlp/fc1",
+              "vision/merger/fc1_bias", "vision/merger/fc1"}) {
             expect_axis(object, ShardAxis::Rows);
         }
         for (std::string_view object :
              {"text/layers/5/attention/output", "text/layers/3/gdn/output",
               "text/layers/5/mlp/down", "mtp/input_projection",
-              "text/layers/3/gdn/convolution"}) {
+              "text/layers/3/gdn/convolution",
+              // Vision row-parallel (input/column dimension split): o_proj, fc2, merger fc2.
+              "vision/layers/0/attention/output", "vision/layers/0/mlp/fc2", "vision/merger/fc2"}) {
             expect_axis(object, ShardAxis::Columns);
         }
         for (std::string_view object :
              {"text/token_embedding", "text/final_norm", "text/layers/5/input_norm",
-              "text/layers/3/gdn/norm", "mtp/hidden_norm", "text/draft_head_token_ids"}) {
+              "text/layers/3/gdn/norm", "mtp/hidden_norm", "text/draft_head_token_ids",
+              // Vision replicated: patch_embedding (decision 8), position, norms, and the row-
+              // parallel OUTPUT biases (which are applied after the allreduce reconstructs the
+              // full width).
+              "vision/patch_embedding", "vision/position_embedding",
+              "vision/layers/0/norm1/weight", "vision/layers/0/attention/output_bias",
+              "vision/layers/0/mlp/fc2_bias"}) {
             expect_axis(object, ShardAxis::Replicated);
         }
         // tp == 1 degenerates the same way plan_for does, before any family check.

@@ -8,6 +8,7 @@
 #endif
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
+#include "ops/linear/fp16/fp16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
@@ -123,6 +124,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::BF16_CTRL:
         detail::bf16_dispatch(x, w, out, policy, stream);
         return;
+    case QType::FP16_CTRL:
+        detail::fp16_dispatch(x, w, out, policy, stream);
+        return;
     case QType::NVFP4:
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
@@ -188,6 +192,12 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::BF16_CTRL:
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);
+        return 0;
+    case QType::FP16_CTRL:
+        // No split-K: the single tensor-core tile covers the whole contraction, so there is no
+        // workspace. The select call still validates the shape at both token bounds.
+        (void)detail::select_fp16_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_fp16_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
     case QType::NVFP4:
         if (!detail::is_nvfp4_linear_problem(output_rows, input_rows) ||

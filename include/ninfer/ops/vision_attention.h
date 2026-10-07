@@ -9,17 +9,19 @@ namespace ninfer::ops {
 
 /**
  * Returns the caller-owned transient capacity for every legal patch/segment pair in the supplied
- * inclusive envelope. A pair is legal when 1 <= segments <= patches. An envelope with no legal
- * pair throws.
+ * inclusive envelope, for `heads` attention heads. A pair is legal when 1 <= segments <= patches.
+ * An envelope with no legal pair throws.
  *
  * Zero is returned only when the selected route needs no transient storage: the descriptor-based
  * route needs none for a single segment, whereas a route that restages q/k/v for a different
- * kernel geometry always does. Callers must size from this function rather than assume either.
+ * kernel geometry always does (its staging is linear in `heads`, so a head-sharded rank reserves
+ * proportionally less). Callers must size from this function rather than assume either.
  */
 [[nodiscard]] std::size_t vision_attention_workspace_capacity_bytes(std::int32_t min_patches,
                                                                     std::int32_t max_patches,
                                                                     std::int32_t min_segments,
-                                                                    std::int32_t max_segments);
+                                                                    std::int32_t max_segments,
+                                                                    std::int32_t heads);
 
 /**
  * Packed, non-causal multi-head attention. For each segment [begin,end), head h, and
@@ -28,12 +30,13 @@ namespace ninfer::ops {
  *   score[j]    = dot(q[:,h,t], k[:,h,j]) / sqrt(72), begin <= j < end
  *   ideal[:,h,t] = sum_j softmax(score)[j] * v[:,h,j].
  *
- * q/k/v are BF16 [72,16,P] with contiguous feature and head dimensions; token strides may be
- * padded. out is contiguous BF16 [72,16,P]. cu_seqlens is contiguous I32 [S+1], begins at 0,
- * ends at P, and is strictly increasing. The oracle evaluates `ideal` naively in FP64 from the
- * represented inputs. The BF16 out is promoted and compared directly with that result; output
- * storage rounding belongs to the Op's numerical criterion, not the oracle. Inputs and output are
- * mutually non-overlapping.
+ * q/k/v are BF16 [72,H,P] with contiguous feature and head dimensions; token strides may be
+ * padded. The head count H is taken from q.ne[1] and must divide the tower's full head count (16);
+ * a tensor-parallel rank passes only its local heads (16/tp). out is contiguous BF16 [72,H,P].
+ * cu_seqlens is contiguous I32 [S+1], begins at 0, ends at P, and is strictly increasing. The
+ * oracle evaluates `ideal` naively in FP64 from the represented inputs. The BF16 out is promoted
+ * and compared directly with that result; output storage rounding belongs to the Op's numerical
+ * criterion, not the oracle. Inputs and output are mutually non-overlapping.
  *
  * The Op allocates required opaque tile descriptors from `workspace` for the duration of the call;
  * no capacity is consumed for a single segment. There is no persistent state side effect.

@@ -5,6 +5,7 @@ from __future__ import annotations
 from tools.convert.qwen3_6.common.inventory import (
     BF16,
     CONTIGUOUS_LAYOUT,
+    FP16,
     FP32,
     I32,
     LogicalAliasSpec,
@@ -31,7 +32,7 @@ FP8 = "FP8_E4M3FN_ROW_BF16S"
 BLOCK_SCALE_LAYOUT = "blockscale-k16-m128x4-v1"
 ROW_SCALE_LAYOUT = "row-scale-v1"
 
-FORMAT_NAMES = (BF16, FP32, I32, Q4, Q5, Q6, W8, NVFP4, FP8)
+FORMAT_NAMES = (BF16, FP16, FP32, I32, Q4, Q5, Q6, W8, NVFP4, FP8)
 LAYOUT_NAMES = (
     CONTIGUOUS_LAYOUT,
     ROW_SPLIT_LAYOUT,
@@ -52,7 +53,7 @@ def tensor_spec(
     shape: tuple[int, ...],
     numeric_format: str,
 ) -> TensorSpec:
-    if numeric_format in (BF16, FP32, I32):
+    if numeric_format in (BF16, FP16, FP32, I32):
         layout = CONTIGUOUS_LAYOUT
     elif numeric_format in (Q4, Q5, Q6, W8):
         layout = ROW_SPLIT_LAYOUT
@@ -391,19 +392,20 @@ def validate_inventory() -> None:
         raise ValueError("registered Qwen3.8 NVFP4 inventory is incomplete")
     if FORMAT_COUNTS != {
         BF16: 534,
+        FP16: 111,
         FP32: 208,
         I32: 1,
-        Q4: 55,
-        Q5: 54,
-        Q6: 1,
-        W8: 7,
+        Q4: 1,
+        Q5: 0,
+        Q6: 0,
+        W8: 5,
         NVFP4: 112,
         FP8: 146,
     }:
         raise ValueError(f"unexpected numeric allocation: {FORMAT_COUNTS}")
     if LAYOUT_COUNTS != {
-        CONTIGUOUS_LAYOUT: 743,
-        ROW_SPLIT_LAYOUT: 117,
+        CONTIGUOUS_LAYOUT: 854,
+        ROW_SPLIT_LAYOUT: 6,
         BLOCK_SCALE_LAYOUT: 112,
         ROW_SCALE_LAYOUT: 146,
     }:

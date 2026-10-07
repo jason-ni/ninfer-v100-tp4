@@ -34,12 +34,13 @@ def test_closed_allocation_inventory_and_site_coverage():
     assert len(inventory.INPUT_SCALE_DIVISOR_SPECS) == 247
     assert inventory.FORMAT_COUNTS == {
         "BF16": 591,
+        "FP16": 111,
         "FP32": 343,
         "I32": 1,
-        "Q4G64_F16S": 55,
-        "Q5G64_F16S": 54,
-        "Q6G64_F16S": 1,
-        "W8G32_F16S": 9,
+        "Q4G64_F16S": 1,
+        "Q5G64_F16S": 0,
+        "Q6G64_F16S": 0,
+        "W8G32_F16S": 7,
         "NVFP4": 247,
     }
     tensors = {spec.name: spec for spec in inventory.TENSOR_SPECS}

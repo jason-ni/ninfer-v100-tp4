@@ -110,10 +110,7 @@ both resources into the 248077-entry token domain.
 | MTP matrices, including routed experts | `W8G32_F16S` |
 | DFlash feature, attention, and MLP matrices | `W8G32_F16S` |
 | DFlash norms | `BF16` |
-| Vision block input/expansion matrices | `Q4G64_F16S` |
-| Vision block output/contraction matrices | `Q5G64_F16S` |
-| Vision patch projection | `Q6G64_F16S` |
-| Vision merger matrices | `W8G32_F16S` |
+| Vision linear matrices (patch projection, block qkv/o_proj/fc1/fc2, merger fc1/fc2) | `FP16` |
 | all other Vision weights and biases | `BF16` |
 
 Every quantized tensor uses encoder profile `MAXABS_F16_RECIP_RNE_V1` and storage layout
@@ -293,7 +290,7 @@ Section 9.3.
 
 | Order | Object name | Shape | Format |
 |---:|---|---|---|
-| 0 | `vision/patch_embedding` | `[1152,1536]` | `Q6G64_F16S` |
+| 0 | `vision/patch_embedding` | `[1152,1536]` | `FP16` |
 | 1 | `vision/patch_embedding_bias` | `[1152]` | `BF16` |
 | 2 | `vision/position_embedding` | `[2304,1152]` | `BF16` |
 
@@ -303,13 +300,13 @@ For every block `b` in `0..26`, emit these twelve objects:
 
 | Order | Object-name pattern | Shape | Format |
 |---:|---|---|---|
-| 0 | `vision/layers/{b}/attention/qkv` | `[3456,1152]` | `Q4G64_F16S` |
+| 0 | `vision/layers/{b}/attention/qkv` | `[3456,1152]` | `FP16` |
 | 1 | `vision/layers/{b}/attention/qkv_bias` | `[3456]` | `BF16` |
-| 2 | `vision/layers/{b}/attention/output` | `[1152,1152]` | `Q5G64_F16S` |
+| 2 | `vision/layers/{b}/attention/output` | `[1152,1152]` | `FP16` |
 | 3 | `vision/layers/{b}/attention/output_bias` | `[1152]` | `BF16` |
-| 4 | `vision/layers/{b}/mlp/fc1` | `[4304,1152]` | `Q4G64_F16S` |
+| 4 | `vision/layers/{b}/mlp/fc1` | `[4304,1152]` | `FP16` |
 | 5 | `vision/layers/{b}/mlp/fc1_bias` | `[4304]` | `BF16` |
-| 6 | `vision/layers/{b}/mlp/fc2` | `[1152,4304]` | `Q5G64_F16S` |
+| 6 | `vision/layers/{b}/mlp/fc2` | `[1152,4304]` | `FP16` |
 | 7 | `vision/layers/{b}/mlp/fc2_bias` | `[1152]` | `BF16` |
 | 8 | `vision/layers/{b}/norm1/weight` | `[1152]` | `BF16` |
 | 9 | `vision/layers/{b}/norm1/bias` | `[1152]` | `BF16` |
@@ -320,9 +317,9 @@ For every block `b` in `0..26`, emit these twelve objects:
 
 | Order | Object name | Shape | Format |
 |---:|---|---|---|
-| 0 | `vision/merger/fc1` | `[4608,4608]` | `W8G32_F16S` |
+| 0 | `vision/merger/fc1` | `[4608,4608]` | `FP16` |
 | 1 | `vision/merger/fc1_bias` | `[4608]` | `BF16` |
-| 2 | `vision/merger/fc2` | `[2048,4608]` | `W8G32_F16S` |
+| 2 | `vision/merger/fc2` | `[2048,4608]` | `FP16` |
 | 3 | `vision/merger/fc2_bias` | `[2048]` | `BF16` |
 | 4 | `vision/merger/norm/weight` | `[1152]` | `BF16` |
 | 5 | `vision/merger/norm/bias` | `[1152]` | `BF16` |
@@ -611,7 +608,7 @@ All sources begin with `model.visual.`.
 
 | Artifact object | Source suffix | Transform |
 |---|---|---|
-| `vision/patch_embedding` | `patch_embed.proj.weight [1152,3,2,16,16]` | contiguous reshape to `[1152,1536]`, quantize Q6 |
+| `vision/patch_embedding` | `patch_embed.proj.weight [1152,3,2,16,16]` | contiguous reshape to `[1152,1536]`, cast to FP16 |
 | `vision/patch_embedding_bias` | `patch_embed.proj.bias [1152]` | preserve BF16 |
 | `vision/position_embedding` | `pos_embed.weight [2304,1152]` | preserve BF16 |
 
@@ -619,13 +616,13 @@ For block `b`, use source prefix `model.visual.blocks.{b}.`:
 
 | Artifact suffix under `vision/layers/{b}/` | Source suffix | Transform |
 |---|---|---|
-| `attention/qkv` | `attn.qkv.weight [3456,1152]` | quantize Q4 |
+| `attention/qkv` | `attn.qkv.weight [3456,1152]` | cast to FP16 |
 | `attention/qkv_bias` | `attn.qkv.bias [3456]` | preserve BF16 |
-| `attention/output` | `attn.proj.weight [1152,1152]` | quantize Q5 |
+| `attention/output` | `attn.proj.weight [1152,1152]` | cast to FP16 |
 | `attention/output_bias` | `attn.proj.bias [1152]` | preserve BF16 |
-| `mlp/fc1` | `mlp.linear_fc1.weight [4304,1152]` | quantize Q4 |
+| `mlp/fc1` | `mlp.linear_fc1.weight [4304,1152]` | cast to FP16 |
 | `mlp/fc1_bias` | `mlp.linear_fc1.bias [4304]` | preserve BF16 |
-| `mlp/fc2` | `mlp.linear_fc2.weight [1152,4304]` | quantize Q5 |
+| `mlp/fc2` | `mlp.linear_fc2.weight [1152,4304]` | cast to FP16 |
 | `mlp/fc2_bias` | `mlp.linear_fc2.bias [1152]` | preserve BF16 |
 | `norm1/weight` | `norm1.weight [1152]` | preserve BF16 |
 | `norm1/bias` | `norm1.bias [1152]` | preserve BF16 |
@@ -636,9 +633,9 @@ For source prefix `model.visual.merger.`:
 
 | Artifact suffix under `vision/merger/` | Source suffix | Transform |
 |---|---|---|
-| `fc1` | `linear_fc1.weight [4608,4608]` | quantize W8 |
+| `fc1` | `linear_fc1.weight [4608,4608]` | cast to FP16 |
 | `fc1_bias` | `linear_fc1.bias [4608]` | preserve BF16 |
-| `fc2` | `linear_fc2.weight [2048,4608]` | quantize W8 |
+| `fc2` | `linear_fc2.weight [2048,4608]` | cast to FP16 |
 | `fc2_bias` | `linear_fc2.bias [2048]` | preserve BF16 |
 | `norm/weight` | `norm.weight [1152]` | preserve BF16 |
 | `norm/bias` | `norm.bias [1152]` | preserve BF16 |

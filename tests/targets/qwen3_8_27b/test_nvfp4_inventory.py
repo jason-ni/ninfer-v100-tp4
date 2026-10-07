@@ -18,18 +18,19 @@ def test_complete_nvfp4_inventory_and_format_allocation() -> None:
     assert len(inventory.RESOURCE_SPECS) == 6
     assert inventory.FORMAT_COUNTS == {
         "BF16": 534,
+        "FP16": 111,
         "FP32": 208,
         "I32": 1,
-        "Q4G64_F16S": 55,
-        "Q5G64_F16S": 54,
-        "Q6G64_F16S": 1,
-        "W8G32_F16S": 7,
+        "Q4G64_F16S": 1,
+        "Q5G64_F16S": 0,
+        "Q6G64_F16S": 0,
+        "W8G32_F16S": 5,
         "NVFP4": 112,
         "FP8_E4M3FN_ROW_BF16S": 146,
     }
     assert inventory.LAYOUT_COUNTS == {
-        "contiguous-le-v1": 743,
-        "row-split-k128-v1": 117,
+        "contiguous-le-v1": 854,
+        "row-split-k128-v1": 6,
         "blockscale-k16-m128x4-v1": 112,
         "row-scale-v1": 146,
     }
@@ -89,13 +90,13 @@ def test_closed_dual_source_recipe_and_tensor_ownership() -> None:
         len(recipe.QUANTIZED_DIRECT_RECIPES),
         len(recipe.OFFICIAL_RECIPES),
         len(recipe.SOURCE_REQUIREMENTS),
-    ) == (145, 112, 112, 56, 233, 168, 401, 348, 1587)
+    ) == (145, 112, 112, 56, 233, 168, 401, 348, 1586)
     dtype_counts: dict[str, int] = {}
     for _, dtype in recipe.SOURCE_REQUIREMENTS.values():
         dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
     assert dtype_counts == {
         "BF16": 682,
-        "F8_E4M3": 401,
+        "F8_E4M3": 400,
         "U8": 168,
         "F32": 336,
     }

@@ -123,6 +123,12 @@ preserving packed bytes alone does not prove absence of end-to-end quality loss.
 
 The five published identities retain Text, image/video Vision, MTP, prefix reuse, CLI,
 OpenAI/Anthropic serving, and measurement through the same public `.ninfer` Engine route.
+The Vision tower weights are native FP16 (cast from the official BF16 source), and at
+tensor-parallel width greater than one the tower is sharded across the rank group: qkv (and its
+column-parallel bias) by head, `o_proj`/`fc2`/merger `fc2` row-parallel, and `fc1`/merger `fc1`
+column-parallel; `patch_embedding`, the position embedding, every norm, and the row-parallel
+(output-projection) biases are replicated, and `allreduce_sum` in the row-parallel joins is the
+tower's only collective.
 The GGUF-derived identity uses this same route for Text/MTP and rejects Vision; its retained
 Vision objects are validation-only. The 35B-A3B target additionally supports text-only DFlash.
 Qwen3.8-27B artifacts containing the optional DFlash2 package also support text-only DFlash,

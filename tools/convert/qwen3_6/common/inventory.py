@@ -15,6 +15,7 @@ ROW_SPLIT_LAYOUT = "row-split-k128-v1"
 RESOURCE_ENCODING = "raw-bytes-v1"
 
 BF16 = "BF16"
+FP16 = "FP16"
 FP32 = "FP32"
 I32 = "I32"
 Q4 = "Q4G64_F16S"
@@ -22,8 +23,8 @@ Q5 = "Q5G64_F16S"
 Q6 = "Q6G64_F16S"
 W8 = "W8G32_F16S"
 
-DIRECT_FORMATS = frozenset((BF16, FP32, I32))
-FORMAT_NAMES = (BF16, FP32, I32, Q4, Q5, Q6, W8)
+DIRECT_FORMATS = frozenset((BF16, FP16, FP32, I32))
+FORMAT_NAMES = (BF16, FP16, FP32, I32, Q4, Q5, Q6, W8)
 LAYOUT_NAMES = (CONTIGUOUS_LAYOUT, ROW_SPLIT_LAYOUT)
 
 VISION_LAYERS = tuple(range(27))
@@ -104,7 +105,7 @@ def build_vision_specs(text_width: int) -> tuple[TensorSpec, ...]:
     """Build the shared Qwen3.6 Vision inventory for a target text width."""
 
     specs: list[TensorSpec] = [
-        tensor_spec("vision/patch_embedding", (1152, 1536), Q6),
+        tensor_spec("vision/patch_embedding", (1152, 1536), FP16),
         tensor_spec("vision/patch_embedding_bias", (1152,), BF16),
         tensor_spec("vision/position_embedding", (2304, 1152), BF16),
     ]
@@ -113,13 +114,13 @@ def build_vision_specs(text_width: int) -> tuple[TensorSpec, ...]:
         prefix = f"vision/layers/{layer}/"
         specs.extend(
             (
-                tensor_spec(prefix + "attention/qkv", (3456, 1152), Q4),
+                tensor_spec(prefix + "attention/qkv", (3456, 1152), FP16),
                 tensor_spec(prefix + "attention/qkv_bias", (3456,), BF16),
-                tensor_spec(prefix + "attention/output", (1152, 1152), Q5),
+                tensor_spec(prefix + "attention/output", (1152, 1152), FP16),
                 tensor_spec(prefix + "attention/output_bias", (1152,), BF16),
-                tensor_spec(prefix + "mlp/fc1", (4304, 1152), Q4),
+                tensor_spec(prefix + "mlp/fc1", (4304, 1152), FP16),
                 tensor_spec(prefix + "mlp/fc1_bias", (4304,), BF16),
-                tensor_spec(prefix + "mlp/fc2", (1152, 4304), Q5),
+                tensor_spec(prefix + "mlp/fc2", (1152, 4304), FP16),
                 tensor_spec(prefix + "mlp/fc2_bias", (1152,), BF16),
                 tensor_spec(prefix + "norm1/weight", (1152,), BF16),
                 tensor_spec(prefix + "norm1/bias", (1152,), BF16),
@@ -130,9 +131,9 @@ def build_vision_specs(text_width: int) -> tuple[TensorSpec, ...]:
 
     specs.extend(
         (
-            tensor_spec("vision/merger/fc1", (4608, 4608), W8),
+            tensor_spec("vision/merger/fc1", (4608, 4608), FP16),
             tensor_spec("vision/merger/fc1_bias", (4608,), BF16),
-            tensor_spec("vision/merger/fc2", (text_width, 4608), W8),
+            tensor_spec("vision/merger/fc2", (text_width, 4608), FP16),
             tensor_spec("vision/merger/fc2_bias", (text_width,), BF16),
             tensor_spec("vision/merger/norm/weight", (1152,), BF16),
             tensor_spec("vision/merger/norm/bias", (1152,), BF16),
@@ -146,6 +147,7 @@ __all__ = [
     "CONTIGUOUS_LAYOUT",
     "DIRECT_FORMATS",
     "FORMAT_NAMES",
+    "FP16",
     "FP32",
     "I32",
     "LAYOUT_NAMES",

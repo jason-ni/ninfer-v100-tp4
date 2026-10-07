@@ -99,7 +99,7 @@ class RowPlanes:
 
 
 CONTIGUOUS_LE_V1 = Layout(
-    "contiguous-le-v1", 256, frozenset(("BF16", "FP32", "I32"))
+    "contiguous-le-v1", 256, frozenset(("BF16", "FP16", "FP32", "I32"))
 )
 ROW_SPLIT_K128_V1 = Layout(
     "row-split-k128-v1",
@@ -335,6 +335,7 @@ def validate_ggml_k_payload(shape: Sequence[int], payload: bytes | memoryview) -
 
 _DIRECT_DTYPES = {
     "BF16": torch.bfloat16,
+    "FP16": torch.float16,
     "FP32": torch.float32,
     "I32": torch.int32,
 }
@@ -345,7 +346,7 @@ def encode_direct(tensor: torch.Tensor, format: str | DirectFormat) -> bytes:
 
     spec = _format(format)
     if not isinstance(spec, DirectFormat):
-        raise ValueError("direct encoding requires BF16, FP32, or I32")
+        raise ValueError("direct encoding requires BF16, FP16, FP32, or I32")
     expected_dtype = _DIRECT_DTYPES[spec.name]
     if tensor.dtype != expected_dtype:
         raise TypeError(
@@ -389,7 +390,7 @@ def decode_direct(
 
     spec = _format(format)
     if not isinstance(spec, DirectFormat):
-        raise ValueError("direct decoding requires BF16, FP32, or I32")
+        raise ValueError("direct decoding requires BF16, FP16, FP32, or I32")
     dims = _shape(shape)
     if len(dims) > 16:
         raise ValueError("contiguous-le-v1 supports rank 0 through 16")

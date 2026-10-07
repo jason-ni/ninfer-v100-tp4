@@ -99,11 +99,26 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
     if (state.dflash != nullptr) {
         throw std::logic_error("DFlash staged multimodal prefill is unavailable");
     }
+    auto tp = tp_execution(state.execution);
+    if (state.execution.tp > 1) {
+        // Same per-request MTP KV window binding the plain text prefill makes: the window is
+        // request state, so it comes from the PrefillContext rather than the process-lifetime peer
+        // core. Without it a tp>1 multimodal chunk would build a single-device card and fall into
+        // the tp1 schedule entirely.
+        for (int rank = 1; rank < state.execution.tp; ++rank) {
+            TpExecution& peer = *tp[rank];
+            peer.mtp_kv = state.mtp_kv_peer[rank];
+            if (peer.mtp_kv.valid() != state.mtp_kv.valid()) {
+                throw std::logic_error("tensor-parallel MTP KV windows disagree between ranks");
+            }
+        }
+    }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.execution.rope_frequency, state.text_kv,
                      state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     state.execution.tp > 1 ? &tp : nullptr);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
@@ -127,8 +142,8 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
     CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
 
-    Tensor visual_embedding;
-    const Tensor* composed_embedding = nullptr;
+    std::array<Tensor, kMaximumDevices> visual_embeddings{};
+    const std::array<Tensor, kMaximumDevices>* composed_embeddings = nullptr;
     if (prompt.token_types[state.text_kv_base] != 0) {
         const VisionChunk chunk = vision.prepare_chunk(state.text_kv_base, 1);
         if (chunk.control == nullptr) {
@@ -142,13 +157,26 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
                 prompt.token_types[state.text_kv_base]) {
             throw std::logic_error("visual MTP bridge does not match Vision scatter metadata");
         }
-        visual_embedding =
-            chunk.embeddings.slice(1, static_cast<std::int32_t>(column - scatter.begin()), 1);
-        composed_embedding = &visual_embedding;
+        const auto visual_column = static_cast<std::int32_t>(column - scatter.begin());
+        if (state.execution.tp > 1) {
+            if (!vision.tensor_parallel()) {
+                throw std::logic_error(
+                    "tensor-parallel visual MTP bridge requires a sharded Vision session");
+            }
+            // The Vision session keeps a replicated [H, merged] copy of the last encoded item on
+            // every rank, so each embedding rank reads its own local column with no transfer.
+            const auto& per_rank = vision.tp_embeddings();
+            for (int rank = 0; rank < state.execution.tp; ++rank) {
+                visual_embeddings[rank] = per_rank[rank].slice(1, visual_column, 1);
+            }
+        } else {
+            visual_embeddings[0] = chunk.embeddings.slice(1, visual_column, 1);
+        }
+        composed_embeddings = &visual_embeddings;
     }
 
     mtp_bridge_and_propose(state, bridge_token, *bridge.previous_hidden, bridge.position,
-                           bridge.rope_position, false, composed_embedding);
+                           bridge.rope_position, false, composed_embeddings);
 }
 
 std::array<Tensor, kMaximumDevices> resume_hidden(ExecutionCore& execution, const Tensor& hidden) {

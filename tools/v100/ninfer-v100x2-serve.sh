@@ -11,7 +11,7 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd -- "${script_dir}/../.." && pwd)
 
-executable=${NINFER_V100X2_SERVE_EXECUTABLE:-"${repo_dir}/build-v100/apps/ninfer-serve"}
+executable=${NINFER_V100X2_SERVE_EXECUTABLE:-"${repo_dir}/dist/ninfer-serve"}
 artifact=${NINFER_V100X2_SERVE_ARTIFACT:-/media/zt/models/orcarouter/qwen3_8_27b_nvfp4.ninfer}
 host=${NINFER_V100X2_SERVE_HOST:-0.0.0.0}
 port=${NINFER_V100X2_SERVE_PORT:-8081}

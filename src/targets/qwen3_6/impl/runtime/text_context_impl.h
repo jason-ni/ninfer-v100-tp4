@@ -1453,11 +1453,15 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData&
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
     }
-    if (tensor_parallel()) {
-        throw std::logic_error("multimodal prefill has no tensor-parallel path in this build");
-    }
     const std::span<const int> tokens(input.token_ids);
     const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
+    if (tensor_parallel()) {
+        // Vision is encoded sharded across the group (see prefill_impl_parallel), then its
+        // replicated embeddings are scattered into every rank's residual before the parallel text
+        // layers run.
+        return prefill_impl_parallel(tokens.subspan(begin, nominal_length), TextPrefill{tokens, begin},
+                                     finalize_at_end, nullptr, &multimodal);
+    }
     NullTap tap;
     return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, tap,
                         finalize_at_end);
@@ -2115,9 +2119,10 @@ void TextContext::target_argmax_parallel(const std::array<Tensor, kMaximumDevice
 }
 
 PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
-                                                 const TextPrefill& text_prefill,
-                                                 bool finalize_at_end,
-                                                 DFlashFeatureSink* dflash_sink) {
+                                                  const TextPrefill& text_prefill,
+                                                  bool finalize_at_end,
+                                                  DFlashFeatureSink* dflash_sink,
+                                                  const MultimodalPrefill* multimodal) {
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill token count exceeds int32");
@@ -2158,8 +2163,36 @@ PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
 
     int len = std::min(chunk, T);
     if (checkpoint_rel > 0 && len > checkpoint_rel) { len = checkpoint_rel; }
-    const bool is_last                = finalize_at_end && len == T;
-    const bool prepare_mtp_prompt     = mtp_enabled() && io_.mtp.has_value();
+
+    // Multimodal: encode any vision in this chunk (sharded across the group) and learn the actual
+    // token count plus the per-chunk scatter layout. The replicated embeddings are scattered into
+    // each rank's residual below, so no cross-device transfer is needed.
+    VisionChunk vision_chunk;
+    std::vector<std::int32_t> local_scatter_indices;
+    std::int32_t visual_begin = 0;
+    if (multimodal != nullptr) {
+        if (multimodal->vision == nullptr || !multimodal->vision->tensor_parallel()) {
+            throw std::logic_error(
+                "tensor-parallel multimodal prefill requires a sharded Vision session");
+        }
+        const std::uint32_t prompt_t0 = static_cast<std::uint32_t>(base_i);
+        vision_chunk                  = multimodal->vision->prepare_chunk(
+            prompt_t0, static_cast<std::uint32_t>(len));
+        len = vision_chunk.length;
+        if (vision_chunk.control != nullptr) {
+            const auto scatter = std::span<const std::int32_t>(vision_chunk.control->scatter_indices);
+            const auto begin   = std::lower_bound(scatter.begin(), scatter.end(), prompt_t0);
+            const auto end     = std::lower_bound(begin, scatter.end(), prompt_t0 + len);
+            visual_begin       = static_cast<std::int32_t>(begin - scatter.begin());
+            local_scatter_indices.resize(static_cast<std::size_t>(end - begin));
+            for (std::size_t i = 0; i < local_scatter_indices.size(); ++i) {
+                local_scatter_indices[i] = begin[i] - static_cast<std::int32_t>(prompt_t0);
+            }
+        }
+    }
+    const bool is_last          = finalize_at_end && len == T;
+    const bool prepare_mtp_prompt = mtp_enabled() && io_.mtp.has_value();
+    const int rope_axes         = multimodal != nullptr ? 3 : 0;
     nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                   static_cast<std::uint64_t>(len));
     for (int rank = 0; rank < tp_count_; ++rank) { ws[rank]->reset(); }
@@ -2172,19 +2205,51 @@ PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
         std::array<Tensor, kMaximumDevices> positions;
         std::array<Tensor, kMaximumDevices> x;
         std::array<Tensor, kMaximumDevices> staging;
+        // rope_positions / scatter_indices are allocated only when multimodal (rope_axes > 0) and a
+        // visual span is present, respectively; they stay default-constructed otherwise.
+        std::array<Tensor, kMaximumDevices> rope_positions;
+        std::array<Tensor, kMaximumDevices> scatter_indices_device;
         for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-            const auto roots = workspace_recipe::text_prefill_roots<TextConfig>(*ws[r], len, 0, 0);
+            const auto roots = workspace_recipe::text_prefill_roots<TextConfig>(
+                *ws[r], len, rope_axes, static_cast<std::int32_t>(local_scatter_indices.size()));
             ids_device[r]    = roots.ids;
             positions[r]     = roots.positions;
             x[r]             = roots.residual;
             staging[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, len});
+            rope_positions[r] = roots.rope_positions;
+            scatter_indices_device[r] = roots.scatter_indices;
+        }
+        // The 3-axis MRoPE positions are replicated across ranks, so build the host copy once and
+        // upload to each rank (identical layout to the tp1 path).
+        std::vector<std::int32_t> rope_positions_host;
+        if (multimodal != nullptr) {
+            rope_positions_host.resize(static_cast<std::size_t>(3) * len);
+            const std::size_t prompt_tokens = multimodal->token_ids.size();
+            for (int axis = 0; axis < 3; ++axis) {
+                const auto* src = multimodal->positions.data() +
+                                  static_cast<std::size_t>(axis) * prompt_tokens + base_i;
+                std::copy_n(src, len,
+                            rope_positions_host.data() + static_cast<std::size_t>(axis) * len);
+            }
         }
         for_each_rank(execution, [&](int rank) {
             const auto r   = static_cast<std::size_t>(rank);
             cudaStream_t s = stream_for(rank);
             copy_i32(ids.data(), ids_device[r], s);
             ops::fill_i32_positions(positions[r], base_i, s);
+            if (multimodal != nullptr) {
+                copy_i32(rope_positions_host.data(), rope_positions[r], s);
+            }
             ops::embedding(ids_device[r], rank == 0 ? *embed_ : *embed_peer_[r], x[r], s);
+            // Scatter the replicated vision embeddings into this rank's residual at the visual
+            // positions; each rank reads its own local copy (no cross-device transfer).
+            if (!local_scatter_indices.empty()) {
+                copy_i32(local_scatter_indices.data(), scatter_indices_device[r], s);
+                const Tensor& emb = multimodal->vision->tp_embeddings()[r];
+                Tensor embeddings = emb.slice(1, visual_begin,
+                                              static_cast<std::int32_t>(local_scatter_indices.size()));
+                ops::scatter(embeddings, scatter_indices_device[r], x[r], s);
+            }
         });
 
         std::array<std::optional<ScopedValue<const Tensor*>>, kMaximumDevices> peer_cache;
@@ -2193,12 +2258,14 @@ PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
         for (int rank = 1; rank < tp_count_; ++rank) {
             const auto r = static_cast<std::size_t>(rank);
             peer_cache[rank].emplace(peer_cache_positions_[r], &positions[r]);
-            peer_rope[rank].emplace(peer_rope_positions_[r], &positions[r]);
+            peer_rope[rank].emplace(peer_rope_positions_[r],
+                                    multimodal != nullptr ? &rope_positions[r] : &positions[r]);
             peer_rows[rank].emplace(peer_kv_table_rows_[r],
                                     &tp_at(rank).io->text_kv_table_row);
         }
         ScopedPositions scoped_cache(active_cache_positions_, positions[0]);
-        ScopedPositions scoped_rope(active_rope_positions_, positions[0]);
+        ScopedPositions scoped_rope(
+            active_rope_positions_, multimodal != nullptr ? rope_positions[0] : positions[0]);
         const auto visible = static_cast<std::uint32_t>(base_i + len);
         const ops::GqaExecutionEnvelope chunk_envelope{visible, visible};
         ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
@@ -2486,7 +2553,8 @@ void TextContext::ordinary_decode_batch_parallel(const Tensor& ids, const Tensor
 
 void TextContext::mtp_forward_stem_parallel(const Tensor& ids, const std::array<Tensor, kMaximumDevices>& hidden,
                                        std::array<Tensor, kMaximumDevices>& x, std::array<Tensor, kMaximumDevices>& ah,
-                                       const std::array<Tensor, kMaximumDevices>& staging) {
+                                       const std::array<Tensor, kMaximumDevices>& staging,
+                                       const std::array<Tensor, kMaximumDevices>* input_embeddings) {
     const ExecutionContext& execution       = ec();
     const std::array<WorkspaceArena*, kMaximumDevices> ws = workspaces();
     const int T                             = ids.ne[0] * ids.ne[1];
@@ -2500,7 +2568,6 @@ void TextContext::mtp_forward_stem_parallel(const Tensor& ids, const std::array<
                 "tensor-parallel MTP stem hidden does not match the token count");
         }
     }
-    Tensor flat_ids = ids.view({T});
 
     // Which ranks own which packed rows. Device r contracts packed rows
     // [r*chunk, (r+1)*chunk) with chunk = mtp_input_rows / tp, and the packed layout is
@@ -2511,13 +2578,24 @@ void TextContext::mtp_forward_stem_parallel(const Tensor& ids, const std::array<
     // still hands ops::linear_row_parallel a contiguous [chunk, T] slice of the normalized half.
     const std::int32_t chunk     = kCfg.mtp_fc_in / tp_width();
     const std::int32_t emb_ranks = kCfg.hidden / chunk;
-    // The token embedding is replicated on every device, so an embedding rank computes the full
-    // normalized embedding and keeps its slice; a hidden rank normalizes the replicated target
-    // hidden. Rank 0 is always an embedding rank (`emb_ranks >= 1` for the tp > 1 widths here).
+    // When the caller supplies the composed input embeddings (a visual bridge token whose features
+    // come from the Vision tower rather than the token table), every embedding rank must already
+    // hold its own [hidden, T] copy: rank 0 is the caller's transient and the peers are the Vision
+    // session's replicated buffers, so there is no cross-device transfer here.
+    if (input_embeddings != nullptr) {
+        for (int rank = 0; rank < emb_ranks; ++rank) {
+            const Tensor& emb = (*input_embeddings)[static_cast<std::size_t>(rank)];
+            if (emb.dtype != DType::BF16 || emb.ne[0] != kCfg.hidden || emb.ne[1] != T ||
+                emb.ne[2] != 1 || emb.ne[3] != 1 || !emb.is_contiguous() || emb.data == nullptr) {
+                throw std::invalid_argument("tensor-parallel MTP input embeddings shape mismatch");
+            }
+        }
+    }
     std::array<workspace_recipe::MtpStemRoots, kMaximumDevices> roots;
     for (int rank = 0; rank < tp_count_; ++rank) {
         roots[rank] = workspace_recipe::mtp_stem<TextConfig>(
-            *ws[rank], T, /*allocate_embedding=*/rank < emb_ranks, tp_width());
+            *ws[rank], T,
+            /*allocate_embedding=*/input_embeddings == nullptr && rank < emb_ranks, tp_width());
     }
     for (int rank = 0; rank < tp_count_; ++rank) {
         const auto r = static_cast<std::size_t>(rank);
@@ -2532,14 +2610,18 @@ void TextContext::mtp_forward_stem_parallel(const Tensor& ids, const std::array<
     // pointer) from rank 1 is an illegal cross-device access. The ids live on rank 0 and are
     // produced on rank 0's stream, so replicating them is a rank-0 broadcast: the ordered pull
     // (`broadcast_rank0`) records rank 0's stream, has each peer wait, then copy -- capture-safe,
-    // and empty at tp == 2 because `emb_ranks == 1` there.
+    // and empty at tp == 2 because `emb_ranks == 1` there. A supplied input embedding needs no
+    // broadcast because it is already replicated on every embedding rank.
     std::array<Tensor, kMaximumDevices> rank_ids;
-    rank_ids[0] = flat_ids;
-    if (emb_ranks > 1) {
-        for (int rank = 1; rank < tp_count_; ++rank) {
-            rank_ids[rank] = ws[rank]->alloc(DType::I32, {T});
+    if (input_embeddings == nullptr) {
+        Tensor flat_ids = ids.view({T});
+        rank_ids[0] = flat_ids;
+        if (emb_ranks > 1) {
+            for (int rank = 1; rank < tp_count_; ++rank) {
+                rank_ids[rank] = ws[rank]->alloc(DType::I32, {T});
+            }
+            ops::broadcast_rank0(flat_ids, rank_ids, execution, *events_);
         }
-        ops::broadcast_rank0(flat_ids, rank_ids, execution, *events_);
     }
 
     // `ops::mtp_pack_fc_input` is NOT called here, and the packed [10240, T] buffer is not even
@@ -2558,11 +2640,17 @@ void TextContext::mtp_forward_stem_parallel(const Tensor& ids, const std::array<
         const auto r   = static_cast<std::size_t>(rank);
         cudaStream_t s = stream_for(rank);
         if (rank < emb_ranks) {
-            const Weight* emb = rank == 0 ? embed_ : embed_peer_[r];
-            Tensor emb_out     = roots[r].embedding;
-            ops::embedding(rank_ids[r], *emb, emb_out, s);
-            ops::rmsnorm(emb_out, *mtp_weights_for(rank).pre_fc_norm_embedding, kCfg.rms_eps, true,
-                         roots[r].normalized_embedding, s);
+            if (input_embeddings != nullptr) {
+                Tensor emb_in = (*input_embeddings)[r].view({kCfg.hidden, T});
+                ops::rmsnorm(emb_in, *mtp_weights_for(rank).pre_fc_norm_embedding, kCfg.rms_eps,
+                             true, roots[r].normalized_embedding, s);
+            } else {
+                const Weight* emb = rank == 0 ? embed_ : embed_peer_[r];
+                Tensor emb_out     = roots[r].embedding;
+                ops::embedding(rank_ids[r], *emb, emb_out, s);
+                ops::rmsnorm(emb_out, *mtp_weights_for(rank).pre_fc_norm_embedding, kCfg.rms_eps,
+                             true, roots[r].normalized_embedding, s);
+            }
         } else {
             const Tensor flat_hidden = hidden[r].view({kCfg.hidden, T});
             ops::rmsnorm(flat_hidden, *mtp_weights_for(rank).pre_fc_norm_hidden, kCfg.rms_eps, true,
@@ -2730,7 +2818,8 @@ void TextContext::mtp_forward_core_parallel(const Tensor& ids, const std::array<
                                        const std::array<Tensor, kMaximumDevices>& positions,
                                        const std::array<Tensor, kMaximumDevices>& rope_positions,
                                        ops::GqaExecutionEnvelope envelope,
-                                       const std::array<Tensor, kMaximumDevices>& mtp_hidden) {
+                                       const std::array<Tensor, kMaximumDevices>& mtp_hidden,
+                                       const std::array<Tensor, kMaximumDevices>* input_embeddings) {
     if (batch_mtp_kv_ == nullptr) {
         throw std::runtime_error("MTP forward is not enabled");
     }
@@ -2751,7 +2840,7 @@ void TextContext::mtp_forward_core_parallel(const Tensor& ids, const std::array<
     }
     std::array<Tensor, kMaximumDevices> x;
     std::array<Tensor, kMaximumDevices> ah;
-    mtp_forward_stem_parallel(ids, hidden, x, ah, staging);
+    mtp_forward_stem_parallel(ids, hidden, x, ah, staging, input_embeddings);
     mtp_forward_tail_parallel(x, ah, positions, rope_positions, envelope, mtp_hidden, staging);
 }
 
@@ -3141,7 +3230,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const std::array<Tensor, 
                                     const std::array<Tensor, kMaximumDevices>& rope_positions,
                                     ops::GqaExecutionEnvelope envelope,
                                     const std::array<Tensor, kMaximumDevices>& mtp_hidden, int logits_column,
-                                    const std::array<Tensor, kMaximumDevices>* logits, Tensor* draft_token) {
+                                    const std::array<Tensor, kMaximumDevices>* logits, Tensor* draft_token,
+                                    const std::array<Tensor, kMaximumDevices>* input_embeddings) {
     if (!tensor_parallel()) { throw std::logic_error("tensor-parallel MTP batch requires a peer"); }
     if (batch_mtp_kv_ == nullptr) {
         throw std::runtime_error("MTP forward is not enabled");
@@ -3178,7 +3268,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const std::array<Tensor, 
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP draft token");
     }
 
-    mtp_forward_core_parallel(ids, hidden, positions, rope_positions, envelope, mtp_hidden);
+    mtp_forward_core_parallel(ids, hidden, positions, rope_positions, envelope, mtp_hidden,
+                              input_embeddings);
     if (logits_column >= 0) {
         std::array<Tensor, kMaximumDevices> columns;
         for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {

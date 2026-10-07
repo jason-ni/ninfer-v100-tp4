@@ -440,6 +440,9 @@ ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_fp16_a16_test
+  SOURCES ops/linear/test_fp16_a16.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_attn_input_proj_test
   SOURCES ops/test_attn_input_proj.cpp
   LIBRARIES ninfer_ops)

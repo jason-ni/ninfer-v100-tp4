@@ -97,6 +97,7 @@ std::uint64_t require_unsigned(const Json& value, std::string_view label, bool p
 
 NumericFormat parse_format(std::string_view name) {
     if (name == "BF16") { return NumericFormat::BF16; }
+    if (name == "FP16") { return NumericFormat::FP16; }
     if (name == "FP32") { return NumericFormat::FP32; }
     if (name == "I32") { return NumericFormat::I32; }
     if (name == "Q4G64_F16S") { return NumericFormat::Q4G64_F16S; }
@@ -437,7 +438,7 @@ public:
             const auto kind = require_string(object->at("kind"), "v3 object kind");
             if (kind == "tensor") {
                 static const std::map<std::string, std::string, std::less<>> formats = {
-                    {"bf16", "BF16"}, {"fp32", "FP32"}, {"int32", "I32"},
+                    {"bf16", "BF16"}, {"fp16", "FP16"}, {"fp32", "FP32"}, {"int32", "I32"},
                     {"q4_g64_fp16", "Q4G64_F16S"}, {"q5_g64_fp16", "Q5G64_F16S"},
                     {"q6_g64_fp16", "Q6G64_F16S"}, {"q8_g32_fp16", "W8G32_F16S"},
                     {"nvfp4", "NVFP4"}, {"fp8_e4m3fn_row_bf16", "FP8_E4M3FN_ROW_BF16S"},
