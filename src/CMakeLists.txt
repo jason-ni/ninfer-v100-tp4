@@ -377,7 +377,8 @@ endif()
 add_library(ninfer_engine STATIC
   targets/registry.cpp
   runtime/contract/sampling.cpp
-  runtime/engine/engine.cpp)
+  runtime/engine/engine.cpp
+  runtime/engine/raw_output_log.cpp)
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 

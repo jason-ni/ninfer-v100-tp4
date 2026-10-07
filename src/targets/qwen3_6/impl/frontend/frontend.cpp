@@ -758,9 +758,10 @@ public:
 class OutputSession::Impl {
 public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
-         bool starts_in_reasoning)
+         bool starts_in_reasoning, std::vector<TokenId> debug_prompt_tail_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
-          preserve_special(output.raw || output.preserve_special_tokens) {
+          preserve_special(output.raw || output.preserve_special_tokens),
+          debug_prompt_tail(std::move(debug_prompt_tail_)) {
         state.in_reasoning = starts_in_reasoning && !output.raw;
     }
 
@@ -771,6 +772,7 @@ public:
     DecoderState preview_state;
     PublishedOutput preview_output;
     bool preview_ready = false;
+    std::vector<TokenId> debug_prompt_tail;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -951,6 +953,38 @@ PublishedOutput OutputSession::commit_preview() noexcept {
 
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {
     return impl_ != nullptr ? impl_->state.reasoning_tokens : 0;
+}
+
+namespace {
+
+// TEMPORARY debug capture aid: decode a token range with the session's detokenization options, the
+// same byte-to-text path the reasoning parser uses (maximal-subpart U+FFFD replacement).
+std::string debug_decode_ids(const fi::Tokenizer& tokenizer, bool skip_special,
+                             std::span<const TokenId> ids) {
+    std::string bytes;
+    for (const TokenId token : ids) {
+        if (!tokenizer.is_valid_token(token)) {
+            throw std::out_of_range("token is outside the checkpoint vocabulary: " +
+                                    std::to_string(token));
+        }
+        bytes += tokenizer.decode_token_bytes(token, skip_special);
+    }
+    std::string text;
+    const std::size_t resolved = decode_utf8_prefix(bytes, text);
+    if (resolved < bytes.size()) { text.append(kReplacementCharacter); }
+    return text;
+}
+
+} // namespace
+
+std::string OutputSession::debug_raw_text(std::span<const TokenId> tokens) const {
+    if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
+    return debug_decode_ids(*impl_->tokenizer, !impl_->preserve_special, tokens);
+}
+
+std::string OutputSession::debug_prompt_tail() const {
+    if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
+    return debug_decode_ids(*impl_->tokenizer, !impl_->preserve_special, impl_->debug_prompt_tail);
 }
 
 Frontend::Frontend(std::shared_ptr<const Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1135,8 +1169,16 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
+    // TEMPORARY debug capture aid: keep the tail of the prompt so a caller can see whether the
+    // model was fed a continuation (e.g. a prompt ending mid-tool-call). Cheap: a bounded copy.
+    constexpr std::size_t kDebugPromptTailTokens = 1024;
+    const auto& ids = prompt.data_->token_ids;
+    const std::size_t tail_size = std::min(kDebugPromptTailTokens, ids.size());
+    std::vector<TokenId> debug_prompt_tail(ids.end() - static_cast<std::ptrdiff_t>(tail_size),
+                                           ids.end());
     return OutputSession(std::make_unique<OutputSession::Impl>(
-        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning));
+        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning,
+        std::move(debug_prompt_tail)));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

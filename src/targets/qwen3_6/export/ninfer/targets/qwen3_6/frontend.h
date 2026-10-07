@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6 {
@@ -102,6 +103,17 @@ public:
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview() noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
+
+    // TEMPORARY debug capture aid (see runtime/engine/raw_output_log.h). Decodes the committed
+    // generated-token stream with this session's own detokenization options and returns exactly the
+    // text the reasoning/content parser routed — the structural `</think>` / `<tool_call>` markers
+    // are NOT stripped, so a caller can see the raw shard the parser decided on. Not part of the
+    // product output contract; remove with the raw-output capture.
+    [[nodiscard]] std::string debug_raw_text(std::span<const TokenId> tokens) const;
+
+    // TEMPORARY debug capture aid: decodes the tail of the prompt this session was built from, so a
+    // caller can see whether the model was fed a continuation (e.g. a prompt ending mid-tool-call).
+    [[nodiscard]] std::string debug_prompt_tail() const;
 
 private:
     class Impl;

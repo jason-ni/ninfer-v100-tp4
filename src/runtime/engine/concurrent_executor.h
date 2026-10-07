@@ -6,6 +6,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
+#include "runtime/engine/raw_output_log.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
@@ -458,7 +459,39 @@ private:
         request->cv.notify_one();
     }
 
+    // TEMPORARY debug capture (see runtime/engine/raw_output_log.h). Best-effort: any failure here
+    // is swallowed so the capture can never turn a real request into an error.
+    void log_raw_output(const std::shared_ptr<Request>& request, FinishReason reason) const {
+        RawOutputLog& log = RawOutputLog::instance();
+        if (!log.enabled()) { return; }
+        try {
+            RawOutputRecord record;
+            record.request_id = request->id;
+            record.timestamp_unix_ms = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count());
+            record.prompt_tokens    = request->prompt_summary.prompt_tokens;
+            record.reasoning_tokens = request->output.reasoning_tokens();
+            record.finish_reason    = reason;
+            record.raw              = request->options.output.raw;
+            record.preserve_special = request->options.output.preserve_special_tokens;
+            record.token_ids        = request->generated;
+            record.reasoning        = request->reasoning;
+            record.content          = request->content;
+            record.raw_text         = request->output.debug_raw_text(request->generated);
+            record.prompt_tail      = request->output.debug_prompt_tail();
+            if (request->begin) {
+                record.reused_prompt_tokens = request->begin->reused_prompt_tokens;
+                record.prefix_reuse_path    = request->begin->prefix_reuse_path;
+                record.prefix_reuse_reason  = request->begin->prefix_reuse_reason;
+            }
+            log.write(record);
+        } catch (...) {}
+    }
+
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
+        log_raw_output(request, reason);
         release_planning_state(request);
         request->prompt = {};
         GenerationResult result;
