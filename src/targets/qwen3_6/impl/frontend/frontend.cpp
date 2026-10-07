@@ -555,6 +555,13 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
                  best_match);
 }
 
+// The byte after a candidate `</think>` decides whether it is the structural reasoning close. The
+// model leaves thinking with the exact sequence `\n</think>\n\n`, so a structural close is followed
+// by a line boundary. The identical token also appears as ordinary text whenever the model quotes
+// the tag (a markdown code span, a prompt or source dump it read, its own re-fed thinking), and
+// such a copy is embedded inside a line of prose.
+bool is_reasoning_close_delimiter(char c) { return c == '\n' || c == '\r'; }
+
 void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
                        StopMatch* best_match) {
@@ -564,13 +571,33 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
     }
 
     state.think_marker_pending.append(text);
-    const std::size_t marker = state.think_marker_pending.find(kThinkClose);
-    if (marker != std::string::npos) {
+    for (;;) {
+        const std::size_t marker = state.think_marker_pending.find(kThinkClose);
+        if (marker == std::string::npos) { break; }
+        const std::size_t end = marker + kThinkClose.size();
+        if (end >= state.think_marker_pending.size()) {
+            // The deciding byte has not arrived yet. Emit everything before the candidate close and
+            // hold the tag itself until the next byte resolves it.
+            feed_channel(state, OutputChannel::Reasoning,
+                         std::string_view(state.think_marker_pending).substr(0, marker), policy,
+                         emitted, committed_tokens, best_match);
+            state.think_marker_pending.erase(0, marker);
+            return;
+        }
+        if (!is_reasoning_close_delimiter(state.think_marker_pending[end])) {
+            // Mid-line: the model quoted the tag as ordinary text, not a structural close. Keep it
+            // on the Reasoning channel and keep scanning for the real close.
+            feed_channel(state, OutputChannel::Reasoning,
+                         std::string_view(state.think_marker_pending).substr(0, end), policy,
+                         emitted, committed_tokens, best_match);
+            state.think_marker_pending.erase(0, end);
+            continue;
+        }
         feed_channel(state, OutputChannel::Reasoning,
                      std::string_view(state.think_marker_pending).substr(0, marker), policy,
                      emitted, committed_tokens, best_match);
         close_channel(state, OutputChannel::Reasoning, emitted);
-        std::string content = state.think_marker_pending.substr(marker + kThinkClose.size());
+        std::string content = state.think_marker_pending.substr(end);
         state.think_marker_pending.clear();
         state.in_reasoning          = false;
         state.strip_content_leading = true;
@@ -607,8 +634,12 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         feed_decoded_text(state, kReplacementCharacter, policy, emitted, committed_tokens, nullptr);
     }
     if (state.in_reasoning) {
-        feed_channel(state, OutputChannel::Reasoning, state.think_marker_pending, policy, emitted,
-                     committed_tokens, nullptr);
+        // A `</think>` still held at the end of the stream is the structural close: it was only
+        // pending because generation ended before the byte that would have confirmed it.
+        if (std::string_view(state.think_marker_pending) != kThinkClose) {
+            feed_channel(state, OutputChannel::Reasoning, state.think_marker_pending, policy,
+                         emitted, committed_tokens, nullptr);
+        }
         state.think_marker_pending.clear();
         close_channel(state, OutputChannel::Reasoning, emitted);
     } else {

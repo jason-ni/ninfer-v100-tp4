@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -88,13 +89,18 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
+const char* official_model_dir() {
+    if (const char* configured = std::getenv("NINFER_QWEN3_6_27B_DIR")) { return configured; }
+    return "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16";
+}
+
 const fi::Tokenizer& official_tokenizer() {
     static const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+        read_file((std::string(official_model_dir()) + "/tokenizer.json").c_str());
     static const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_file((std::string(official_model_dir()) + "/tokenizer_config.json").c_str());
     static const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_file((std::string(official_model_dir()) + "/generation_config.json").c_str());
     static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});
@@ -1061,6 +1067,35 @@ int test_reasoning_split(const Frontend& frontend) {
     return failures;
 }
 
+// A `</think>` token the model emits as ordinary text (quoting a template, echoing a tool result)
+// is byte-identical to the structural close. Only a tag followed by a line boundary ends
+// reasoning; a mid-line tag stays on the Reasoning channel and the search continues for the real
+// close. Token set: 248069="</think>", 1="helloST", 3="thought</thi", 4="nk>\n\nanswer".
+int test_quoted_think_tag_routing(const Frontend& frontend) {
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = true;
+    auto prompt                         = frontend.prepare(std::move(input));
+    auto session                        = frontend.make_output_session(prompt, {});
+    const std::array<ninfer::TokenId, 4> tokens{248069, 1, 3, 4};
+    const auto decision = session.preview(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                          ninfer::FinishReason::OutputLimit);
+    int failures        = check(decision.accepted_tokens == tokens.size(),
+                                "quoted think-tag sequence did not accept");
+    const auto output   = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) ==
+                          "</think>helloSTthought",
+                      "a mid-line </think> tag was mistaken for the reasoning close");
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answer",
+                      "content after the real reasoning close was not published");
+    return failures;
+}
+
 int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto prompt             = frontend.prepare_tokens({0});
     auto session            = frontend.make_output_session(prompt, {});
@@ -1405,6 +1440,7 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
+    failures += test_quoted_think_tag_routing(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_invalid_utf8_is_replaced(frontend);
     failures += test_media_cache_reuses_immutable_payload();
