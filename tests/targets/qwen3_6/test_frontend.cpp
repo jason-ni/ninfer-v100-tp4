@@ -128,7 +128,9 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     result.chat_template_jinja  = chat_template;
     const nlohmann::json tokens = nlohmann::json::array(
         {added(1, "helloST"), added(2, "OPtail"), added(3, "thought</thi"),
-         added(4, "nk>\n\nanswer"), added(6, "<eos>", true), added(7, "<0.0 seconds>"),
+         added(4, "nk>\n\nanswer"), added(5, "```rust\n</think>\nlet x = 1;\n```\n"),
+         added(6, "<eos>", true), added(7, "<0.0 seconds>"),
+         added(8, "</think>\n\nfinal answer"),
          added(30, "user\n"), added(31, "assistant\n"), added(32, "\n"),
          added(248045, "<|im_start|>", true), added(248046, "<|im_end|>", true),
          added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
@@ -1068,9 +1070,10 @@ int test_reasoning_split(const Frontend& frontend) {
 }
 
 // A `</think>` token the model emits as ordinary text (quoting a template, echoing a tool result)
-// is byte-identical to the structural close. Only a tag followed by a line boundary ends
-// reasoning; a mid-line tag stays on the Reasoning channel and the search continues for the real
-// close. Token set: 248069="</think>", 1="helloST", 3="thought</thi", 4="nk>\n\nanswer".
+// is byte-identical to the structural close. Only the model's close sequence `</think>\n\n` (a
+// blank line after the tag line) ends reasoning; a tag quoted mid-line, or alone on a line inside
+// a code block, stays on the Reasoning channel and the search continues for the real close.
+// Token set: 248069="</think>", 1="helloST", 3="thought</thi", 4="nk>\n\nanswer".
 int test_quoted_think_tag_routing(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -1092,6 +1095,36 @@ int test_quoted_think_tag_routing(const Frontend& frontend) {
                           "</think>helloSTthought",
                       "a mid-line </think> tag was mistaken for the reasoning close");
     failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answer",
+                      "content after the real reasoning close was not published");
+    return failures;
+}
+
+// A `</think>` the model writes alone on a line inside a code block it is updating or echoing is
+// also a quoted copy, not the structural close: the quoted tag line is followed by more code,
+// whereas the close is followed by a blank line. The earlier "a line boundary after the tag" rule
+// ended reasoning at that quoted line and leaked the rest of the code onto the content channel.
+// Token set: 5 = a Rust block containing a standalone </think> line, 8 = the close plus the answer.
+int test_code_block_think_tag_routing(const Frontend& frontend) {
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = true;
+    auto prompt                         = frontend.prepare(std::move(input));
+    auto session                        = frontend.make_output_session(prompt, {});
+    const std::array<ninfer::TokenId, 2> tokens{5, 8};
+    const auto decision = session.preview(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                          ninfer::FinishReason::OutputLimit);
+    int failures        = check(decision.accepted_tokens == tokens.size(),
+                                "code-block think-tag sequence did not accept");
+    const auto output   = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) ==
+                          "```rust\n</think>\nlet x = 1;\n```\n",
+                      "a standalone </think> line inside a code block was mistaken for the close");
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "final answer",
                       "content after the real reasoning close was not published");
     return failures;
 }
@@ -1441,6 +1474,7 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_quoted_think_tag_routing(frontend);
+    failures += test_code_block_think_tag_routing(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_invalid_utf8_is_replaced(frontend);
     failures += test_media_cache_reuses_immutable_payload();

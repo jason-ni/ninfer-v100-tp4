@@ -555,12 +555,16 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
                  best_match);
 }
 
-// The byte after a candidate `</think>` decides whether it is the structural reasoning close. The
-// model leaves thinking with the exact sequence `\n</think>\n\n`, so a structural close is followed
-// by a line boundary. The identical token also appears as ordinary text whenever the model quotes
-// the tag (a markdown code span, a prompt or source dump it read, its own re-fed thinking), and
-// such a copy is embedded inside a line of prose.
-bool is_reasoning_close_delimiter(char c) { return c == '\n' || c == '\r'; }
+// A `</think>` closes the reasoning channel only when it is the model's structural close, which
+// is the exact sequence `\n</think>\n\n`: the tag ends a line and the line boundary that ends the
+// tag line is itself followed by a blank line. The identical tag appears as ordinary text whenever
+// the model quotes it and, in a coding turn, the most common copy is a `</think>` alone on a line
+// inside a Python or Rust code block the model is writing or echoing back. That quoted copy also
+// ends a line, so merely requiring one trailing line boundary (the earlier rule) closed reasoning
+// early and leaked the quoted tag and the rest of the code onto the content channel. The blank
+// line after the tag line is what separates the structural close (blank line, then the answer)
+// from a quoted code line (followed by more code).
+bool is_line_boundary(char c) { return c == '\n' || c == '\r'; }
 
 void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
@@ -575,18 +579,39 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
         const std::size_t marker = state.think_marker_pending.find(kThinkClose);
         if (marker == std::string::npos) { break; }
         const std::size_t end = marker + kThinkClose.size();
+        // The model's structural close is `</think>\n\n`: a line boundary ends the tag line and is
+        // itself followed by the blank line that precedes the answer. A quoted copy that ends a
+        // line (most often a `</think>` alone on a line inside a Python or Rust code block) is
+        // followed by more code, so the second line boundary is what distinguishes the close. A
+        // deciding byte that is still in flight holds the tag for the next feed.
         if (end >= state.think_marker_pending.size()) {
-            // The deciding byte has not arrived yet. Emit everything before the candidate close and
-            // hold the tag itself until the next byte resolves it.
+            // The byte after the tag has not arrived; it decides line-end vs. mid-line.
             feed_channel(state, OutputChannel::Reasoning,
                          std::string_view(state.think_marker_pending).substr(0, marker), policy,
                          emitted, committed_tokens, best_match);
             state.think_marker_pending.erase(0, marker);
             return;
         }
-        if (!is_reasoning_close_delimiter(state.think_marker_pending[end])) {
-            // Mid-line: the model quoted the tag as ordinary text, not a structural close. Keep it
-            // on the Reasoning channel and keep scanning for the real close.
+        if (!is_line_boundary(state.think_marker_pending[end])) {
+            // Mid-line: the model quoted the tag as text, not a structural close. Publish it on the
+            // Reasoning channel and keep scanning.
+            feed_channel(state, OutputChannel::Reasoning,
+                         std::string_view(state.think_marker_pending).substr(0, end), policy,
+                         emitted, committed_tokens, best_match);
+            state.think_marker_pending.erase(0, end);
+            continue;
+        }
+        if (end + 1 >= state.think_marker_pending.size()) {
+            // The tag ends a line but the byte deciding the blank line has not arrived; hold it.
+            feed_channel(state, OutputChannel::Reasoning,
+                         std::string_view(state.think_marker_pending).substr(0, marker), policy,
+                         emitted, committed_tokens, best_match);
+            state.think_marker_pending.erase(0, marker);
+            return;
+        }
+        if (!is_line_boundary(state.think_marker_pending[end + 1])) {
+            // Ends a line but is followed by more code rather than the close's blank line: a
+            // `</think>` quoted inside a code block. Publish it and keep scanning.
             feed_channel(state, OutputChannel::Reasoning,
                          std::string_view(state.think_marker_pending).substr(0, end), policy,
                          emitted, committed_tokens, best_match);
@@ -635,8 +660,15 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
     }
     if (state.in_reasoning) {
         // A `</think>` still held at the end of the stream is the structural close: it was only
-        // pending because generation ended before the byte that would have confirmed it.
-        if (std::string_view(state.think_marker_pending) != kThinkClose) {
+        // pending because generation ended before the blank line that would have confirmed it. The
+        // held text is the tag plus at most the line boundary already seen, with no reasoning text
+        // before it (that was published as it arrived). Anything else is unpublished reasoning.
+        const std::string_view pending = state.think_marker_pending;
+        const bool held_close =
+            pending.starts_with(kThinkClose) &&
+            std::all_of(pending.begin() + static_cast<std::ptrdiff_t>(kThinkClose.size()),
+                        pending.end(), is_line_boundary);
+        if (!held_close) {
             feed_channel(state, OutputChannel::Reasoning, state.think_marker_pending, policy,
                          emitted, committed_tokens, nullptr);
         }
