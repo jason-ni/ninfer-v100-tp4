@@ -721,6 +721,14 @@ Admission 在同一 lane 成功时消费 retained entry，并把 SequenceState o
 Rewrite-checkpoint restore 保留包含 checkpoint 的部分尾页，释放其后的完整 pages。KV page 或 token prefix match
 本身不是 checkpoint；当前架构不支持 arbitrary longest-common-prefix reuse。
 
+启用 `--prefix-cache` 的 hybrid content-addressed prefix cache 在此之上增加一条复用路径：按 64-token block
+的内容 hash 匹配 prompt 路径，命中时恢复该 block 边界上捕获的完整 state image
+（`PrefixReusePath::BlockSnapshot`）。因此 common prefix 即便结束在任何 checkpoint 都没有的位置，只要落在
+block 边界上且该边界存在 state snapshot 就能复用。它不是 token 级 arbitrary LCP：capture 与复用都以
+`kBlockTokens`=64 为单位，且要求对应 frontier 上确有快照。该路径是 additive 的——block-snapshot admission
+未命中时仍回退到上面的 retained/rewrite-checkpoint 逻辑。参见
+`docs/maintainer/hybrid-prefix-cache-plan.md`。
+
 27B TP2 的 suffix、exact-hit 和 MTP bridge 采用同一套 reuse plan。Rank 0 独占 retained target hidden
 和 rewrite-checkpoint hidden 的权威副本；恢复时通过有序跨卡传输把选中的 hidden 暂存到 rank 1 已有的
 prefill buffer，不为每个 lane 增加第二份 hidden ledger。两个 rank 分别捕获、恢复自身的 GDN shard。

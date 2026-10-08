@@ -1,10 +1,11 @@
 # Hybrid prefix cache: V100X2 adaptation plan
 
-Status: design / plan (not implemented). This document adapts the content-addressed
+Status: implemented. M1 (device-only block + snapshot cache) and M2 (host tier) are in-tree and
+verified; M3 (persistence and keys) has not started. This document adapts the content-addressed
 prefix cache of `Wallawalla47/ninfer-custom` (its `docs/maintainer/hybrid-prefix-cache-spec.md`,
-referred to below as **HPC**) to this checkout's Qwen3.8-27B V100X2 engine. It records *what* the
-current engine does, *why* exact-frontier reuse misses agent clients, and the staged path to the
-hybrid design. It changes no code.
+referred to below as **HPC**) to this checkout's Qwen3.8-27B V100X2 engine. Sections 0–4 keep the
+original reference/motivation framing; §5 onward is the implementation record, and §1.1 lists where
+the V100X2 implementation deviates from the HPC reference.
 
 ---
 
@@ -67,6 +68,28 @@ The model constraint HPC is built around is exactly ours: the GDN recurrent stat
 back, so a prefix is reusable only where the complete state exists. HPC makes those states cheap
 to create (one state copy at a chunk boundary), cheap to store (host tier), and exactly
 addressable (block path).
+
+### 1.1 Where the V100X2 implementation deviates from the reference
+
+- **Taps are block-aligned; `tail_len` is always 0.** A tap is captured only when the prefill
+  cursor sits exactly on a `kBlockTokens` (64) boundary, and it is published with `frontier ==
+  cursor` (§6, capture invariant). Flexible tap positions from the planner are snapped down to
+  `floor(pos/64)*64`; positions at or below the reuse base are dropped. Because the prompt tail is
+  generally not 64-aligned, the final prefill chunk is cut at `floor(prompt_tokens/64)*64` so that
+  tail capture lands on a boundary; the residual `prompt_tokens % 64` tokens are prefilled in one
+  extra short chunk, charged as one extra prefill quantum in `service_work_quanta`. A capture
+  boundary that lands mid-block for any other reason (e.g. a rewrite-checkpoint split) defers the
+  tap to the next aligned boundary. The reference's "private partial-tail page bundle" is therefore
+  **not** constructed on this path — the index's tail fields exist but stay unused.
+- **State image contents.** `ProgramImplCore::copy_snapshot_slot` copies the per-layer GDN conv
+  history (BF16) and recurrent state (FP32) only. Continuation hidden and DFlash rings are not part
+  of a tap image: under the acceptance MTP profile the resumed suffix recomputes the continuation
+  hidden and re-establishes MTP through the normal bridge, and DFlash2 is a separate (text-only)
+  profile.
+- **Tap sources.** Only the planner's prompt-tail and geometric-ladder (flexible) taps are produced
+  today: `plan_request_for_lane` passes a default-empty `TapHint`, so the explicit client
+  breakpoints, generation opener, and end-of-tools taps (the "exact" set) are not yet plumbed
+  (M3).
 
 ---
 
@@ -155,9 +178,10 @@ Deliverables:
   re-compare; node insertion only when all 64 positions of every enabled pool are committed.
 - A tap planner producing the §1 set (explicit markers first, then generation opener, structural
   boundaries, prompt tail, geometric ladder), with the HPC clustering/redundancy rules.
-- Snapshot capture: reuse the existing committed-state path (`dflash_context_impl.h:47-52`,
-  `rewrite_checkpoint_hidden`) to D2D-copy the state image into a device snapshot slot at a chunk
-  boundary; publish when the anchor block is committed.
+- Snapshot capture: D2D-copy the state image (per-layer GDN conv history + recurrent state) into a
+  device snapshot slot at a **block-aligned** chunk boundary; publish with `frontier == cursor` once
+  the anchor block is committed. Flexible tap positions are snapped to block boundaries and the
+  prompt-tail chunk is cut at `floor(n/64)*64` (§1.1, §6).
 - Admission = deepest snapshot on the matched path with `F ≤ n−1`; restore by sharing the path's
   device pages and copying the image into the lane's active slot.
 - The admission's `prefix_reuse_path` reporting gains a `BlockSnapshot` path (or equivalent) so
@@ -168,10 +192,11 @@ the rewritten tool block, and the prefill token count equals `n − F`.
 
 ### M2 — host tier
 
-Status: **code complete; GPU verification pending.** Tracked as tasks T0–T7 below. T0–T7 are done
-in-tree (uncommitted): the tree compiles, `ninfer_prefix_cache_host_test` and
-`ninfer_prefix_cache_index_test` are green, and the full build links. What remains is the T7 GPU
-exit criterion (host-reuse scenario + `--host-cache-mib=0` regression) on real weights.
+Status: **complete; GPU-verified.** Tracked as tasks T0–T7 below, all done in-tree.
+`ninfer_prefix_cache_host_test` and `ninfer_prefix_cache_index_test` are green, the full build
+links, and the GPU host-reuse scenario passes on V100X2: `ninfer_qwen3_8_27b_v100x2_hybrid_real_test`
+runs the normal, pool-exhaustion, and host-tier cases (a returning conversation restored from the
+pinned host tier after device eviction) and reports PASS for all three.
 
 A review while landing T7 found and fixed a real bug: `finish_host_write` / `finish_snapshot_write`
 pinned their slab in `begin_*` to protect the in-flight transfer but only *un*pinned it on the
@@ -218,15 +243,15 @@ permanently-pinned slabs and stopped making room. Both success paths now release
 | T0 | Update tracking doc | Mark M1 done; add this M2 task table + design decisions | done |
 | T1 | Fix physical transfer layer | All-rank transfers, backend pages in block data, snapshot image = per-layer conv+recurrent segments, rank-sliced slab sizing; `PagedKVPool::copy_page_d2h/h2d` rewritten non-throwing on the kernel's real layout; `per_page_bytes()` from plane specs | done |
 | T2 | Fix PrefixIndex policy | LRU invariant in `link_lru_tail`; pin/unpin simplification; `begin_snapshot_write` pins anchor node; `delete_snapshot` defers while pinned; `detach_snapshot` releases slab; `hit()` updates GDSF metadata; `evictable_page_counts()`; dead-code removal | done |
-| T3 | Write-through (D2H) + slot fix | `issue_block_write_through` / `issue_snapshot_write_through` with per-rank events; `tick_prefix_cache()` polling; tap-loop slot settlement (consumed = `kInvalidSlot`); `clear_lane` write-through before unpin, releases only unconsumed slots | done (tick call sites partial — see WIP note) |
+| T3 | Write-through (D2H) + slot fix | `issue_block_write_through` / `issue_snapshot_write_through` with per-rank events; `tick_prefix_cache()` polling; tap-loop slot settlement (consumed = `kInvalidSlot`); `clear_lane` write-through before unpin, releases only unconsumed slots | done |
 | T4 | Restore (H2D) | Rewrite `start_prefill_lane` BlockSnapshot branch: batch H2D of missing blocks (text+backend, all ranks) + snapshot image via `begin_snapshot_restore`; sync per rank; borrow restored pages; admission in `request_plan_impl.h` picks deeper of `best_device`/`best_host` | done |
 | T5 | Wire device eviction to memory pressure | `can_admit_lane` counts evictable cache pages (`active_refs==0 && restore_pins==0`) as reclaimable; `reserve_sequence_kv` + restore-time `acquire_cache_pages` retry through `evict_device_lru()` on `bad_alloc`; fix `release_cached_pages` to release backend pages (all ranks) | done |
-| T6 | Config surface + docs | Serve `--host-cache-mib` (`serve_options.{h,cpp}`, `generation_service.cpp`); `docs/cli.md`, `docs/serving.md`; finalize this tracking section | code done; `docs/cli.md`/`docs/serving.md` prose pending |
-| T7 | Tests + verification | Extend `tests/test_prefix_cache_host.cpp` (demote-vs-erase, slab reconciliation, dead-KV/supersede marking, slot demote, best_host admission, slot-release fix); GPU host-reuse scenario + regression | unit tests done + green; **GPU scenario pending** |
+| T6 | Config surface + docs | Serve `--host-cache-mib` (`serve_options.{h,cpp}`, `generation_service.cpp`); `docs/cli.md`, `docs/serving.md`; finalize this tracking section | done — `--prefix-cache`/`--host-cache-mib` documented in the CLI and serving option tables |
+| T7 | Tests + verification | Extend `tests/test_prefix_cache_host.cpp` (demote-vs-erase, slab reconciliation, dead-KV/supersede marking, slot demote, best_host admission, slot-release fix); GPU host-reuse scenario + regression | done — unit tests green; GPU host-reuse scenario passes (`ninfer_qwen3_8_27b_v100x2_hybrid_real_test`: normal / exhaustion / host-tier); acceptance regression verified on a live TP4 session |
 
 Dependency order: T0 → T2 → T1 → T3/T4 → T5 → T6 → T7 (T1/T2 near-independent).
 
-#### WIP status (session 2026-10-06, uncommitted)
+#### Implementation notes (session 2026-10-06)
 
 Done in-tree:
 
@@ -260,19 +285,22 @@ Done in-tree:
   unpinning; releases only unconsumed tap slots (fixes the M1 latent bug: published slots stay owned
   by their live snapshot).
 
-Remaining (only the T7 GPU exit criterion):
+#### Verification status
 
-1. **GPU host-reuse scenario** (`CUDA_VISIBLE_DEVICES=1,2 GGML_CUDA_PDL=0`, TP2, MTP-3,
-   `--host-cache-mib` sized for ~1 conversation): run conversation A (~90k tokens) then B (different
-   prefix, ~90k) so A's blocks demote/evict from device; re-issue A's next turn → expect
-   `ReusedBlockSnapshot` with frontier < n and a continuation **identical** to a cold run of the same
-   prompt (greedy). See the Verification section below.
-2. **Regression:** `--host-cache-mib=0` byte-for-byte M1 behavior; decode tok/s parity on the
-   acceptance workload; TP4 smoke with the host tier enabled.
+All T7 gates are met:
 
-All code tasks (T3 tick call sites, T4 restore, T5 eviction wiring, T6 serve config, T7 unit tests)
-are implemented in-tree and the build + unit tests are green. The pin-leak fix noted in the M2 status
-above was found while writing the T7 slab-reconciliation test.
+1. **GPU host-reuse scenario** — `ninfer_qwen3_8_27b_v100x2_hybrid_real_test` (`exercise_host_tier`;
+   TP2 + MTP-3 + `--host-cache-mib`) passes: conversation A cold, a disjoint equally long B evicts A
+   from device, A re-issued → `ReusedBlockSnapshot` restored from the host tier. The normal and
+   pool-exhaustion cases pass alongside it.
+2. **Regression / acceptance** — a live TP4 session (`--prefix-cache --host-cache-mib 28192
+   --vision`, TP4, MTP-3) ran the agent OCR workload end to end. The raw-output capture shows 59
+   `ReusedBlockSnapshot` reuses, every one anchored on a 64-token block boundary, with no
+   leaked/mis-anchored continuations; a `--no-prefix-reuse` run of the same workload is the control
+   for the detector. The host tier and multi-rank transfers were exercised throughout the session.
+
+The pin-leak fix noted in the M2 status above was found while writing the T7 slab-reconciliation
+test.
 
 Facts the next session needs:
 
@@ -312,6 +340,14 @@ Exit: restarting the server and re-issuing a prefix yields the same reuse as bef
 - **Reuse is exact relocation, not arithmetic.** A restored state must be the *same bytes* as the
   committed state at `F`: snapshot capture and restore are copies, compared byte-for-byte against a
   freshly prefilled state at the same `F` (the exact oracle for a state image).
+- **Capture invariant (`frontier == state`).** A tap is published only when the prefill cursor sits
+  exactly on the block boundary it names. The copied image is the live state *after* `cursor`
+  tokens, so publishing it under `frontier = floor(cursor/64)*64` at a non-aligned `cursor` would
+  leave the state `cursor % 64` tokens ahead of its frontier, and a resume would double-consume
+  those tokens through the GDN recurrence — the Qwen3.8 "tool output leaks into reasoning" defect.
+  Flexible taps are therefore snapped to block boundaries and the prompt-tail chunk is cut at
+  `floor(prompt_tokens/64)*64` (§1.1), so every snapshot's image is byte-identical to a freshly
+  prefilled state at its `F`.
 - **Admission equivalence.** Prefill `n − F` tokens from a restored snapshot must produce the same
   continuation as a cold prefill of all `n` tokens, within the same tolerance the cache-off path
   already uses (BF16/INT8 KV profile). This is the end-to-end property; run it over the OpenCode
@@ -325,19 +361,31 @@ Exit: restarting the server and re-issuing a prefix yields the same reuse as bef
 
 ---
 
-## 7. Configuration surface (proposed)
+## 7. Configuration surface
+
+Implemented server flags:
 
 | Option | Default | Meaning |
 |---|---|---|
+| `--prefix-cache` | off | Enable the hybrid content-addressed prefix cache (additive to the legacy owner/checkpoint reuse paths). |
 | `--host-cache-mib N` | `0` | Pinned host RAM for the prefix pool; `0` = device-only (M1). |
-| `--prefix-cache-file PATH` | unset | Persist the host pool across restarts (M3). |
-| `--use-original-prefix-caching` | off | Keep the current owner/checkpoint path instead of the hybrid one. |
-| `--max-new-taps N` | `8` / `2` without host tier | Cap snapshots per request. |
-| `--tap-ladder-tokens G` | e.g. `8192` | Ladder spacing `n − G·2^k`. |
-| `--tap-min-gap` | `max(1024, chunk)` | Minimum gap between ladder taps. |
+| `--no-prefix-reuse` | reuse on | Disable all prefix reuse for the request. |
 
-Per HPC §14.1, in hybrid mode the legacy owner/checkpoint machinery is not constructed; it remains
-behind `--use-original-prefix-caching` for comparison.
+Internal `PrefixCacheOptions` fields. They are not exposed as CLI flags; `ProgramImplCore` derives
+these defaults when the field is zero:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `snapshot_slots` | `0` → `max_concurrency + 1` | Device state-image slots. |
+| `max_new_taps` | `0` → `2` | Cap on snapshots captured per request. |
+| `ladder_tokens` | `0` → `max(4096, 2·prefill_chunk)` | Ladder spacing `n − G·2^k`. |
+| `min_gap` | `0` → `max(1024, prefill_chunk)` | Minimum gap between taps. |
+
+Not yet implemented: `--prefix-cache-file` (M3 persistence), explicit client breakpoints
+(OpenAI/Anthropic `cache_control`/markers), and a `--use-original-prefix-caching` switch. The hybrid
+cache is **additive**, not a replacement: `admit_block_snapshot` is tried first and, on no usable
+hit, planning falls through to the existing owner/checkpoint paths (`AppendAtFrontier`, rewrite
+checkpoint) unchanged — unlike HPC §14.1, the legacy machinery is still constructed.
 
 ---
 
@@ -347,11 +395,13 @@ behind `--use-original-prefix-caching` for comparison.
   the smallest cut that removes the OpenCode hard-miss; do not under-budget M2.
 - **TP-sharded snapshots.** HPC is single-GPU. Per-rank snapshot capture/restore and per-rank graph
   capture must be designed here; the cross-rank reduce is unaffected and no state sync is needed.
-- **State image size.** Verify the per-rank image against the real layouts before sizing device
-  snapshot slots and the host pool; DFlash2 rings can dominate.
+- **State image size.** The per-rank tap image is the GDN conv history + recurrent state only
+  (§1.1). Verify its size against the real layouts before sizing device snapshot slots and the host
+  pool.
 - **Rewriting clients.** Reuse will still restart at the *deepest surviving boundary* before a
   rewrite. If a client rewrites the very first tool block, only the system/tools preamble is
   reusable — that is the floor, and it is a large improvement over a full reset.
-- **Contract.** Adopting this changes the supported-identity description; update
-  `docs/README.md`, `docs/cli.md`/`docs/serving.md` (`--tp`, cache options) and the
-  `EngineOptions` comments together when it lands.
+- **Contract.** The cache extended the published CLI/serve surface (`--prefix-cache`,
+  `--host-cache-mib`), now documented in `docs/cli.md` and `docs/serving.md`. The
+  `include/ninfer/types.h` `PrefixCacheOptions` comments carry the internal fields. If the supported
+  identities themselves ever change, update `docs/README.md` with them.

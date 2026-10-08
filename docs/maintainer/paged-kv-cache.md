@@ -781,6 +781,12 @@ allocation 来强制重算；本次保留既有快照并延迟新 capture。
 最后一种情况不是 page-size limitation。缺少的是对应 Linear Attention/backend continuation state，而不是
 KV page。
 
+启用 hybrid content-addressed prefix cache（`--prefix-cache`）时，上面的 "cache miss" 不再绝对：内容寻址的
+block tree 会匹配“结束于 64-token block 边界、且该边界上存在 state snapshot”的 common prefix，并以
+`PrefixReusePath::BlockSnapshot` 复用其 KV pages 与该状态镜像。粒度是 block（`kPagedKVPageSize`=64）而非
+token；未命中时仍回退到 retained checkpoint 路径。参见
+`docs/maintainer/hybrid-prefix-cache-plan.md`。
+
 ### 10.2 Non-page-aligned frontier
 
 例如 Main Text `P=64`、retained frontier `F=1000`：

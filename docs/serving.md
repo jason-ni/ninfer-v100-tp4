@@ -551,6 +551,8 @@ curl http://127.0.0.1:8080/v1/models \
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--cuda-graph` / `--no-cuda-graph` | force CUDA Graph capture on/off | off at `--tp > 1`, on at `--tp 1` |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
+| `--prefix-cache` | enable the hybrid content-addressed prefix cache (block-granular KV reuse plus GDN state snapshots; device tier, optionally backed by pinned host RAM) | off |
+| `--host-cache-mib N` | pinned host RAM for the prefix-cache pool; only used with `--prefix-cache`; `0` is device-only | `0` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--chat-template-kwargs JSON` | default chat-template options as a JSON object; supported keys are `preserve_thinking` (bool), `enable_thinking` (bool), and `reasoning_effort` (`none`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`); it overrides `--no-thinking`/`--preserve-thinking` for the keys it names, and requests can still override each field | unset |
