@@ -1066,12 +1066,26 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             throw std::logic_error("request plan has an invalid prefix reuse path");
         }
 
-        // Hybrid prefix cache: initialize the capture state from the plan.
+        // Hybrid prefix cache: initialize the capture state from the plan. A tap snapshot is
+        // published with tail_len == 0 and an anchor on the last committed block, so the state
+        // image captured at `cursor` is the state after the block boundary `floor(cursor/64)*64`.
+        // Snap every flexible tap down to a block boundary and require its frontier to sit above
+        // the reuse base, so the capture that advance_prefill performs at that boundary publishes
+        // a state image that is exactly the snapshot's frontier.
         if (prefix_index != nullptr && !request_plan.prefix_taps.empty()) {
-            sequence.prefix_tap_positions = request_plan.prefix_taps;
-            sequence.prefix_tap_slots.reserve(request_plan.prefix_taps.size());
+            constexpr std::uint32_t kBlock = static_cast<std::uint32_t>(
+                ninfer::prefix_cache::kBlockTokens);
+            std::vector<std::uint32_t> tap_positions;
+            tap_positions.reserve(request_plan.prefix_taps.size());
             for (std::uint32_t position : request_plan.prefix_taps) {
-                (void)position;
+                const std::uint32_t aligned = (position / kBlock) * kBlock;
+                if (aligned <= base) { continue; }
+                if (!tap_positions.empty() && tap_positions.back() >= aligned) { continue; }
+                tap_positions.push_back(aligned);
+            }
+            sequence.prefix_tap_positions = std::move(tap_positions);
+            sequence.prefix_tap_slots.reserve(sequence.prefix_tap_positions.size());
+            for (std::size_t tap = 0; tap < sequence.prefix_tap_positions.size(); ++tap) {
                 const ninfer::prefix_cache::SlotId slot = prefix_index->reserve_snapshot_slot(0);
                 if (slot == ninfer::prefix_cache::kInvalidSlot) { break; }
                 sequence.prefix_tap_slots.push_back(slot);
@@ -3000,8 +3014,21 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
+            std::uint32_t nominal =
                 std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // End the prompt-tail chunk on a block boundary. A tap snapshot's state image is the
+            // state after `cursor`, so it must be captured at an aligned cursor; otherwise the
+            // final (mid-block) tail would publish a snapshot whose frontier lags its state by
+            // `prompt_tokens % 64` tokens and the resume double-consumes those tokens.
+            if (sequence.prefix_capture &&
+                sequence.prefix_tap_next < sequence.prefix_tap_positions.size() &&
+                staged.cursor + nominal == staged.prompt_tokens) {
+                const std::uint32_t kBlock =
+                    static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens);
+                const std::uint32_t boundary =
+                    (staged.prompt_tokens / kBlock) * kBlock;
+                if (boundary > staged.cursor) { nominal = boundary - staged.cursor; }
+            }
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
@@ -3094,8 +3121,14 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                         break; // avoid an infinite loop if the commit is rejected
                     }
                 }
-                // Capture tap snapshots at chunk boundaries.
-                while (sequence.prefix_tap_next < sequence.prefix_tap_slots.size() &&
+                // Capture tap snapshots at chunk boundaries. Only when the boundary is block-aligned:
+                // the state image copied below is the state after `cursor`, so a mid-block boundary
+                // (e.g. from a rewrite-checkpoint split) would publish a snapshot whose frontier is
+                // ahead of its state. Defer such taps to the next aligned boundary.
+                const bool capture_aligned =
+                    cursor % static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens) == 0;
+                while (capture_aligned &&
+                       sequence.prefix_tap_next < sequence.prefix_tap_slots.size() &&
                        sequence.prefix_tap_positions[sequence.prefix_tap_next] <= cursor) {
                     const std::uint32_t position = sequence.prefix_tap_positions[sequence.prefix_tap_next];
                     const ninfer::prefix_cache::SlotId slot =
@@ -3112,12 +3145,13 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                             LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                             state_slot, peer[peer_slot]->device.stream);
                     }
-                    // anchor for snapshot at cursor (block-aligned) = last full block below cursor =
-                    // block (completed-1). anchor node = prefix_pinned_nodes[completed].
+                    // cursor is block-aligned (capture_aligned), so `completed*64 == cursor`. The
+                    // state image copied above is the state after exactly `cursor` tokens, so the
+                    // snapshot's frontier is `cursor` and its tail_len is 0. anchor node =
+                    // prefix_pinned_nodes[completed] (block completed-1).
                     const ninfer::prefix_cache::NodeId anchor =
                         sequence.prefix_pinned_nodes[completed];
-                    // Snap the frontier to the last full block boundary so tail_len=0 for a tap snapshot.
-                    const std::uint32_t frontier = completed * ninfer::prefix_cache::kBlockTokens;
+                    const std::uint32_t frontier = cursor;
                     const auto snap_id = prefix_index->add_snapshot(ninfer::prefix_cache::SnapshotRequest{
                         .anchor        = anchor,
                         .frontier      = frontier,

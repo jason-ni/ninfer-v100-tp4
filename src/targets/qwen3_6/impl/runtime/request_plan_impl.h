@@ -383,12 +383,26 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
+    // A prompt that does not end on a kBlockTokens boundary prefills one extra short tail chunk so
+    // the hybrid cache can capture its deepest tap at a block-aligned frontier (advance_prefill caps
+    // the final chunk at floor(n/kBlockTokens)*kBlockTokens). Charge one prefill quantum for it so
+    // the executor's service projection is never exceeded; it is an upper bound (the extra chunk is
+    // skipped when no tap survives to the prompt tail).
+    const std::size_t tap_tail_split =
+        prefix_index != nullptr && !plan->prefix_taps.empty() &&
+                plan->reuse_base < plan->summary.prompt_tokens &&
+                plan->summary.prompt_tokens %
+                        static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens) !=
+                    0
+            ? 1ULL
+            : 0ULL;
     const std::size_t prefill_splits =
         (plan->vision ? plan->vision->uses.size() : 0ULL) +
         (plan->rewrite_checkpoint_capture &&
                  plan->rewrite_checkpoint_capture->frontier < plan->summary.prompt_tokens
              ? 1ULL
-             : 0ULL);
+             : 0ULL) +
+        tap_tail_split;
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
     return RequestPlan(std::move(plan));
