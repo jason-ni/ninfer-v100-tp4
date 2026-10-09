@@ -98,6 +98,7 @@ exec "${executable}" "${artifact}" \
     --prefill-chunk "${prefill_chunk}" \
     --kv-dtype "${kv_dtype}" \
     --max-concurrency "${max_concurrency}" \
+    --pending-timeout-ms "300000" \
     --spec mtp --draft-tokens "${draft_tokens}" \
     --lm-head-draft \
     ${serve_args[@]+"${serve_args[@]}"} "$@"
