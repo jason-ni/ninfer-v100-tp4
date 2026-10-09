@@ -3,6 +3,7 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -18,6 +19,16 @@ std::int32_t checked_i32(std::uint32_t value, const char* label) {
         throw std::invalid_argument(std::string(label) + " must fit positive int32");
     }
     return static_cast<std::int32_t>(value);
+}
+
+// Debug (NINFER_PAGE_TRACE): log every physical-page state transition for pages 0..39 so the
+// owner history of a specific page can be reconstructed. States: 0=free 1=mapped 2=cached.
+void page_trace(const void* pool, std::int32_t page, std::uint8_t old_state, std::uint8_t new_state,
+                const char* op) {
+    if (std::getenv("NINFER_PAGE_TRACE") == nullptr) { return; }
+    if (page < 0 || page >= 40) { return; }
+    std::fprintf(stderr, "[PTRACE] pool=%p page=%d %-12s %u->%u\n", pool, page, op, old_state,
+                 new_state);
 }
 
 std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
@@ -114,6 +125,12 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
     for (std::uint32_t page = 0; page < spec_.page_group_count; ++page) {
         free_page_ids_.push_back(static_cast<std::int32_t>(page));
     }
+    debug_page_state_.assign(spec_.page_group_count, 0);
+}
+
+std::uint8_t PagedKVPool::debug_page_state(std::int32_t page) const noexcept {
+    if (page < 0 || static_cast<std::size_t>(page) >= debug_page_state_.size()) { return 0xFF; }
+    return debug_page_state_[static_cast<std::size_t>(page)];
 }
 
 std::uint32_t PagedKVPool::page_group_count() const noexcept { return spec_.page_group_count; }
@@ -140,12 +157,13 @@ Tensor PagedKVPool::block_table_row(std::int32_t row) const {
 
 namespace {
 
-// Every KV plane is physically laid out [page][head][token][leading] with `leading` fastest --
-// the exact convention ops/kernel/paged_kv_address.cuh addresses (both the attention reads and
-// the KV writes go through paged_kv_element_offset). One page therefore consists of
-// head_extent contiguous runs of (leading_extent * page_size) elements; run h of page p starts
-// at LE * PS * (h + HE * p). The declared tensor shape (PageMajor/HeadMajor) does not change
-// this physical arrangement.
+// A plane is `head_extent` contiguous runs of (leading_extent * page_size) elements per page.
+// The plane order decides where those runs sit:
+//   - PageMajor: [page][head][token][leading], leading fastest; run h of page p starts at
+//     LE * PS * (h + HE * p). This is the convention ops/kernel/paged_kv_address.cuh addresses
+//     (every attention read and KV write goes through paged_kv_element_offset).
+//   - HeadMajor: [head][page][token][leading]; run h of page p starts at LE * PS * (p + P * h),
+//     matching the DFlash full-context pool's bidirectional attention and append kernels.
 std::size_t per_plane_page_bytes(const PagedKVPlaneSpec& spec) noexcept {
     return static_cast<std::size_t>(spec.leading_extent) * kPagedKVPageSize *
            static_cast<std::size_t>(spec.head_extent) * dtype_size(spec.dtype);
@@ -153,14 +171,17 @@ std::size_t per_plane_page_bytes(const PagedKVPlaneSpec& spec) noexcept {
 
 template <bool DeviceToHost>
 bool copy_plane_page(const PagedKVPlaneSpec& spec, std::int32_t page_id, void* host_base,
-                     char* device_base, cudaStream_t stream) noexcept {
+                     char* device_base, std::size_t physical_pages, PagedKVPlaneOrder order,
+                     cudaStream_t stream) noexcept {
     const std::size_t leading = static_cast<std::size_t>(spec.leading_extent);
     const std::size_t heads   = static_cast<std::size_t>(spec.head_extent);
     const std::size_t run_bytes = leading * kPagedKVPageSize * dtype_size(spec.dtype);
+    const std::size_t page      = static_cast<std::size_t>(page_id);
     char* host = static_cast<char*>(host_base);
     for (std::size_t h = 0; h < heads; ++h) {
-        char* dev_run = device_base +
-                        leading * kPagedKVPageSize * (h + heads * static_cast<std::size_t>(page_id));
+        const std::size_t run_index =
+            order == PagedKVPlaneOrder::PageMajor ? h + heads * page : page + physical_pages * h;
+        char* dev_run = device_base + run_bytes * run_index;
         if (DeviceToHost) {
             if (cudaMemcpyAsync(host, dev_run, run_bytes, cudaMemcpyDeviceToHost, stream) !=
                 cudaSuccess) {
@@ -192,7 +213,8 @@ bool PagedKVPool::copy_page_d2h(void* host_dst, std::int32_t page_id,
     char* out = static_cast<char*>(host_dst);
     for (std::size_t i = 0; i < planes_.size(); ++i) {
         if (!copy_plane_page<true>(spec_.planes[i], page_id, out,
-                                   static_cast<char*>(planes_[i].data), stream)) {
+                                   static_cast<char*>(planes_[i].data), spec_.page_group_count,
+                                   spec_.plane_order, stream)) {
             (void)cudaGetLastError();
             return false;
         }
@@ -203,10 +225,14 @@ bool PagedKVPool::copy_page_d2h(void* host_dst, std::int32_t page_id,
 
 bool PagedKVPool::copy_page_h2d(const void* host_src, std::int32_t page_id,
                                 cudaStream_t stream) const noexcept {
+    if (page_id >= 8 && page_id < 16) {
+        std::fprintf(stderr, "[H2D] pool=%p page=%d\n", static_cast<const void*>(this), page_id);
+    }
     char* in = const_cast<char*>(static_cast<const char*>(host_src));
     for (std::size_t i = 0; i < planes_.size(); ++i) {
         if (!copy_plane_page<false>(spec_.planes[i], page_id, in,
-                                    static_cast<char*>(planes_[i].data), stream)) {
+                                    static_cast<char*>(planes_[i].data), spec_.page_group_count,
+                                    spec_.plane_order, stream)) {
             (void)cudaGetLastError();
             return false;
         }
@@ -226,14 +252,23 @@ std::uint32_t PagedKVPool::free_pages() const noexcept {
 std::uint32_t PagedKVPool::cached_pages() const noexcept { return cached_pages_; }
 
 bool PagedKVPool::can_reserve(std::uint32_t page_entitlement) const noexcept {
+    // Signed headroom: `entitled + cached` may not exceed the pool, and any future accounting
+    // drift must reject the reservation rather than underflow `page_group_count() - used` into a
+    // huge unsigned value that accepts everything.
+    const std::int64_t headroom = static_cast<std::int64_t>(page_group_count()) -
+                                  static_cast<std::int64_t>(entitled_pages_) -
+                                  static_cast<std::int64_t>(cached_pages_);
     return page_entitlement != 0 && page_entitlement <= logical_page_capacity() &&
-           page_entitlement <= page_group_count() - entitled_pages_ - cached_pages_;
+           headroom >= 0 && static_cast<std::int64_t>(page_entitlement) <= headroom;
 }
 
 bool PagedKVPool::can_replace_entitlement(std::uint32_t old_pages,
                                           std::uint32_t new_pages) const noexcept {
-    return old_pages <= entitled_pages_ && new_pages <= logical_page_capacity() &&
-           new_pages <= page_group_count() - (entitled_pages_ - old_pages) - cached_pages_;
+    if (old_pages > entitled_pages_ || new_pages > logical_page_capacity()) { return false; }
+    const std::int64_t headroom = static_cast<std::int64_t>(page_group_count()) -
+                                  static_cast<std::int64_t>(entitled_pages_ - old_pages) -
+                                  static_cast<std::int64_t>(cached_pages_);
+    return headroom >= 0 && static_cast<std::int64_t>(new_pages) <= headroom;
 }
 
 PagedKVAllocation PagedKVPool::reserve(std::uint32_t page_entitlement) {
@@ -245,6 +280,12 @@ PagedKVAllocation PagedKVPool::reserve(std::uint32_t page_entitlement) {
 
 void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream) {
     if (page_ids.empty()) { return; }
+    for (std::int32_t page_id : page_ids) {
+        if (page_id >= 8 && page_id < 16) {
+            std::fprintf(stderr, "[ZERO] pool=%p page=%d\n", static_cast<const void*>(this),
+                         page_id);
+        }
+    }
 
     std::vector<std::int32_t> sorted(page_ids.begin(), page_ids.end());
     std::sort(sorted.begin(), sorted.end());
@@ -328,6 +369,16 @@ std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count,
         free_page_ids_.erase(free_page_ids_.begin(), last);
     }
     mapped_pages_ += count;
+    for (std::int32_t page : out) {
+        const std::uint8_t old_state = debug_page_state_[static_cast<std::size_t>(page)];
+        if (old_state != 0) {
+            std::fprintf(stderr,
+                         "[KVDBG] TAKE pool=%p page=%d was state=%u (double-handout)\n",
+                         static_cast<const void*>(this), page, old_state);
+        }
+        debug_page_state_[static_cast<std::size_t>(page)] = 1;
+        page_trace(this, page, old_state, 1, "take");
+    }
     return out;
 }
 
@@ -336,6 +387,16 @@ void PagedKVPool::return_pages(std::span<const std::int32_t> pages) noexcept {
     free_page_ids_.insert(free_page_ids_.end(), pages.begin(), pages.end());
     std::sort(free_page_ids_.begin(), free_page_ids_.end());
     mapped_pages_ -= static_cast<std::uint32_t>(pages.size());
+    for (std::int32_t page : pages) {
+        const std::uint8_t old_state = debug_page_state_[static_cast<std::size_t>(page)];
+        if (old_state != 1) {
+            std::fprintf(stderr,
+                         "[KVDBG] RETURN pool=%p page=%d was state=%u (not owned)\n",
+                         static_cast<const void*>(this), page, old_state);
+        }
+        debug_page_state_[static_cast<std::size_t>(page)] = 0;
+        page_trace(this, page, old_state, 0, "return");
+    }
 }
 
 void PagedKVPool::add_entitlement(std::uint32_t pages) noexcept { entitled_pages_ += pages; }
@@ -351,6 +412,11 @@ std::vector<std::int32_t> PagedKVPool::acquire_cache_pages(std::uint32_t count) 
     }
     std::vector<std::int32_t> pages = take_pages(count, -1);
     cached_pages_ += count;
+    for (std::int32_t page : pages) {
+        const std::uint8_t old_state = debug_page_state_[static_cast<std::size_t>(page)];
+        debug_page_state_[static_cast<std::size_t>(page)] = 2;
+        page_trace(this, page, old_state, 2, "acquire_cache");
+    }
     return pages;
 }
 
@@ -362,6 +428,16 @@ void PagedKVPool::release_cache_pages(std::span<const std::int32_t> page_ids) no
     cached_pages_ -= static_cast<std::uint32_t>(page_ids.size());
     free_page_ids_.insert(free_page_ids_.end(), page_ids.begin(), page_ids.end());
     std::sort(free_page_ids_.begin(), free_page_ids_.end());
+    for (std::int32_t page : page_ids) {
+        const std::uint8_t old_state = debug_page_state_[static_cast<std::size_t>(page)];
+        if (old_state != 2) {
+            std::fprintf(stderr,
+                         "[KVDBG] RELEASE_CACHE pool=%p page=%d was state=%u (not cache-owned)\n",
+                         static_cast<const void*>(this), page, old_state);
+        }
+        debug_page_state_[static_cast<std::size_t>(page)] = 0;
+        page_trace(this, page, old_state, 0, "release_cache");
+    }
 }
 
 void PagedKVPool::promote_to_cache(std::span<const std::int32_t> page_ids) {
@@ -378,8 +454,27 @@ void PagedKVPool::promote_to_cache(std::span<const std::int32_t> page_ids) {
             throw std::invalid_argument("Paged KV promotion physical page is out of range");
         }
     }
-    cached_pages_ += static_cast<std::uint32_t>(page_ids.size());
-    mapped_pages_ -= static_cast<std::uint32_t>(page_ids.size());
+    const auto count = static_cast<std::uint32_t>(page_ids.size());
+    // A promoted page leaves the owning allocation's reservation and becomes cache-owned: it must
+    // no longer be counted in entitled_pages_. Counting it in both `entitled` and `cached` makes
+    // `page_group_count() - entitled - cached` underflow (unsigned), which silently defeats every
+    // capacity predicate and over-admits until materialization runs out of pages.
+    if (entitled_pages_ < count) {
+        throw std::logic_error("Paged KV promotion exceeds the entitled page count");
+    }
+    entitled_pages_ -= count;
+    cached_pages_ += count;
+    mapped_pages_ -= count;
+    for (std::int32_t page : page_ids) {
+        const std::uint8_t old_state = debug_page_state_[static_cast<std::size_t>(page)];
+        if (old_state != 1) {
+            std::fprintf(stderr,
+                         "[KVDBG] PROMOTE pool=%p page=%d was state=%u (not owned)\n",
+                         static_cast<const void*>(this), page, old_state);
+        }
+        debug_page_state_[static_cast<std::size_t>(page)] = 2;
+        page_trace(this, page, old_state, 2, "promote");
+    }
 }
 
 void PagedKVPool::acquire_row(std::int32_t row) {
@@ -405,11 +500,11 @@ PagedKVAllocation::~PagedKVAllocation() { release(); }
 
 PagedKVAllocation::PagedKVAllocation(PagedKVAllocation&& other) noexcept
     : pool_(other.pool_), page_ids_(std::move(other.page_ids_)),
-      page_entitlement_(other.page_entitlement_), borrowed_pages_(other.borrowed_pages_),
+      cache_owned_(std::move(other.cache_owned_)),
+      page_entitlement_(other.page_entitlement_),
       bound_row_(other.bound_row_) {
     other.pool_             = nullptr;
     other.page_entitlement_ = 0;
-    other.borrowed_pages_   = 0;
     other.bound_row_        = -1;
 }
 
@@ -418,12 +513,11 @@ PagedKVAllocation& PagedKVAllocation::operator=(PagedKVAllocation&& other) noexc
     release();
     pool_                   = other.pool_;
     page_ids_               = std::move(other.page_ids_);
+    cache_owned_            = std::move(other.cache_owned_);
     page_entitlement_       = other.page_entitlement_;
-    borrowed_pages_         = other.borrowed_pages_;
     bound_row_              = other.bound_row_;
     other.pool_             = nullptr;
     other.page_entitlement_ = 0;
-    other.borrowed_pages_   = 0;
     other.bound_row_        = -1;
     return *this;
 }
@@ -437,10 +531,20 @@ std::uint32_t PagedKVAllocation::mapped_page_count() const noexcept {
 }
 
 std::uint32_t PagedKVAllocation::owned_page_count() const noexcept {
-    return static_cast<std::uint32_t>(page_ids_.size()) - borrowed_pages_;
+    std::uint32_t owned = 0;
+    for (bool cache_owned : cache_owned_) {
+        if (!cache_owned) { ++owned; }
+    }
+    return owned;
 }
 
-std::uint32_t PagedKVAllocation::borrowed_page_count() const noexcept { return borrowed_pages_; }
+std::uint32_t PagedKVAllocation::borrowed_page_count() const noexcept {
+    std::uint32_t cached = 0;
+    for (bool cache_owned : cache_owned_) {
+        if (cache_owned) { ++cached; }
+    }
+    return cached;
+}
 
 std::uint32_t PagedKVAllocation::mapped_token_capacity() const noexcept {
     return mapped_page_count() * static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -463,16 +567,24 @@ void PagedKVAllocation::borrow_prefix(std::span<const std::int32_t> page_ids) {
     }
     if (page_ids.empty()) { return; }
     page_ids_.assign(page_ids.begin(), page_ids.end());
-    borrowed_pages_ = static_cast<std::uint32_t>(page_ids.size());
+    cache_owned_.assign(page_ids.size(), true);
 }
 
-void PagedKVAllocation::promote_owned_pages(std::uint32_t count) {
-    if (count == 0) { return; }
-    if (!valid() || count > owned_page_count()) {
-        throw std::invalid_argument("Paged KV promotion exceeds the owned page count");
+void PagedKVAllocation::promote_page_at(std::uint32_t index) {
+    if (!valid() || index >= page_ids_.size()) {
+        throw std::invalid_argument("Paged KV promotion index is out of range");
     }
-    pool_->promote_to_cache(std::span<const std::int32_t>(page_ids_).subspan(borrowed_pages_, count));
-    borrowed_pages_ += count;
+    if (cache_owned_[index]) {
+        throw std::invalid_argument("Paged KV page is already cache-owned");
+    }
+    // The promoted page becomes cache-owned rather than owned: it keeps its id and stays published
+    // in the block table but leaves this allocation's entitlement, so the pool's entitled count
+    // matches the sum of the allocations' entitlements after every promotion. A non-cache-owned
+    // index is an owned page, hence within the current entitlement, so the decrement is safe.
+    const std::int32_t page = page_ids_[index];
+    pool_->promote_to_cache(std::span<const std::int32_t>(&page, 1));
+    cache_owned_[index] = true;
+    --page_entitlement_;
 }
 
 void PagedKVAllocation::set_page_entitlement(std::uint32_t pages) {
@@ -493,16 +605,21 @@ void PagedKVAllocation::cancel_unmapped_entitlement() noexcept {
 }
 
 void PagedKVAllocation::materialize_pages(std::uint32_t pages, cudaStream_t stream) {
-    if (!valid() || pages < mapped_page_count() || pages - borrowed_pages_ > page_entitlement_) {
+    if (!valid() || pages < mapped_page_count()) {
         throw std::invalid_argument("Paged KV materialize extent is outside entitlement");
     }
     const std::uint32_t old_count = mapped_page_count();
     const std::uint32_t count     = pages - old_count;
     if (count == 0) { return; }
+    // New pages are owned, so the owned count grows by `count` and must stay within entitlement.
+    if (owned_page_count() + count > page_entitlement_) {
+        throw std::invalid_argument("Paged KV materialize extent is outside entitlement");
+    }
     const std::int32_t preferred =
         page_ids_.empty() ? -1 : static_cast<std::int32_t>(page_ids_.back() + 1);
     std::vector<std::int32_t> acquired = pool_->take_pages(count, preferred);
     page_ids_.insert(page_ids_.end(), acquired.begin(), acquired.end());
+    cache_owned_.resize(page_ids_.size(), false);
     if (bound_row_ >= 0) { publish_range(old_count, count, stream); }
 }
 
@@ -515,13 +632,18 @@ void PagedKVAllocation::trim_pages(std::uint32_t pages) {
     if (pages > mapped_page_count()) {
         throw std::invalid_argument("Paged KV trim extent exceeds mapped pages");
     }
-    if (pages < borrowed_pages_) {
-        throw std::invalid_argument("Paged KV trim extent would discard borrowed prefix pages");
+    // The trimmed tail must be all owned pages; a cache-owned page (borrowed prefix or adopted
+    // block) is still live in the block table and must not be returned to the pool.
+    for (std::uint32_t i = pages; i < mapped_page_count(); ++i) {
+        if (cache_owned_[i]) {
+            throw std::invalid_argument("Paged KV trim extent would discard cache-owned pages");
+        }
     }
     if (pages == mapped_page_count()) { return; }
     pool_->return_pages(std::span<const std::int32_t>(
         page_ids_.data() + pages, static_cast<std::size_t>(mapped_page_count() - pages)));
     page_ids_.resize(pages);
+    cache_owned_.resize(pages);
 }
 
 void PagedKVAllocation::trim_tokens(std::uint32_t tokens) { trim_pages(pages_for_tokens(tokens)); }
@@ -564,13 +686,21 @@ Tensor PagedKVAllocation::block_table() const {
 void PagedKVAllocation::release() noexcept {
     if (!valid()) { return; }
     unbind_row();
-    const std::size_t owned_count = page_ids_.size() - borrowed_pages_;
-    pool_->return_pages(std::span<const std::int32_t>(page_ids_.data() + borrowed_pages_,
-                                                      owned_count));
+    // Return only the owned pages to the pool. Cache-owned pages (borrowed prefix / adopted
+    // blocks) belong to the prefix cache, stay out of this release, and are reclaimed through the
+    // index's own eviction path instead.
+    std::vector<std::int32_t> owned;
+    owned.reserve(page_ids_.size());
+    for (std::size_t i = 0; i < page_ids_.size(); ++i) {
+        if (!cache_owned_[i]) { owned.push_back(page_ids_[i]); }
+    }
+    if (!owned.empty()) {
+        pool_->return_pages(std::span<const std::int32_t>(owned.data(), owned.size()));
+    }
     pool_->replace_entitlement(page_entitlement_, 0);
     page_ids_.clear();
+    cache_owned_.clear();
     page_entitlement_ = 0;
-    borrowed_pages_   = 0;
     pool_             = nullptr;
 }
 
@@ -597,7 +727,7 @@ void resize_paged_kv_bundle(std::span<const PagedKVResize> changes) {
         if (change.allocation == nullptr || !change.allocation->valid()) {
             throw std::invalid_argument("Paged KV resize must name a live allocation");
         }
-        const std::uint32_t borrowed = change.allocation->borrowed_pages_;
+        const std::uint32_t borrowed = change.allocation->borrowed_page_count();
         if (change.mapped_pages < borrowed ||
             change.mapped_pages > change.allocation->mapped_page_count() ||
             change.mapped_pages - borrowed > change.page_entitlement) {

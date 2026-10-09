@@ -63,7 +63,8 @@ bool admission_resources_fit(const AdmissionResources& used,
 AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
                                               const AdmissionResources& head_resources,
                                               std::span<const ActiveAdmissionSnapshot> active,
-                                              const AdmissionResources& capacity) {
+                                              const AdmissionResources& capacity,
+                                              const AdmissionResources& cache_residue) {
     if (epoch_id == 0 || head_request_id == 0 || active.empty() ||
         active.size() > kMaximumConcurrency || head_resources.active_lanes == 0 ||
         !admission_resources_fit(head_resources, capacity)) {
@@ -74,6 +75,7 @@ AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint6
     out.epoch_id        = epoch_id;
     out.head_request_id = head_request_id;
     out.head_resources  = head_resources;
+    out.cache_residue   = cache_residue;
     out.incumbent_count = active.size();
 
     ResourceTotals survivors;
@@ -85,8 +87,14 @@ AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint6
         add(survivors, active[i].resources);
     }
     add(survivors, head_resources);
+    add(survivors, cache_residue);
+    // The head still fits with every incumbent and the whole non-reclaimable cache held: no donor
+    // release can be what unblocks it, so there is no frontier to borrow across. Drain instead of
+    // asserting -- the head is retried exactly against the live pool every turn, and it proceeds
+    // once the cache releases, so this is a waiting state, never an Engine failure.
     if (fits(survivors, capacity)) {
-        throw std::invalid_argument("protected head is not blocked by frozen incumbents");
+        out.phase = ProtectionPhase::Drain;
+        return out;
     }
 
     std::array<std::size_t, kMaximumConcurrency> order{};
@@ -106,7 +114,12 @@ AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint6
         out.temporal_credit              = donor.remaining_work_quanta;
         if (fits(survivors, capacity)) { return out; }
     }
-    throw std::logic_error("exclusive-feasible head has no releasing incumbent frontier");
+    // Cache residency alone keeps the head infeasible even after every incumbent releases. That is
+    // a legitimate blocked head (the residency is reclaimed asynchronously), not a contradiction.
+    out.incumbent_count = 0;
+    out.donor_count     = 0;
+    out.phase           = ProtectionPhase::Drain;
+    return out;
 }
 
 bool persistent_backfill_is_safe(const AdmissionProtection& protection,
@@ -115,6 +128,7 @@ bool persistent_backfill_is_safe(const AdmissionProtection& protection,
                                  const AdmissionResources& capacity) noexcept {
     ResourceTotals future;
     add(future, protection.head_resources);
+    add(future, protection.cache_residue);
     for (const ActiveAdmissionSnapshot& request : active) {
         if (is_incumbent(protection, request.request_id)) {
             if (!is_donor(protection, request.request_id)) { add(future, request.resources); }
@@ -144,6 +158,7 @@ bool protected_head_safe_without_temporal(const AdmissionProtection& protection,
                                           const AdmissionResources& capacity) noexcept {
     ResourceTotals used;
     add(used, protection.head_resources);
+    add(used, protection.cache_residue);
     for (const ActiveAdmissionSnapshot& request : active) {
         if (is_incumbent(protection, request.request_id) ||
             request.backfill_epoch != protection.epoch_id ||

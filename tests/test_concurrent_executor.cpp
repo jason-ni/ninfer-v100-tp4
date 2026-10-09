@@ -25,6 +25,8 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <exception>
@@ -36,6 +38,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -205,7 +208,25 @@ public:
         return base;
     }
 
+    // Reproduces a pool whose remaining room is held by PREFIX-CACHE residency that no active plan
+    // reservation covers: a borrowed prefix page kept pinned by a running sequence, or an in-flight
+    // write-through pin. While armed, every empty lane is unreservable, so the scheduler correctly
+    // sees the queue head as blocked even though `head + active plans <= capacity` on its own.
+    void set_admission_blocked(bool blocked) noexcept {
+        admission_blocked_.store(blocked, std::memory_order_relaxed);
+    }
+    // Non-reclaimable cache residency that the protected-admission arithmetic must account for.
+    // Zero until a test arms it; the real Program derives it from the pool and prefix index.
+    void set_admission_cache_residue(std::uint32_t main_pages) noexcept {
+        residue_main_.store(main_pages, std::memory_order_relaxed);
+    }
+    [[nodiscard]] rt::AdmissionResources admission_cache_residue() const noexcept {
+        return rt::AdmissionResources{
+            .active_lanes = 0, .main_kv_pages = residue_main_.load(std::memory_order_relaxed)};
+    }
+
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const ScriptedPlan&) const noexcept {
+        if (admission_blocked_.load(std::memory_order_relaxed)) { return false; }
         return lane < max_concurrency_ && lanes_[lane].lifecycle == Lifecycle::Empty;
     }
 
@@ -358,6 +379,8 @@ private:
     std::deque<GenerationScript> queued_;
     std::vector<TokenId> batch_;
     std::size_t maximum_batch_rows_ = 0;
+    std::atomic<bool> admission_blocked_{false};
+    std::atomic<std::uint32_t> residue_main_{0};
 };
 
 struct ScriptedPackage {
@@ -682,6 +705,53 @@ void test_engine_scope_failure_still_fails_all(const q36::Frontend& frontend,
            "a request after a device failure was not refused as unavailable");
 }
 
+// A pool whose remaining room is held by prefix-cache residency that no active plan reservation
+// covers blocks admission while `head + active plans` still fits on its own. The protected-head
+// precondition asserted on the plan sum alone and threw "protected head is not blocked by frozen
+// incumbents"; the worker loop treated that as an engine-scope failure and stopped serving
+// (every later request answered "inference engine is unavailable"). The fix folds the
+// non-reclaimable cache residency into the protection arithmetic, so the same state is an
+// ordinary blocked head: the incumbent keeps running, the head waits, and it proceeds once the
+// cache releases.
+void test_protected_head_blocked_by_cache_residency(const q36::Frontend& frontend,
+                                                    const ninfer::DeviceContext& device) {
+    ScriptedInstance instance{.loaded  = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                              .program = std::make_unique<ScriptedProgram>(2),
+                              .request_memory         = {},
+                              .kv_capacity_resolution = {}};
+    ScriptedProgram& program = *instance.program;
+    Executor executor(instance, executor_options(2), device);
+
+    // A stays active for the whole test: its script far outruns the rounds it will actually run.
+    program.push_script(GenerationScript{.tokens = std::vector<TokenId>(200000, 0)});
+    program.push_script(GenerationScript{.tokens = {0}}); // B completes as soon as it admits.
+
+    auto a = submit_request(executor, frontend, 200000);
+    for (int spin = 0; spin < 5000 && executor.runtime_stats().running_requests == 0; ++spin) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    expect(executor.runtime_stats().running_requests >= 1, "the incumbent was never admitted");
+
+    // The pool now holds cache residency the incumbent's plan does not cover: `head + active plans`
+    // fits the pool, but the head is genuinely blocked.
+    program.set_admission_cache_residue(1);
+    program.set_admission_blocked(true);
+    auto b = submit_request(executor, frontend, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    expect(executor.runtime_stats().running_requests >= 1,
+           "a cache-blocked protected head killed the running request (engine-scope failure)");
+
+    // Release the cache residency: the blocked head must proceed and complete normally.
+    program.set_admission_blocked(false);
+    const Outcome b_outcome = await(std::move(b));
+    expect(b_outcome.ok, "the blocked head did not proceed after the cache released");
+    expect(b_outcome.error.find("protected head") == std::string::npos,
+           "the blocked head was failed by the protected-admission precondition");
+
+    (void)a; // A is cancelled when its handle is destroyed; the Engine must still be alive.
+}
+
 } // namespace
 
 int main() {
@@ -699,5 +769,6 @@ int main() {
     test_request_scope_failure_is_isolated(frontend, device, true);
     test_request_scope_failure_is_isolated(frontend, device, false);
     test_engine_scope_failure_still_fails_all(frontend, device);
+    test_protected_head_blocked_by_cache_residency(frontend, device);
     return failures == 0 ? 0 : 1;
 }

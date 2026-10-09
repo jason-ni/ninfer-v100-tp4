@@ -142,11 +142,15 @@ public:
     // Transfers already-mapped pages from an allocation to the prefix cache in place: the page ids
     // stay published and keep their contents, but the pool now counts them as cache-owned rather
     // than sequence-mapped. The owning allocation must stop returning them (see
-    // PagedKVAllocation::promote_owned_pages).
+    // PagedKVAllocation::promote_page_at).
     void promote_to_cache(std::span<const std::int32_t> page_ids);
 
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
+
+    // Debug: per-page ownership state (0 free, 1 owned/entitled, 2 cache-owned). Temporary
+    // instrumentation for the M2 host-restore clobber investigation.
+    [[nodiscard]] std::uint8_t debug_page_state(std::int32_t page) const noexcept;
 
 private:
     friend class PagedKVAllocation;
@@ -170,6 +174,7 @@ private:
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;
     std::uint32_t cached_pages_   = 0;
+    std::vector<std::uint8_t> debug_page_state_;
 };
 
 class PagedKVAllocation {
@@ -198,10 +203,12 @@ public:
     // continues to bound only owned pages.
     void borrow_prefix(std::span<const std::int32_t> page_ids);
 
-    // Promotes the first `count` owned pages into the prefix cache in place and folds them into the
-    // borrowed prefix, so release()/trim() never return them. The pages must already be mapped and
-    // are expected to form the complete leading blocks handed to the cache.
-    void promote_owned_pages(std::uint32_t count);
+    // Promotes one owned page into the prefix cache in place: it keeps its id, stays published in
+    // the block table, and is folded into the cache-owned set so release()/trim() never return it.
+    // The page must already be mapped and not yet cache-owned. Called per committed block only when
+    // the index actually adopted the page (see PrefixIndex::commit_block), so a duplicate commit
+    // never releases a page that is still live in this allocation's block table.
+    void promote_page_at(std::uint32_t index);
 
     void set_page_entitlement(std::uint32_t pages);
     void cancel_unmapped_entitlement() noexcept;
@@ -227,8 +234,13 @@ private:
 
     PagedKVPool* pool_ = nullptr;
     std::vector<std::int32_t> page_ids_;
+    // Per-page cache ownership, parallel to page_ids_. A set entry marks a page the prefix cache /
+    // index owns (either borrowed from a reused prefix or adopted by commit_block), so release() and
+    // trim() never return it. Cache-owned pages need not be contiguous (a partial reuse leaves a
+    // non-adopted owned prefix followed by an adopted suffix), so this is tracked per page rather
+    // than as a leading count.
+    std::vector<bool> cache_owned_;
     std::uint32_t page_entitlement_ = 0;
-    std::uint32_t borrowed_pages_   = 0;
     std::int32_t bound_row_         = -1;
 };
 

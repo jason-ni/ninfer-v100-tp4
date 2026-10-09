@@ -291,6 +291,8 @@ public:
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan& plan) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    [[nodiscard]] runtime::AdmissionResources admission_cache_residue() const noexcept;
+    void debug_watch_prefix_pages(const char* tag) noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPromptData&& prompt,
                                                                 RequestPlan&& plan,
@@ -401,6 +403,11 @@ public:
     // M2: dedicated cache transfer stream per rank for D2H/H2D copies.
     std::array<cudaStream_t, kMaximumDevices> prefix_cache_stream{};
     std::array<cudaEvent_t, kMaximumDevices> prefix_cache_event{};
+    // Source-ordering events, one per rank: each marks "every compute-stream operation submitted
+    // so far on this rank is complete". A cache-stream D2H must wait on it before reading device
+    // state (a GDN snapshot slot or KV page) that the compute stream just wrote, otherwise the copy
+    // can capture stale contents. Recorded immediately before each write-through D2H.
+    std::array<cudaEvent_t, kMaximumDevices> prefix_cache_src_event{};
     // Per-rank slice sizes inside a host slab (a slab holds tp consecutive rank slices).
     std::size_t prefix_block_rank_bytes = 0;
     std::size_t prefix_snapshot_rank_bytes = 0;
@@ -550,6 +557,10 @@ private:
     // Best-effort and non-throwing: allocation or enqueue failure rolls the reservation back.
     void issue_block_write_through(ninfer::prefix_cache::NodeId node) noexcept;
     void issue_snapshot_write_through(ninfer::prefix_cache::SnapshotId id) noexcept;
+    // Order the rank's cache stream after all compute-stream work submitted so far, so a D2H
+    // write-through cannot read a GDN snapshot slot or KV page before the compute stream that wrote
+    // it has finished. Called immediately before each per-rank D2H.
+    void order_prefix_cache_after_compute(int rank) noexcept;
     // Poll in-flight write-throughs; complete (and unpin) every transfer whose per-rank events
     // have all fired. Called at round boundaries.
     void tick_prefix_cache() noexcept;
@@ -570,6 +581,7 @@ private:
                              std::uint32_t backend_pages);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
+    void resize_paged_kv_with_eviction(std::span<PagedKVResize> changes);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

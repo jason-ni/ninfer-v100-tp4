@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -567,6 +569,11 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     auto scope = workspace.scope();
     detail::GqaAttentionRoute route =
         detail::gqa_attention_resolve_route(q.ne[1], width, batch, cache.dtype, envelope);
+    if (std::getenv("NINFER_ROUTE_DBG") != nullptr) {
+        std::fprintf(stderr, "[ROUTE] %s qheads=%d width=%d batch=%d min=%u max=%u\n",
+                     detail::gqa_attention_route_name(route), q.ne[1], width, batch,
+                     envelope.min_visible_keys, envelope.max_visible_keys);
+    }
 #ifdef NINFER_VOLTA_BUILD
     if (route == detail::GqaAttentionRoute::VoltaFlash && valid_columns.data == nullptr) {
         VoltaFlashWorkspace staging =
@@ -626,6 +633,10 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
     const std::uint32_t capacity = validate_cache(cache, kv_heads, op);
     if (static_cast<std::uint32_t>(tokens) > capacity) {
         throw std::invalid_argument("gqa_kv_append: T exceeds KV cache capacity");
+    }
+    if (std::getenv("NINFER_ROUTE_DBG") != nullptr) {
+        std::fprintf(stderr, "[KAPP] k_pages=%p block_table=%p tokens=%d\n", cache.k_pages.data,
+                     cache.block_table.data, tokens);
     }
     detail::gqa_kv_append_launch(k, v, positions, cache, stream);
 }

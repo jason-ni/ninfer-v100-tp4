@@ -42,13 +42,36 @@ int main() {
         },
     };
 
+    const AdmissionResources no_cache_residue{};
     const auto protection = ninfer::runtime::make_admission_protection(
-        7, 10, head, std::span<const ActiveAdmissionSnapshot>(incumbents), capacity);
+        7, 10, head, std::span<const ActiveAdmissionSnapshot>(incumbents), capacity,
+        no_cache_residue);
     failures += check(protection.donor_count == 1 && protection.donor_ids[0] == 2 &&
                           protection.temporal_credit == 20,
                       "release frontier did not select the earliest sufficient incumbent");
     failures += check(ninfer::runtime::protection_frontier_distance(protection, incumbents) == 20,
                       "frontier distance did not follow the frozen donor");
+
+    // A head whose plan sum fits alongside every incumbent, but whose pool also holds a chunk of
+    // non-reclaimable prefix-cache residency, is a legitimately blocked head (the residency is
+    // reclaimed asynchronously) and must produce a draining protection, not a contradiction. This
+    // is the exact state that used to throw and take the Engine out of service.
+    {
+        const AdmissionResources small_head{1, 16, 16};
+        std::array<ActiveAdmissionSnapshot, 2> small_incumbents{
+            ActiveAdmissionSnapshot{
+                .request_id = 1, .resources = {1, 32, 32}, .remaining_work_quanta = 100},
+            ActiveAdmissionSnapshot{
+                .request_id = 2, .resources = {1, 32, 32}, .remaining_work_quanta = 20},
+        };
+        const AdmissionResources residue{0, 48, 48};
+        const auto blocked = ninfer::runtime::make_admission_protection(
+            8, 11, small_head, std::span<const ActiveAdmissionSnapshot>(small_incumbents), capacity,
+            residue);
+        failures += check(blocked.phase == ninfer::runtime::ProtectionPhase::Drain &&
+                              blocked.donor_count == 0,
+                          "cache-residency-blocked head was not treated as a draining wait");
+    }
 
     const AdmissionResources persistent_candidate{1, 24, 40};
     failures += check(ninfer::runtime::persistent_backfill_is_safe(protection, incumbents,

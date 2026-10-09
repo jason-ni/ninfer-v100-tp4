@@ -206,6 +206,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
                 const int lane2             = tid & 31;
                 int physical_page = lane2 == 0 ? paged_kv_physical_page(block_table, p_tok) : 0;
                 physical_page      = __shfl_sync(FullMask, physical_page, 0);
+                kv_debug_probe(7, cache_k, physical_page, p_tok, lane2);
                 const std::int64_t cache_off =
                     gqa_cache_index<Geometry>(physical_page, kv_head, d, p_tok & kPagedKVPageMask);
                 store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));

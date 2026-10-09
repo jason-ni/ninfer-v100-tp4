@@ -235,6 +235,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int position = pos[token];
             if (position < split_start || position >= split_end) { continue; }
             int physical_page       = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+            kv_debug_probe(2, cache_k_i8, physical_page, position, lane);
             const int page_offset   = position & kPagedKVPageMask;
             const int d0            = grp * kGqaKvQuantGroup + lane;
             const int d1            = d0 + 32;
@@ -739,6 +740,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int position = pos[token];
             if (position < split_start || position >= split_end) { continue; }
             int physical_page       = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+            kv_debug_probe(2, cache_k_i8, physical_page, position, lane);
             const int page_offset   = position & kPagedKVPageMask;
             const int d0            = grp * kGqaKvQuantGroup + lane;
             const int d1            = d0 + 32;

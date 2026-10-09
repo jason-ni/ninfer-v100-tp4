@@ -13,13 +13,117 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
+#include <vector>
+
+namespace ninfer { namespace ops {
+void kv_dbg_reset(cudaStream_t stream);
+void kv_dbg_dump();
+} }
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+
+namespace {
+// Debug (NINFER_RESTORE_DUMP): FNV-1a over a device buffer, to compare restored vs borrowed KV and
+// GDN state byte-for-byte across the device-borrow and host-restore scenarios.
+std::uint64_t dbg_mix(std::uint64_t h, const void* p, std::size_t n) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    for (std::size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
+    return h;
+}
+std::uint64_t dbg_checksum_page(const PagedKVPool& pool, std::int32_t page, cudaStream_t stream) {
+    const std::size_t total = pool.per_page_bytes();
+    std::vector<unsigned char> buf(total);
+    if (!pool.copy_page_d2h(buf.data(), page, stream)) { return 0; }
+    (void)cudaStreamSynchronize(stream);
+    return dbg_mix(1469598103934665603ULL, buf.data(), total);
+}
+// Debug (NINFER_RESTORE_DUMP): FNV-1a over host-resident slab bytes (CPU-side), to compare the
+// host-tier copy against the device page it was written from / restored to.
+std::uint64_t dbg_checksum_host(const void* p, std::size_t n) {
+    return dbg_mix(1469598103934665603ULL, p, n);
+}
+// Debug (NINFER_PAGECK): checksum the clobbered prefix pages at a request boundary so the point at
+// which a resident page first diverges from its seed value can be localized.
+void dbg_dump_pages_ck(const PagedKVPool& pool, cudaStream_t stream, const char* who) {
+    std::fprintf(stderr, "[PAGECK] %s:", who);
+    for (std::int32_t page : {8, 9, 10, 11, 12, 13, 14, 15, 30}) {
+        std::fprintf(stderr, " p%d=%016llx", page,
+                     static_cast<unsigned long long>(dbg_checksum_page(pool, page, stream)));
+    }
+    std::fprintf(stderr, "\n");
+}
+// Debug (NINFER_PAGECK): read back the DEVICE block-table row so the physical-page mapping the
+// kernel is actually given can be compared against the host page_ids_ source of truth.
+void dbg_dump_blocktable_row(const PagedKVAllocation& alloc, cudaStream_t stream) {
+    if (alloc.bound_row() < 0) { return; }
+    const Tensor row = alloc.block_table();
+    const std::size_t entries = row.bytes() / sizeof(std::int32_t);
+    std::vector<std::int32_t> host(entries);
+    cudaMemcpyAsync(host.data(), row.data, row.bytes(), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    std::fprintf(stderr, " [BT] row=%d:", alloc.bound_row());
+    for (std::size_t i = 0; i < entries && i < 16; ++i) { std::fprintf(stderr, " %d", host[i]); }
+    std::fprintf(stderr, "\n");
+}
+// Debug (NINFER_PAGECK): dump a pool's plane address spans and where its K-plane pages 8-15 live,
+// so cross-pool aliasing (e.g. mtp_cache over text_kv) can be ruled in or out.
+void dbg_dump_pool_span(const PagedKVPool& pool, const char* name) {
+    unsigned long long lo = ~0ULL, hi = 0;
+    for (std::size_t i = 0; i < pool.plane_count(); ++i) {
+        const Tensor& t = pool.plane(i);
+        auto base = reinterpret_cast<unsigned long long>(t.data);
+        auto end  = base + static_cast<unsigned long long>(t.bytes());
+        if (base < lo) { lo = base; }
+        if (end > hi) { hi = end; }
+    }
+    const Tensor& k      = pool.plane(0);
+    unsigned long long kb = reinterpret_cast<unsigned long long>(k.data);
+    unsigned long long per_page = static_cast<unsigned long long>(k.bytes()) /
+                                  static_cast<unsigned long long>(pool.page_group_count());
+    std::fprintf(stderr, "[POOLS] %s span=[%016llx,%016llx) planes=%zu | K.p8=%016llx "
+                         "K.p15end=%016llx\n",
+                 name, lo, hi, pool.plane_count(), kb + 8 * per_page, kb + 16 * per_page);
+}
+std::uint64_t dbg_checksum_gdn(const LinearAttentionStatePool& la, std::int32_t slot) {
+    std::uint64_t h = 1469598103934665603ULL;
+    for (std::uint32_t layer = 0; layer < la.layer_count(); ++layer) {
+        const Tensor conv = la.conv_slot(layer, slot);
+        const Tensor rec  = la.recurrent_slot(layer, slot);
+        std::vector<unsigned char> cb(conv.bytes()), rb(rec.bytes());
+        cudaMemcpy(cb.data(), conv.data, conv.bytes(), cudaMemcpyDeviceToHost);
+        cudaMemcpy(rb.data(), rec.data, rec.bytes(), cudaMemcpyDeviceToHost);
+        h = dbg_mix(h, cb.data(), cb.size());
+        h = dbg_mix(h, rb.data(), rb.size());
+    }
+    return h;
+}
+// Debug (NINFER_BT_DUMP): for every lane, print the block-table slots that reference one of the
+// clobbered prefix pages (8..15 or 30), so the request that references a page it does not own is
+// identified.
+void dbg_dump_block_tables(const PagedKVPool& pool, int num_lanes, const char* who) {
+    for (int lane = 0; lane < num_lanes; ++lane) {
+        Tensor row = pool.block_table_row(lane);
+        std::vector<std::int32_t> vals(row.ne[0]);
+        cudaMemcpy(vals.data(), row.data, row.bytes(), cudaMemcpyDeviceToHost);
+        std::fprintf(stderr, "[BTDUMP] %s lane=%d:", who, lane);
+        for (std::int32_t s = 0; s < row.ne[0]; ++s) {
+            const std::int32_t p = vals[s];
+            if ((p >= 8 && p <= 15) || p == 30) {
+                std::fprintf(stderr, " [%d]=%d", s, p);
+            }
+        }
+        std::fprintf(stderr, "\n");
+    }
+}
+} // namespace
 
 // Evicted prefix-cache pages return to every rank's text-KV pool; snapshot slots are statically
 // partitioned from the linear-attention pool, so releasing one is bookkeeping only.
@@ -578,15 +682,23 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
                         .snapshot_slab_count = snap_count,
                     });
                 prefix_index->set_host_pool(prefix_host_pool.get());
-                // M2: dedicated cache transfer stream per rank for D2H/H2D copies.
+                // M2: dedicated cache transfer stream per rank for D2H/H2D copies. Each rank's
+                // stream and events must be created with THAT rank's device current, because they
+                // operate on that rank's KV/GDN memory under ScopedDevice(rank_device.device); a
+                // stream or event bound to the wrong device is an invalid resource handle.
                 for (int rank = 0; rank < tp; ++rank) {
                     const auto slot = static_cast<std::size_t>(rank);
+                    DeviceContext& rank_device = rank == 0 ? device : peer[slot]->device;
+                    const ScopedDevice scope(rank_device.device);
                     cudaStream_t stream = nullptr;
                     cudaEvent_t event   = nullptr;
+                    cudaEvent_t src     = nullptr;
                     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
                     CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-                    prefix_cache_stream[slot] = stream;
-                    prefix_cache_event[slot]  = event;
+                    CUDA_CHECK(cudaEventCreateWithFlags(&src, cudaEventDisableTiming));
+                    prefix_cache_stream[slot]    = stream;
+                    prefix_cache_event[slot]     = event;
+                    prefix_cache_src_event[slot] = src;
                 }
             }
         }
@@ -647,6 +759,9 @@ ProgramImplCore::~ProgramImplCore() noexcept {
         if (prefix_cache_event[slot] != nullptr) {
             (void)cudaEventDestroy(prefix_cache_event[slot]);
         }
+        if (prefix_cache_src_event[slot] != nullptr) {
+            (void)cudaEventDestroy(prefix_cache_src_event[slot]);
+        }
     }
 }
 
@@ -665,10 +780,15 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
                                 : std::array<std::uint32_t, ninfer::prefix_cache::kMaxPools>{0U, 0U};
     const auto can_replace = [&evictable](const PagedKVPool& pool, std::uint32_t old_pages,
                                  std::uint32_t new_pages, std::uint32_t evictable_pages) {
-        return old_pages <= pool.entitled_pages() && new_pages <= pool.logical_page_capacity() &&
-               new_pages <=
-                   pool.page_group_count() - (pool.entitled_pages() - old_pages) -
-                       pool.cached_pages() + evictable_pages;
+        if (old_pages > pool.entitled_pages() || new_pages > pool.logical_page_capacity()) {
+            return false;
+        }
+        const std::int64_t headroom =
+            static_cast<std::int64_t>(pool.page_group_count()) -
+            static_cast<std::int64_t>(pool.entitled_pages() - old_pages) -
+            static_cast<std::int64_t>(pool.cached_pages()) +
+            static_cast<std::int64_t>(evictable_pages);
+        return headroom >= 0 && static_cast<std::int64_t>(new_pages) <= headroom;
     };
     const std::uint32_t old_text = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
     if (!can_replace(decoder->text_kv.pool(), old_text, plan.impl_->text_kv_page_entitlement,
@@ -719,8 +839,12 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
             return false;
         }
         const std::uint32_t committed = pool.entitled_pages() - old_pages - reclaimable_pages;
-        return new_pages <=
-               pool.page_group_count() - committed - pool.cached_pages() + evictable_pages;
+        const std::int64_t headroom =
+            static_cast<std::int64_t>(pool.page_group_count()) -
+            static_cast<std::int64_t>(committed) -
+            static_cast<std::int64_t>(pool.cached_pages()) +
+            static_cast<std::int64_t>(evictable_pages);
+        return headroom >= 0 && static_cast<std::int64_t>(new_pages) <= headroom;
     };
 
     const SequenceState& sequence = sequences[lane];
@@ -747,11 +871,96 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
     };
 }
 
+void ProgramImplCore::debug_watch_prefix_pages(const char* tag) noexcept {
+    if (prefix_index == nullptr || std::getenv("NINFER_PREFIX_WATCH") == nullptr) { return; }
+    try {
+        (void)cudaStreamSynchronize(device.stream);
+        struct WatchState {
+            std::uint64_t hash;
+            std::int32_t page;
+        };
+        static std::unordered_map<std::uint64_t, WatchState> previous;
+        std::vector<char> buffer(decoder->text_kv.pool().per_page_bytes());
+        for (ninfer::prefix_cache::NodeId id : prefix_index->debug_live_node_ids()) {
+            const ninfer::prefix_cache::BlockNode* node = prefix_index->node(id);
+            if (node == nullptr ||
+                node->device_state != ninfer::prefix_cache::Residency::Resident) {
+                continue;
+            }
+            const std::int32_t page = node->device_pages.page[0];
+            if (page < 0) { continue; }
+            if (!decoder->text_kv.pool().copy_page_d2h(buffer.data(), page, nullptr)) { continue; }
+            (void)cudaStreamSynchronize(nullptr);
+            std::uint64_t hash = 1469598103934665603ULL;
+            for (char c : buffer) {
+                hash = (hash ^ static_cast<unsigned char>(c)) * 1099511628211ULL;
+            }
+            const std::uint64_t key = (static_cast<std::uint64_t>(id) << 16) | node->generation;
+            if (id == 10) {
+                std::fprintf(stderr, "[N10] %s gen=%u depth=%d page=%d hash=%016llx\n", tag,
+                             node->generation, node->depth, page,
+                             static_cast<unsigned long long>(hash));
+            }
+            const auto it           = previous.find(key);
+            if (it != previous.end() && it->second.hash != hash) {
+                std::fprintf(
+                    stderr,
+                    "[PATCH] %s node=%u depth=%d page=%d (was page=%d) hash %016llx -> %016llx %s\n",
+                    tag, id, node->depth, page, it->second.page,
+                    static_cast<unsigned long long>(it->second.hash),
+                    static_cast<unsigned long long>(hash),
+                    it->second.page != page ? "REMAPPED" : "CHANGED");
+                if (it->second.page == page) {
+                    std::fprintf(stderr, "[PATCH]   bytes page=%d:", page);
+                    for (int b = 0; b < 16; ++b) {
+                        std::fprintf(stderr, " %02x", static_cast<unsigned char>(buffer[b]));
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+            }
+            previous[key] = WatchState{hash, page};
+        }
+        std::fprintf(stderr, "[PATCH] watch '%s' complete\n", tag);
+    } catch (...) {
+    }
+}
+
+runtime::AdmissionResources ProgramImplCore::admission_cache_residue() const noexcept {
+    // Device prefix-cache residency that an admission-time eviction cannot reclaim. A device node
+    // counts here when it is cached but held off the eviction LRU by a live reference: a borrowed
+    // or promoted prefix page of a running sequence, or an in-flight write-through/restore pin.
+    // `can_admit_lane` already credits only the LRU-linked pages as capacity, so protected-admission
+    // feasibility has to charge this residue too -- otherwise a head that is genuinely blocked by
+    // pinned cache pages looks like it is "not blocked by frozen incumbents". Over-counting is
+    // safe: it can only make the protected projection conservative, never admit a request.
+    if (prefix_index == nullptr) { return {}; }
+    const std::array<std::uint32_t, ninfer::prefix_cache::kMaxPools> evictable =
+        prefix_index->evictable_page_counts();
+    const auto residual = [](std::uint32_t cached, std::uint32_t reclaimable) {
+        return cached > reclaimable ? cached - reclaimable : 0U;
+    };
+    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    return runtime::AdmissionResources{
+        .active_lanes     = 0,
+        .main_kv_pages    = residual(decoder->text_kv.pool().cached_pages(), evictable[0]),
+        .backend_kv_pages = backend != nullptr
+                                ? residual(backend->pool().cached_pages(), evictable[1])
+                                : 0U,
+    };
+}
+
 runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lane,
                                                                PreparedPromptData&& prompt,
                                                                RequestPlan&& plan,
                                                                runtime::TransientRegion transient) {
     tick_prefix_cache();
+    if (std::getenv("NINFER_PREFIX_WATCH") != nullptr) {
+        ::ninfer::ops::kv_dbg_reset(device.stream);
+    }
+    if (std::getenv("NINFER_PAGECK") != nullptr) {
+        dbg_dump_pages_ck(decoder->text_kv.pool(), device.stream, "enter");
+    }
+    debug_watch_prefix_pages("admit");
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
@@ -961,6 +1170,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                     const ninfer::prefix_cache::PoolPages pages = acquire_cache_bundle();
                     prefix_index->begin_device_fill(node_id, pages);
                     char* slab = static_cast<char*>(prefix_host_pool->data(node->host_page));
+                    if (std::getenv("NINFER_RESTORE_DUMP") != nullptr && sequence.lane == 0) {
+                        const std::size_t tlen = decoder->text_kv.pool().per_page_bytes();
+                        std::fprintf(stderr,
+                                     "[SLAB_PRE] node=%u depth=%d host_page=%d slab_ck=%016llx\n",
+                                     static_cast<unsigned>(node_id), node->depth,
+                                     static_cast<int>(node->host_page),
+                                     (unsigned long long)dbg_checksum_host(slab, tlen));
+                    }
                     bool ok = true;
                     for (int rank = 0; ok && rank < tp; ++rank) {
                         ok = copy_cache_block(rank, pages.page[0], pages.page[1],
@@ -1040,6 +1257,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             if (restored == nullptr || !restored->device_resident()) {
                 throw std::logic_error("planned block snapshot is unavailable");
             }
+            debug_watch_prefix_pages("restored");
             sequence.prefix_pinned_nodes = request_plan.block_path;
             sequence.prefix_snapshot     = snap_id;
             sequence.prefix_borrowed     = true;
@@ -1050,6 +1268,24 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             const std::int32_t snapshot_slot = LinearStateSlots::snapshot_state_slot(
                 static_cast<std::uint32_t>(restored->device_slot), max_concurrency,
                 prefix_snapshot_slots);
+            if (std::getenv("NINFER_RESTORE_DUMP") != nullptr && sequence.lane == 0) {
+                const bool is_host = prefix_host_pool != nullptr;
+                static int dev_n = 0, host_n = 0;
+                if ((is_host ? host_n : dev_n) < 3) {
+                    if (is_host) { ++host_n; } else { ++dev_n; }
+                    std::fprintf(stderr,
+                                 "[RDUMP] %s base=%u npages=%zu slot=%d gdn=%016llx\n",
+                                 is_host ? "HOST" : "DEV", base, text_pages.size(), snapshot_slot,
+                                 (unsigned long long)dbg_checksum_gdn(decoder->linear_attention,
+                                                                      snapshot_slot));
+                    for (std::size_t i = 0; i < text_pages.size(); ++i) {
+                        std::fprintf(stderr, "[RDUMP]   %s page[%zu]=%d cksum=%016llx\n",
+                                     is_host ? "H" : "D", i, text_pages[i],
+                                     (unsigned long long)dbg_checksum_page(
+                                         decoder->text_kv.pool(), text_pages[i], device.stream));
+                    }
+                }
+            }
             decoder->linear_attention.copy_slot(
                 snapshot_slot, LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                 device.stream);
@@ -1113,6 +1349,24 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : backend_kv_cache() != nullptr ? prompt_tokens : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
+        if (std::getenv("NINFER_PAGECK") != nullptr) {
+            dbg_dump_pages_ck(decoder->text_kv.pool(), device.stream, "post-materialize");
+        }
+        if (std::getenv("NINFER_PREFIX_WATCH") != nullptr && sequence.kv) {
+            std::vector<std::int32_t> row(48, -99);
+            const Tensor table = sequence.kv->text.block_table();
+            (void)cudaMemcpy(row.data(), table.data, row.size() * sizeof(std::int32_t),
+                             cudaMemcpyDeviceToHost);
+            std::fprintf(stderr, "[PCDBG] row lane=%u reuse=%d base=%u prompt=%u ptr=%p rowidx=%d:",
+                         sequence.lane, static_cast<int>(request_plan.reuse), base, prompt_tokens,
+                         static_cast<const void*>(table.data), sequence.kv->text.bound_row());
+            for (std::int32_t v : row) { std::fprintf(stderr, " %d", v); }
+            std::fprintf(stderr, "\n");
+            const qwen3_6::PagedKVCache* be = backend_kv_cache();
+            std::fprintf(stderr, "[POOLBASE] text0=%p backend0=%p\n",
+                         decoder->text_kv.pool().plane(0).data,
+                         be != nullptr ? be->pool().plane(0).data : nullptr);
+        }
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -1477,6 +1731,7 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 
 void ProgramImplCore::finalize_prefix_cache_state(SequenceState& sequence) noexcept {
     if (prefix_index == nullptr) { return; }
+    debug_watch_prefix_pages("pre-finalize");
     // M2: persist device-resident blocks that gained no host copy yet. This runs BEFORE the
     // lane's pins drop, and each issue pins its node against eviction for the transfer's
     // duration, so the D2H can never race a page release. Best-effort; never throws.
@@ -1521,6 +1776,11 @@ void ProgramImplCore::finalize_prefix_cache_state(SequenceState& sequence) noexc
     // blocks as still in-flight (restore_pins != 0), counts them as non-evictable, and rejects a
     // request that would otherwise fit once the prior blocks can be demoted to host.
     settle_prefix_writes();
+    if (std::getenv("NINFER_PREFIX_WATCH") != nullptr) { ::ninfer::ops::kv_dbg_dump(); }
+    if (std::getenv("NINFER_PAGECK") != nullptr) {
+        dbg_dump_pages_ck(decoder->text_kv.pool(), device.stream, "exit");
+    }
+    debug_watch_prefix_pages("after-clear");
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
@@ -1601,6 +1861,9 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
             }
         }
     }
+    if (std::getenv("NINFER_PAGECK") != nullptr) {
+        dbg_dump_pages_ck(decoder->text_kv.pool(), device.stream, "post-reserve");
+    }
     SequenceKVBundle bundle;
     bundle.text = std::move(allocations[0]);
     if (count == 2) { bundle.backend.emplace(std::move(allocations[1])); }
@@ -1633,6 +1896,27 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
     sequence.kv.emplace(std::move(bundle));
 }
 
+void ProgramImplCore::resize_paged_kv_with_eviction(std::span<PagedKVResize> changes) {
+    // `admission` is granted against an estimate that credits reclaimable cache pages
+    // (`can_admit_lane`), but `resize_paged_kv_bundle` only accepts room that is free right now.
+    // Realize the credited room by evicting device-resident cache nodes, exactly as
+    // `reserve_sequence_kv` and `acquire_cache_bundle` do -- otherwise a resize admitted by that
+    // estimate throws std::bad_alloc and, because the admission region is engine-scoped, takes the
+    // whole Engine down. `resize_paged_kv_bundle` validates every extent before mutating, so a
+    // bad_alloc leaves no partial state and the retry is safe.
+    for (;;) {
+        try {
+            resize_paged_kv_bundle(changes);
+            return;
+        } catch (const std::bad_alloc&) {
+            if (prefix_index == nullptr ||
+                prefix_index->evict_device_lru() == ninfer::prefix_cache::kInvalidNode) {
+                throw;
+            }
+        }
+    }
+}
+
 void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
                                                      std::uint32_t text_pages,
                                                      std::uint32_t backend_pages) {
@@ -1640,21 +1924,34 @@ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
         (sequence.kv->backend.has_value() != (backend_pages != 0))) {
         throw std::invalid_argument("KV resize entitlement does not match the sequence bundle");
     }
+    // `text_pages`/`backend_pages` are the full plan entitlements; borrowed pages (prefix reuse
+    // plus already-promoted blocks) are cache-owned, so only `plan - borrowed` belongs to this
+    // allocation's entitlement.
+    const auto owned_entitlement = [](std::uint32_t plan_pages, std::uint32_t borrowed) {
+        return plan_pages > borrowed ? plan_pages - borrowed : 1U;
+    };
+    const std::uint32_t text_owned =
+        owned_entitlement(text_pages, sequence.kv->text.borrowed_page_count());
+    const std::uint32_t backend_owned =
+        sequence.kv->backend
+            ? owned_entitlement(backend_pages, sequence.kv->backend->borrowed_page_count())
+            : 0U;
+
     std::array<PagedKVResize, 2> changes{};
     std::size_t count = 0;
     changes[count++]  = PagedKVResize{
          .allocation       = &sequence.kv->text,
          .mapped_pages     = sequence.kv->text.mapped_page_count(),
-         .page_entitlement = text_pages,
+         .page_entitlement = text_owned,
     };
     if (sequence.kv->backend) {
         changes[count++] = PagedKVResize{
             .allocation       = &*sequence.kv->backend,
             .mapped_pages     = sequence.kv->backend->mapped_page_count(),
-            .page_entitlement = backend_pages,
+            .page_entitlement = backend_owned,
         };
     }
-    resize_paged_kv_bundle(std::span<PagedKVResize>(changes.data(), count));
+    resize_paged_kv_with_eviction(std::span<PagedKVResize>(changes.data(), count));
     for (int rank = 1; rank < tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         if (!sequence.kv->text_peer[slot]) { continue; }
@@ -1663,14 +1960,15 @@ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
         peer_changes[peer_count++] =
             PagedKVResize{.allocation       = &*sequence.kv->text_peer[slot],
                           .mapped_pages     = sequence.kv->text_peer[slot]->mapped_page_count(),
-                          .page_entitlement = text_pages};
+                          .page_entitlement = text_owned};
         if (sequence.kv->backend_peer[slot]) {
             peer_changes[peer_count++] =
                 PagedKVResize{.allocation   = &*sequence.kv->backend_peer[slot],
                               .mapped_pages = sequence.kv->backend_peer[slot]->mapped_page_count(),
-                              .page_entitlement = backend_pages};
+                              .page_entitlement = backend_owned};
         }
-        resize_paged_kv_bundle(std::span<PagedKVResize>(peer_changes.data(), peer_count));
+        resize_paged_kv_with_eviction(
+            std::span<PagedKVResize>(peer_changes.data(), peer_count));
     }
 }
 
@@ -1701,6 +1999,10 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
         set_device_i32(io.text_kv_table_row, sequence.kv->text.bound_row());
         set_device_i32(io.backend_kv_table_row,
                        sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
+        if (std::getenv("NINFER_BT_DUMP") != nullptr) {
+            std::fprintf(stderr, "[BTDUMP] === binding lane %d ===\n", sequence.lane);
+            dbg_dump_block_tables(decoder->text_kv.pool(), max_concurrency, "bind");
+        }
     } catch (...) {
         for (int rank = 1; rank < tp; ++rank) {
             const auto slot = static_cast<std::size_t>(rank);
@@ -1757,6 +2059,18 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
             sequence.kv->backend_peer[slot]->materialize_tokens(backend_tokens,
                                                                 peer[slot]->device.stream);
         }
+    }
+    if (std::getenv("NINFER_BT_DUMP") != nullptr && main_tokens > 0) {
+        (void)cudaStreamSynchronize(device.stream);
+        const auto ids = sequence.kv->text.page_ids();
+        std::fprintf(stderr,
+                     "[MAT] lane=%u main_tokens=%u mapped=%zu borrowed=%zu owned=%zu "
+                     "cpu_pid[8]=%d cpu_pid[30]=%d\n",
+                     sequence.lane, main_tokens, sequence.kv->text.mapped_page_count(),
+                     sequence.kv->text.borrowed_page_count(),
+                     sequence.kv->text.owned_page_count(), ids.size() > 8 ? ids[8] : -99,
+                     ids.size() > 30 ? ids[30] : -99);
+        dbg_dump_block_tables(decoder->text_kv.pool(), max_concurrency, "post-materialize");
     }
 }
 
@@ -2787,6 +3101,23 @@ bool ProgramImplCore::copy_snapshot_slot(int rank, std::int32_t slot, void* slab
     return ok;
 }
 
+void ProgramImplCore::order_prefix_cache_after_compute(int rank) noexcept {
+    const auto slot = static_cast<std::size_t>(rank);
+    if (prefix_cache_src_event[slot] == nullptr || prefix_cache_stream[slot] == nullptr) {
+        return;
+    }
+    cudaStream_t compute =
+        rank == 0 ? device.stream : peer[static_cast<std::size_t>(rank)]->device.stream;
+    if (rank != 0) {
+        const ScopedDevice scope(peer[static_cast<std::size_t>(rank)]->device.device);
+        (void)cudaEventRecord(prefix_cache_src_event[slot], compute);
+        (void)cudaStreamWaitEvent(prefix_cache_stream[slot], prefix_cache_src_event[slot], 0);
+    } else {
+        (void)cudaEventRecord(prefix_cache_src_event[slot], compute);
+        (void)cudaStreamWaitEvent(prefix_cache_stream[slot], prefix_cache_src_event[slot], 0);
+    }
+}
+
 void ProgramImplCore::issue_block_write_through(ninfer::prefix_cache::NodeId node) noexcept {
     if (prefix_index == nullptr || prefix_host_pool == nullptr) { return; }
     const ninfer::prefix_cache::BlockNode* n = prefix_index->node(node);
@@ -2799,6 +3130,7 @@ void ProgramImplCore::issue_block_write_through(ninfer::prefix_cache::NodeId nod
     char* slab = static_cast<char*>(prefix_host_pool->data(target.page));
     bool ok = true;
     for (int rank = 0; ok && rank < tp; ++rank) {
+        order_prefix_cache_after_compute(rank);
         ok = copy_cache_block(rank, n->device_pages.page[0], n->device_pages.page[1],
                               slab + static_cast<std::size_t>(rank) * prefix_block_rank_bytes,
                               true);
@@ -2825,6 +3157,7 @@ void ProgramImplCore::issue_snapshot_write_through(ninfer::prefix_cache::Snapsho
         static_cast<std::uint32_t>(s->device_slot), max_concurrency, prefix_snapshot_slots);
     bool ok = true;
     for (int rank = 0; ok && rank < tp; ++rank) {
+        order_prefix_cache_after_compute(rank);
         ok = copy_snapshot_slot(rank, state_slot,
                                 slab + static_cast<std::size_t>(rank) * prefix_snapshot_rank_bytes,
                                 true);
@@ -2843,9 +3176,13 @@ void ProgramImplCore::issue_snapshot_write_through(ninfer::prefix_cache::Snapsho
 void ProgramImplCore::tick_prefix_cache() noexcept {
     if (prefix_index == nullptr || prefix_inflight_writes.empty()) { return; }
     // The newest event on every rank's cache stream marks the end of the whole pending set: all
-    // copies were enqueued before their event, so all events ready implies all writes landed.
+    // copies were enqueued before their event, so all events ready implies all writes landed. Each
+    // event lives on its own rank's device, so query it with that device current.
     for (int rank = 0; rank < tp; ++rank) {
-        if (cudaEventQuery(prefix_cache_event[static_cast<std::size_t>(rank)]) != cudaSuccess) {
+        const auto slot = static_cast<std::size_t>(rank);
+        DeviceContext& rank_device = rank == 0 ? device : peer[slot]->device;
+        const ScopedDevice scope(rank_device.device);
+        if (cudaEventQuery(prefix_cache_event[slot]) != cudaSuccess) {
             return;
         }
     }
@@ -2863,10 +3200,27 @@ void ProgramImplCore::settle_prefix_writes() noexcept {
     if (prefix_index == nullptr || prefix_inflight_writes.empty()) { return; }
     // Block until every enqueued D2H copy has landed on each rank's cache stream, then finalize.
     // After this, finish_* has dropped the restore pins and re-linked the nodes into the LRU, so
-    // their pages are counted as evictable by a subsequent admission check.
+    // their pages are counted as evictable by a subsequent admission check. Each stream lives on
+    // its own rank's device, so synchronize it with that device current.
     for (int rank = 0; rank < tp; ++rank) {
-        if (prefix_cache_stream[static_cast<std::size_t>(rank)] != nullptr) {
-            (void)cudaStreamSynchronize(prefix_cache_stream[static_cast<std::size_t>(rank)]);
+        const auto slot = static_cast<std::size_t>(rank);
+        if (prefix_cache_stream[slot] != nullptr) {
+            DeviceContext& rank_device = rank == 0 ? device : peer[slot]->device;
+            const ScopedDevice scope(rank_device.device);
+            (void)cudaStreamSynchronize(prefix_cache_stream[slot]);
+        }
+    }
+    if (std::getenv("NINFER_RESTORE_DUMP") != nullptr && prefix_host_pool != nullptr) {
+        const std::size_t tlen = decoder->text_kv.pool().per_page_bytes();
+        for (const InflightCacheWrite& write : prefix_inflight_writes) {
+            if (write.is_snapshot) { continue; }
+            const auto* n = prefix_index->node(write.node);
+            if (n == nullptr) { continue; }
+            const char* slab = static_cast<const char*>(prefix_host_pool->data(n->host_page));
+            std::fprintf(stderr, "[D2H_DONE] node=%u depth=%d host_page=%d slab_ck=%016llx\n",
+                         static_cast<unsigned>(write.node), n->depth,
+                         static_cast<int>(n->host_page),
+                         (unsigned long long)dbg_checksum_host(slab, tlen));
         }
     }
     tick_prefix_cache();
@@ -3057,6 +3411,63 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (staged.vision) { staged.vision->release_encoded_media_payloads(); }
             staged.cursor += result.processed_tokens;
             sequence.text_kv_valid = staged.cursor;
+            if (std::getenv("NINFER_PAGECK") != nullptr) {
+                auto& ckpool = decoder->text_kv.pool();
+                std::fprintf(stderr, "[CHUNK] lane=%u cursor=%u |", sequence.lane, staged.cursor);
+                for (std::int32_t p : {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 30, 157, 158, 159}) {
+                    std::fprintf(stderr, " p%d=%016llx/%d", p,
+                                 (unsigned long long)dbg_checksum_page(ckpool, p, device.stream),
+                                 prefix_index != nullptr
+                                     ? static_cast<int>(prefix_index->debug_page_referenced(0, p))
+                                     : -1);
+                }
+                if (sequence.kv) { dbg_dump_blocktable_row(sequence.kv->text, device.stream); }
+                static bool pools_dumped = false;
+                if (!pools_dumped && sequence.kv) {
+                    const auto& pids = sequence.kv->text.page_ids();
+                    if (pids.size() > 8 && pids[8] == 157) {
+                        pools_dumped = true;
+                        dbg_dump_pool_span(decoder->text_kv.pool(), "r0.text");
+                        if (backend_kv_cache() != nullptr) {
+                            dbg_dump_pool_span(backend_kv_cache()->pool(), "r0.mtp");
+                        }
+                        if (peer[0]) {
+                            dbg_dump_pool_span(peer[0]->decoder->text_kv.pool(), "r1.text");
+                            if (peer[0]->decoder->mtp_cache() != nullptr) {
+                                dbg_dump_pool_span(peer[0]->decoder->mtp_cache()->pool(), "r1.mtp");
+                            }
+                        }
+                    }
+                }
+                static bool src_traced = false;
+                if (!src_traced && sequence.kv) {
+                    const auto& spids = sequence.kv->text.page_ids();
+                    if (spids.size() > 8 && spids[8] == 157 && staged.cursor >= 512) {
+                        src_traced = true;
+                        auto& cp = decoder->text_kv.pool();
+                        unsigned long long target = dbg_checksum_page(cp, 8, device.stream);
+                        std::fprintf(stderr, "[SRC] clobbered p8=%016llx scanning text+mtp pools "
+                                              "for identical content...\n",
+                                     (unsigned long long)target);
+                        for (std::int32_t src = 0; src < cp.page_group_count(); ++src) {
+                            if (src == 8) { continue; }
+                            if (dbg_checksum_page(cp, src, device.stream) == target) {
+                                std::fprintf(stderr, "[SRC] MATCH text page %d == clobbered p8\n", src);
+                            }
+                        }
+                        if (backend_kv_cache() != nullptr) {
+                            const auto& mp = backend_kv_cache()->pool();
+                            for (std::int32_t src = 0; src < mp.page_group_count(); ++src) {
+                                if (dbg_checksum_page(mp, src, device.stream) == target) {
+                                    std::fprintf(stderr,
+                                                 "[SRC] MATCH mtp page %d == clobbered p8\n", src);
+                                }
+                            }
+                        }
+                    }
+                }
+                std::fprintf(stderr, "\n");
+            }
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
@@ -3068,34 +3479,25 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (prefix_index != nullptr && sequence.prefix_capture) {
                 const std::uint32_t cursor = staged.cursor;
                 const std::uint32_t completed = cursor / ninfer::prefix_cache::kBlockTokens;
-                // Promote the newly committed pages into the cache before handing them over.
                 const std::uint32_t already_committed =
                     sequence.prefix_pinned_nodes.size() - 1;
-                if (completed > already_committed && sequence.kv) {
-                    const std::uint32_t new_blocks = completed - already_committed;
-                    // Promote on every rank: the pools are lockstep, so a cache-owned page must be
-                    // counted as cached in each rank's own pool or their free lists drift apart.
-                    sequence.kv->text.promote_owned_pages(new_blocks);
-                    if (sequence.kv->backend) {
-                        sequence.kv->backend->promote_owned_pages(new_blocks);
-                    }
-                    for (int rank = 1; rank < tp; ++rank) {
-                        const auto slot = static_cast<std::size_t>(rank);
-                        if (sequence.kv->text_peer[slot]) {
-                            sequence.kv->text_peer[slot]->promote_owned_pages(new_blocks);
-                        }
-                        if (sequence.kv->backend_peer[slot]) {
-                            sequence.kv->backend_peer[slot]->promote_owned_pages(new_blocks);
-                        }
-                    }
-                }
-                // Commit newly completed blocks.
+                // Commit newly completed blocks. A block the index adopts transfers its page to the
+                // cache (promote_page_at, replicated across the lockstep rank pools); a duplicate
+                // commit leaves the page owned by this allocation so release() returns it normally
+                // and it is never handed back to the free pool while still live in the block table.
                 while (sequence.prefix_pinned_nodes.size() - 1 < completed) {
                     const std::uint32_t b = sequence.prefix_pinned_nodes.size() - 1; // 0-indexed block number.
                     const std::uint32_t parent = sequence.prefix_pinned_nodes[b];    // node for block (b-1), or root if b=0.
                     const std::int32_t text_page = sequence.kv->text.page_ids()[b];
                     const std::int32_t backend_page =
                         sequence.kv->backend ? sequence.kv->backend->page_ids()[b] : -1;
+                    if (std::getenv("NINFER_PREFIX_WATCH") != nullptr) {
+                        std::fprintf(stderr,
+                                     "[PCDBG] commit-see lane=%u b=%u text_page=%d backend_page=%d "
+                                     "already=%u matched=%u\n",
+                                     sequence.lane, b, text_page, backend_page, already_committed,
+                                     sequence.prefix_matched_blocks);
+                    }
                     const std::span<TokenId> block_tokens =
                         std::span<TokenId>(sequence.prefix_prompt_tokens).subspan(b * 64, 64);
                     const ninfer::prefix_cache::PoolPages pages{
@@ -3110,11 +3512,26 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                             .pages       = pages},
                         adopted);
                     if (node != ninfer::prefix_cache::kInvalidNode) {
-                        if (!adopted) {
-                            // The block duplicates an already-resident node: the index keeps its
-                            // own pages, so return ours to the pools instead of leaking them.
-                            release_cached_pages(pages);
+                        if (adopted && sequence.kv) {
+                            // The index took this page: fold it into the cache-owned set on every
+                            // rank (lockstep pools) so release() never returns it.
+                            sequence.kv->text.promote_page_at(b);
+                            if (sequence.kv->backend) {
+                                sequence.kv->backend->promote_page_at(b);
+                            }
+                            for (int rank = 1; rank < tp; ++rank) {
+                                const auto slot = static_cast<std::size_t>(rank);
+                                if (sequence.kv->text_peer[slot]) {
+                                    sequence.kv->text_peer[slot]->promote_page_at(b);
+                                }
+                                if (sequence.kv->backend_peer[slot]) {
+                                    sequence.kv->backend_peer[slot]->promote_page_at(b);
+                                }
+                            }
                         }
+                        // adopted == false: the block duplicates an already-resident node, so the
+                        // page stays owned by this allocation and is returned normally by
+                        // release(); it is never double-freed while live in the block table.
                         sequence.prefix_pinned_nodes.push_back(node);
                         prefix_index->pin_node(node);
                     } else {
@@ -3279,6 +3696,33 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
 
         staged.prompt.release_all_media_payloads();
 
+        debug_watch_prefix_pages("prefill-done");
+        if (std::getenv("NINFER_PAGECK") != nullptr) {
+            dbg_dump_pages_ck(decoder->text_kv.pool(), device.stream, "post-prefill");
+            if (sequence.kv) {
+                const auto& ids = sequence.kv->text.page_ids();
+                const auto ck   = [&](std::int32_t p) {
+                    return dbg_checksum_page(decoder->text_kv.pool(), p, device.stream);
+                };
+                std::fprintf(stderr,
+                             "[PREF] lane=%u own8=%d own30=%d | p8=%016llx own8ck=%016llx "
+                             "p30=%016llx own30ck=%016llx\n",
+                             sequence.lane, ids.size() > 8 ? ids[8] : -1,
+                             ids.size() > 30 ? ids[30] : -1,
+                             (unsigned long long)ck(8),
+                             (unsigned long long)ck(ids.size() > 8 ? ids[8] : 0),
+                             (unsigned long long)ck(30),
+                             (unsigned long long)ck(ids.size() > 30 ? ids[30] : 0));
+                if (std::getenv("NINFER_FULLIDS") != nullptr) {
+                    std::fprintf(stderr, "[IDS] lane=%u own8=%d n=%zu:", sequence.lane,
+                                 ids.size() > 8 ? ids[8] : -1, ids.size());
+                    for (std::size_t i = 0; i < ids.size(); ++i) {
+                        std::fprintf(stderr, " %d", ids[i]);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+            }
+        }
         request.prefill.reset();
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
                                              .base_E        = 0,

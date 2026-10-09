@@ -1009,9 +1009,9 @@ private:
                 throw std::logic_error("exclusive-feasible request cannot enter an idle Engine");
             }
             if (!protection_) {
-                protection_.emplace(make_admission_protection(next_protection_epoch_++, head->id,
-                                                              head_base.admission, active.span(),
-                                                              admission_capacity_));
+                protection_.emplace(make_admission_protection(
+                    next_protection_epoch_++, head->id, head_base.admission, active.span(),
+                    admission_capacity_, instance_.program->admission_cache_residue()));
             }
             if (protected_head_safe_without_temporal(*protection_, active.span(),
                                                      admission_capacity_)) {

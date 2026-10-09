@@ -331,17 +331,19 @@ int main() {
     promoter.borrow_prefix(cached);
     promoter.materialize_pages(4);
     failures += expect_page_ids(promoter.page_ids(), {0, 1, 2, 3}, "promoter page order");
+    // A page already borrowed from the cache is not owned and cannot be promoted again.
     bool promote_rejected = false;
     try {
-        promoter.promote_owned_pages(3);
+        promoter.promote_page_at(0);
     } catch (const std::invalid_argument&) {
         promote_rejected = true;
     }
     if (!promote_rejected) {
         ++failures;
-        std::cerr << "Promoting more pages than owned was not rejected\n";
+        std::cerr << "Promoting a borrowed (cache-owned) page was not rejected\n";
     }
-    promoter.promote_owned_pages(2);
+    promoter.promote_page_at(2);
+    promoter.promote_page_at(3);
     failures += expect_size(promoter.borrowed_page_count(), 4, "promoted pages joined the prefix");
     failures += expect_size(promoter.owned_page_count(), 0, "promotion left no owned pages");
     failures += expect_size(cache_pool.cached_pages(), 4, "promotion counted cache pages");
@@ -369,7 +371,10 @@ int main() {
     failures += expect_page_ids(wide.page_ids(), {8, 9, 10, 11}, "wide physical page ids");
     bool wide_promoted = true;
     try {
-        wide.promote_owned_pages(4);
+        wide.promote_page_at(0);
+        wide.promote_page_at(1);
+        wide.promote_page_at(2);
+        wide.promote_page_at(3);
     } catch (const std::invalid_argument&) {
         wide_promoted = false;
     }
@@ -380,6 +385,103 @@ int main() {
     failures += expect_size(wide_pool.cached_pages(), 12, "wide promotion counted cache pages");
     wide.unbind_row();
     wide.release();
+
+    // Regression: promotion moves already-mapped pages to cache ownership, so they must leave the
+    // owning allocation's entitlement and the pool's entitled count. Counting a promoted page in
+    // both `entitled` and `cached` made `page_group_count() - entitled - cached` underflow as
+    // unsigned, which defeated `can_reserve` and let the engine over-admit requests the pool could
+    // not then materialize (std::bad_alloc / "entitlement could not be materialized").
+    {
+        auto promote_plan = plan_paged_cache(8, 8, 1, {{ninfer::DType::BF16, 16, 1}});
+        ninfer::DeviceArena promote_arena(promote_plan.bytes);
+        ninfer::PagedKVPool promote_pool({promote_arena.base(), promote_arena.capacity()},
+                                         promote_plan.layout);
+        auto a = promote_pool.reserve(6);
+        a.materialize_pages(6);
+        for (std::uint32_t index = 0; index < 6; ++index) { a.promote_page_at(index); }
+        failures +=
+            expect_size(a.page_entitlement(), 0, "promotion did not release the owned entitlement");
+        failures += expect_size(a.borrowed_page_count(), 6, "promotion did not move pages to borrowed");
+        failures += expect_size(promote_pool.entitled_pages(), 0, "pool entitled kept promoted pages");
+        failures += expect_size(promote_pool.cached_pages(), 6, "pool cached missed promoted pages");
+        // 8 pages total, 6 now cache-owned: only 2 are reservable. The pre-fix underflow made the
+        // 3-page reservation (and even a 7-page one) succeed.
+        if (promote_pool.can_reserve(3)) {
+            ++failures;
+            std::cerr << "can_reserve ignored cache-owned pages after promotion\n";
+        }
+        if (!promote_pool.can_reserve(2)) {
+            ++failures;
+            std::cerr << "can_reserve rejected the genuinely free pages\n";
+        }
+        bool over_admitted = false;
+        try {
+            auto bad = promote_pool.reserve(3);
+            (void)bad;
+        } catch (const std::bad_alloc&) { over_admitted = true; }
+        if (!over_admitted) {
+            ++failures;
+            std::cerr << "reserve over-admitted capacity held by cache-owned pages\n";
+        }
+        a.unbind_row();
+        a.release();
+    }
+
+    // Regression: copy_page_d2h/h2d must place each page's head_extent runs at the offset the
+    // pool's plane order dictates. A HeadMajor plane keeps its runs one page stride apart
+    // (p*nb[2] + h*nb[3]); the copy previously assumed the PageMajor run index (h + HE*p), so a
+    // HeadMajor page landed at half its true offset and clobbered neighbouring runs.
+    const ninfer::PagedKVPlaneOrder orders[] = {ninfer::PagedKVPlaneOrder::PageMajor,
+                                                ninfer::PagedKVPlaneOrder::HeadMajor};
+    for (const ninfer::PagedKVPlaneOrder order : orders) {
+        auto round_plan = plan_paged_cache(4, 2, 1, {{ninfer::DType::BF16, 8, 2}}, order);
+        ninfer::DeviceArena round_arena(round_plan.bytes);
+        ninfer::PagedKVPool pool({round_arena.base(), round_arena.capacity()}, round_plan.layout);
+        const ninfer::Tensor& plane    = pool.plane(0);
+        const std::size_t run_bytes    = 8 * ninfer::kPagedKVPageSize * 2u; // BF16 leading 8
+        const std::size_t page_stride  = order == ninfer::PagedKVPlaneOrder::PageMajor
+                                             ? static_cast<std::size_t>(plane.nb[3])
+                                             : static_cast<std::size_t>(plane.nb[2]);
+        const std::size_t head_stride  = order == ninfer::PagedKVPlaneOrder::PageMajor
+                                             ? static_cast<std::size_t>(plane.nb[2])
+                                             : static_cast<std::size_t>(plane.nb[3]);
+        const std::int32_t head_count  = order == ninfer::PagedKVPlaneOrder::PageMajor
+                                             ? plane.ne[2]
+                                             : plane.ne[3];
+        std::vector<unsigned char> source(pool.per_page_bytes());
+        for (std::size_t i = 0; i < source.size(); ++i) {
+            source[i] = static_cast<unsigned char>(i * 7u + 3u);
+        }
+        if (cudaMemsetAsync(plane.data, 0x5a, plane.bytes(), nullptr) != cudaSuccess) {
+            ++failures;
+            std::cerr << "page copy setup failed\n";
+            continue;
+        }
+        const bool wrote = pool.copy_page_h2d(source.data(), 1, nullptr);
+        std::vector<unsigned char> device(plane.bytes());
+        const cudaError_t err =
+            cudaMemcpy(device.data(), plane.data, device.size(), cudaMemcpyDeviceToHost);
+        if (!wrote || err != cudaSuccess) {
+            ++failures;
+            std::cerr << "page copy failed for plane order " << static_cast<int>(order) << '\n';
+            continue;
+        }
+        std::vector<unsigned char> expected(device.size(), 0x5a);
+        for (std::int32_t head = 0; head < head_count; ++head) {
+            const std::size_t begin = page_stride +
+                                      head_stride * static_cast<std::size_t>(head);
+            std::copy(source.begin() + static_cast<std::ptrdiff_t>(head) *
+                                            static_cast<std::ptrdiff_t>(run_bytes),
+                      source.begin() + static_cast<std::ptrdiff_t>(head + 1) *
+                                           static_cast<std::ptrdiff_t>(run_bytes),
+                      expected.begin() + static_cast<std::ptrdiff_t>(begin));
+        }
+        if (device != expected) {
+            ++failures;
+            std::cerr << "page copy placed runs at the wrong offset for plane order "
+                      << static_cast<int>(order) << '\n';
+        }
+    }
 
     return failures == 0 ? 0 : fail("kv cache test failed");
 }

@@ -247,6 +247,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
             }
             int physical_page     = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
             physical_page          = __shfl_sync(FullMask, physical_page, 0);
+            kv_debug_probe(1, cache_k_i8, physical_page, position, lane);
             const int page_offset = position & kPagedKVPageMask;
             const int d0          = grp * kGqaKvQuantGroup + lane;
             const int d1          = d0 + 32;

@@ -157,6 +157,10 @@ public:
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    // Device prefix-cache residency that admission-time eviction cannot reclaim, per pool. The
+    // engine folds it into protected-admission feasibility: a head can be blocked by pinned cache
+    // pages even when `head + active plan reservations <= capacity` on their own.
+    [[nodiscard]] runtime::AdmissionResources admission_cache_residue() const noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPrompt&& prompt,
                                                                 RequestPlan<Variant>&& plan,

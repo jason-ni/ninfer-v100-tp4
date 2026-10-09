@@ -1,11 +1,12 @@
 # Hybrid prefix cache: V100X2 adaptation plan
 
-Status: implemented. M1 (device-only block + snapshot cache) and M2 (host tier) are in-tree and
-verified; M3 (persistence and keys) has not started. This document adapts the content-addressed
-prefix cache of `Wallawalla47/ninfer-custom` (its `docs/maintainer/hybrid-prefix-cache-spec.md`,
-referred to below as **HPC**) to this checkout's Qwen3.8-27B V100X2 engine. Sections 0–4 keep the
-original reference/motivation framing; §5 onward is the implementation record, and §1.1 lists where
-the V100X2 implementation deviates from the HPC reference.
+Status: implemented and verified. M1 (device-only block + snapshot cache) and M2 (host tier,
+including the host-restore continuation-identity exit criterion) are in-tree and verified; M3
+(persistence and keys) has not started. This document adapts the content-addressed prefix cache of
+`Wallawalla47/ninfer-custom` (its `docs/maintainer/hybrid-prefix-cache-spec.md`, referred to below
+as **HPC**) to this checkout's Qwen3.8-27B V100X2 engine. Sections 0–4 keep the original
+reference/motivation framing; §5 onward is the implementation record, and §1.1 lists where the
+V100X2 implementation deviates from the HPC reference.
 
 ---
 
@@ -192,7 +193,11 @@ the rewritten tool block, and the prefill token count equals `n − F`.
 
 ### M2 — host tier
 
-Status: **complete; GPU-verified.** Tracked as tasks T0–T7 below, all done in-tree.
+Status: **complete (2026-10-09).** M1/M2 remain in-tree; the earlier "complete; GPU-verified" claim
+rested on a host-tier gate (`exercise_host_tier`) that only asserted `reused > 0`, never that the
+restored continuation matched a cold run. The 2026-10-08 reopen — host restore not
+continuation-identical — is resolved: root cause, fix, and verification are recorded under "M2
+resolution" at the end of this section. Tracked as tasks T0–T7 below, all done in-tree.
 `ninfer_prefix_cache_host_test` and `ninfer_prefix_cache_index_test` are green, the full build
 links, and the GPU host-reuse scenario passes on V100X2: `ninfer_qwen3_8_27b_v100x2_hybrid_real_test`
 runs the normal, pool-exhaustion, and host-tier cases (a returning conversation restored from the
@@ -256,10 +261,11 @@ Dependency order: T0 → T2 → T1 → T3/T4 → T5 → T6 → T7 (T1/T2 near-in
 Done in-tree:
 
 - **T1 transfer layer** — Key discovery: every KV plane is physically `[page][head][token][leading]`
-  with leading fastest (`src/ops/kernel/paged_kv_address.cuh`); the `plane_order` enum is vestigial
-  for addressing (kernels hardcode template offsets). Old copy helpers used wrong `nb[]` stride math.
-  Rewritten: `PagedKVPool::copy_page_d2h/h2d` are non-throwing bool APIs (per plane: HE contiguous
-  runs of LE·PS·dsz bytes at offset LE·PS·(h + HE·p)); `per_page_bytes()` = Σ LE·PS·HE·dsz. Program
+  with leading fastest (`src/ops/kernel/paged_kv_address.cuh`); the PageMajor addressing path uses
+  hardcoded template offsets. Old copy helpers used wrong `nb[]` stride math. Rewritten:
+  `PagedKVPool::copy_page_d2h/h2d` are non-throwing bool APIs (per plane: HE contiguous runs of
+  LE·PS·dsz bytes at byte offset dsz·LE·PS·(h + HE·p); the rewrite first omitted `dsz`, which the
+  M2 resolution below fixed); `per_page_bytes()` = Σ LE·PS·HE·dsz. Program
   side: `rank_backend_cache(rank)`, `copy_cache_block(rank, text_page, backend_page, slab_base, d2h)`
   (both pools, all ranks, rank-sliced slabs), `copy_snapshot_slot(rank, slot, slab_base, d2h)` (per
   layer: conv BF16 + recurrent FP32; slot is the last dim so per-slot data is one contiguous run per
@@ -287,7 +293,9 @@ Done in-tree:
 
 #### Verification status
 
-All T7 gates are met:
+T7 gates were recorded as met at the time; the host-tier continuation-identity exit criterion was
+in fact not exercised by the *hybrid* gate (see "M2 resolution" at the end of this section). It is
+now exercised by the concurrent shared-prefix gate, which passes both scenarios. Remaining gates:
 
 1. **GPU host-reuse scenario** — `ninfer_qwen3_8_27b_v100x2_hybrid_real_test` (`exercise_host_tier`;
    TP2 + MTP-3 + `--host-cache-mib`) passes: conversation A cold, a disjoint equally long B evicts A
@@ -321,6 +329,77 @@ Facts the next session needs:
 Exit: a long agent session whose device pool cannot hold every conversation still reuses the host
 tier; TTFT for a returning session is dominated by H2D restore (~GB/s), not recompute; graph/eager
 parity unchanged.
+
+#### M2 resolution — host restore is continuation-identical (2026-10-09)
+
+Status: **fixed and verified.** The 2026-10-08 reopen ("host restore is not continuation-identical")
+came from `copy_plane_page` in `src/core/paged_kv_cache.cpp`, the per-plane transfer helper behind
+`PagedKVPool::copy_page_d2h/h2d` and therefore behind every demote and restore.
+
+Root cause. The helper computed each head run's device offset as an *element* count but used it as a
+*byte* count:
+
+```cpp
+char* dev_run = device_base + leading * kPagedKVPageSize * (h + heads * page_id);
+//                                   ^ missing dtype_size(spec.dtype)
+```
+
+I8 code planes are one byte per element, so the omission was invisible there; the FP16 K/V **scale
+planes** are two bytes per element, so their runs were copied at half their true byte offset. A
+demote therefore stored the wrong region of each scale plane in the host slab and a restore wrote it
+back to the same wrong place, leaving every restored block's real scale region untouched. Attention
+reads scales at the correct (doubled) offset, so a restored prefix ran with stale quantization
+scales — the same prompt computed cold was exact, hence
+`restore_vs_device=0/32 cold_vs_device=32/32 restore_vs_cold=0/32`. The MTP/backend pool's scale
+planes were affected identically.
+
+Correction to the earlier localization. The "content write into the shared prefix's cached device
+KV pages" premise was a measurement artifact of this same bug: `dbg_checksum_page` (and the
+`[PAGECK]` / `[CHUNK]` / `[RDUMP]` / `[LAYERCK]` watches built on it) also read pages through
+`copy_page_d2h`, so for an FP16 scale plane "page q" actually read true page `q/2`'s scale region.
+The per-plane canary that settled it showed only the scale planes changing, at exactly the region
+the attention's own append wrote legitimately (logical pages 4–7); the K/V code planes and the
+block table were always correct, and no registered writer ever wrote a foreign page — which is why
+the session-3 tracker saw `tag=-1`. The session-2 "device-resident blocks 8–15 mismatch" in the
+RDUMP was the same wrong-region read over the two engines' differing page histories, not a clobber.
+
+Fix. `copy_plane_page` now derives `run_bytes = leading * kPagedKVPageSize * dtype_size(dtype)` and
+offsets by `run_bytes * (h + HE*p)`, so every plane dtype copies at its true byte offset. While
+reviewing that function, `HeadMajor` pools were also found to be unsupported: the DFlash
+full-context pool (`layouts_impl.h`, addressed `p + pages*h` by `bidirectional_gqa_attention` and
+`kv_cache_append_prefix`) would have been copied at the PageMajor run index. The helper is now
+order-aware; the DFlash full pool has no demote/restore path today, so this was latent.
+`tests/test_kv_cache.cpp` gained a round-trip test that places a page for both orders and compares
+against the layout's own `nb[]` strides (it fails on the pre-fix formula).
+
+Also landed from the review: the duplicate-commit use-after-free in the prefix commit path. The
+batch `promote_owned_pages(count)` was replaced by per-block `promote_page_at(index)` with a
+per-page `cache_owned_` vector, and the commit loop promotes only blocks the index actually adopted
+(duplicates keep the page owned). The old batch API is removed and `tests/test_kv_cache.cpp` was
+updated to the per-page form.
+
+Verification (TP2, MTP-3, NVFP4, `CUDA_VISIBLE_DEVICES=2,3 GGML_CUDA_PDL=0`):
+
+```text
+device: 4 lanes reused=1984, agreement 32/32                       -> PASS
+host:   restore_vs_device=32/32 cold_vs_device=32/32
+        restore_vs_cold=32/32; single-lane 32/32 x4                -> PASS
+```
+
+- Gate: `ninfer_qwen3_8_27b_v100x2_concurrent_prefix_real_test`, both scenarios.
+- Unit: `ninfer_kv_cache_test` (incl. the new order round-trip), `ninfer_kv_cache_append_prefix_test`,
+  `ninfer_prefix_cache_host_test`, `ninfer_prefix_cache_index_test`, `ninfer_admission_policy_test`,
+  `ninfer_concurrent_executor_test` all green on freshly built binaries.
+- `ninfer_qwen3_8_27b_v100x2_prefix_real_test` (graph/eager outputs, logits, acceptance, frontiers)
+  passes.
+
+Remaining:
+
+1. Strengthen `exercise_host_tier` in `tests/targets/qwen3_6_27b/test_engine_v100x2_hybrid_real.cpp`
+   to assert restored-continuation identity (not just `reused > 0`), matching this gate's criterion.
+2. Remove the session-2/3 investigation instrumentation still in the working tree (write probes +
+   tracker + watch checkpoints + row/byte dumps, all behind `NINFER_PAGECK` / `NINFER_PREFIX_WATCH`
+   and friends) before committing. The session-4 scaffolding was already removed.
 
 ### M3 — persistence and keys
 

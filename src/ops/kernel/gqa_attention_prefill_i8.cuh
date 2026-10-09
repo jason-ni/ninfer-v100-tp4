@@ -104,6 +104,7 @@ __launch_bounds__(256) __global__
     const int position              = positions[0] + token;
     const std::int32_t* block_table = metadata.block_table();
     int page                        = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+    kv_debug_probe(3, cache_k, page, position, lane);
     const int page_off              = position & kPagedKVPageMask;
     const int d0                    = group * kGqaKvQuantGroup + lane;
     const int d1                    = d0 + 32;
@@ -193,6 +194,7 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     if (!valid) { return; }
 
     const int position = base_position + token;
+    kv_debug_probe(4, cache_k, physical_page, position, lane);
     const int page_off = position & kPagedKVPageMask;
     const std::int64_t code_base =
         paged_kv_page_head_offset<kGqaKvQuantHeadDim, Geometry::KVHeads>(physical_page, kv_head) +

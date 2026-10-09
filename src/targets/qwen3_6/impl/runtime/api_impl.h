@@ -153,6 +153,11 @@ runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcep
 }
 
 template <>
+runtime::AdmissionResources Program<Variant>::admission_cache_residue() const noexcept {
+    return impl_->admission_cache_residue();
+}
+
+template <>
 runtime::PrefillStepResult
 Program<Variant>::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
                                      RequestPlan<Variant>&& plan,
