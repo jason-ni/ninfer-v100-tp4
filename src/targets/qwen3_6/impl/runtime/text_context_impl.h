@@ -35,10 +35,7 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <initializer_list>
-#include <vector>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1913,34 +1910,6 @@ void TextContext::run_layers_parallel(std::array<Tensor, kMaximumDevices>& x, Ph
                                  DFlashFeatureSink* dflash_sink) {
     if (dflash_sink != nullptr) { dflash_sink->begin(x[0]); }
     const bool prefill = ph == Phase::Prefill;
-    // Debug (NINFER_PAGECK): per-layer canary to name the exact layer/op that writes text_kv page 8.
-    const bool dbg_pageck = std::getenv("NINFER_PAGECK") != nullptr && prefill && batch_text_kv_ != nullptr;
-    auto dbg_ck_p8 = [&]() -> std::uint64_t {
-        const std::size_t total = batch_text_kv_->pool().per_page_bytes();
-        std::vector<unsigned char> buf(total);
-        if (!batch_text_kv_->pool().copy_page_d2h(buf.data(), 8, stream_for(0))) { return 0; }
-        cudaStreamSynchronize(stream_for(0));
-        std::uint64_t h = 1469598103934665603ULL;
-        for (unsigned char b : buf) { h ^= b; h *= 1099511628211ULL; }
-        return h;
-    };
-    std::uint64_t dbg_prev_p8 = dbg_pageck ? dbg_ck_p8() : 0;
-    if (dbg_pageck) {
-        static bool dbg_addr_done = false;
-        if (!dbg_addr_done) {
-            dbg_addr_done = true;
-            const auto& kpl = batch_text_kv_->pool().plane(0);
-            unsigned long long p8 = (unsigned long long)(kpl.data) +
-                8ull * ((unsigned long long)(kpl.bytes()) /
-                        (unsigned long long)batch_text_kv_->pool().page_group_count());
-            unsigned long long ws_lo = (unsigned long long)work_.base();
-            unsigned long long ws_hi = ws_lo + (unsigned long long)work_.capacity();
-            std::fprintf(stderr, "[ADDR] kvK.plane0=%p page8=%016llx | ws0=[%016llx,%016llx) "
-                         "p8_in_ws=%d staging0=%p\n",
-                         kpl.data, p8, ws_lo, ws_hi, (int)(p8 >= ws_lo && p8 < ws_hi),
-                         staging[0].data);
-        }
-    }
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const auto fidx = static_cast<std::size_t>(ModelConfig::full_idx(layer));
@@ -2023,15 +1992,6 @@ void TextContext::run_layers_parallel(std::array<Tensor, kMaximumDevices>& x, Ph
         }
         if (dflash_sink != nullptr) {
             dflash_sink->capture_layer(layer, x[0], stream_for(0));
-        }
-        if (dbg_pageck) {
-            const std::uint64_t dbg_cur_p8 = dbg_ck_p8();
-            if (dbg_cur_p8 != dbg_prev_p8) {
-                std::fprintf(stderr, "[LAYERCK] layer=%d type=%s p8 %016llx -> %016llx\n",
-                             layer, ModelConfig::is_full(layer) ? "full" : "gdn",
-                             (unsigned long long)dbg_prev_p8, (unsigned long long)dbg_cur_p8);
-                dbg_prev_p8 = dbg_cur_p8;
-            }
         }
     }
     if (dflash_sink != nullptr) {

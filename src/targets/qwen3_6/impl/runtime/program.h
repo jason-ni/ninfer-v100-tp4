@@ -292,7 +292,6 @@ public:
                                            const RequestPlan& plan) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_cache_residue() const noexcept;
-    void debug_watch_prefix_pages(const char* tag) noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPromptData&& prompt,
                                                                 RequestPlan&& plan,

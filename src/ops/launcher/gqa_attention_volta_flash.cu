@@ -31,7 +31,6 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
-#include <cstdio>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -185,7 +184,6 @@ __launch_bounds__(256) __global__ void volta_flash_append_kv_i8_kernel(
     const int position               = positions[token];
     int physical_page = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
     physical_page     = __shfl_sync(0xffffffffu, physical_page, 0);
-    kv_debug_probe(0, k_pages, physical_page, position, lane);
     const int page_offset = position & kPagedKVPageMask;
     const std::int64_t code_base = paged_kv_element_offset<kHeadDim, kKVHeads>(
         physical_page, h, page_offset, group * kGqaKvQuantGroup);
@@ -474,16 +472,6 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     auto* rows         = static_cast<const std::int32_t*>(table_rows.data);
     auto* position_ptr = static_cast<const std::int32_t*>(positions.data);
 
-    if (std::getenv("NINFER_PAGECK") != nullptr) {
-        static bool ws_dumped = false;
-        if (!ws_dumped) {
-            ws_dumped = true;
-            std::fprintf(stderr, "[GATHWS] k_gathered=[%p,%zu) v_gathered=[%p,%zu) | textK=[%p,%zu)\n",
-                         k_gathered.data, k_gathered.bytes(), v_gathered.data, v_gathered.bytes(),
-                         cache.k_pages.data, cache.k_pages.bytes());
-        }
-    }
-
     // 1. Append this call's K/V for the whole width.
     if (cache.dtype == DType::I8) {
         constexpr int kWarpsPerBlock = 8;
@@ -615,34 +603,3 @@ void gqa_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const Te
 }
 
 } // namespace ninfer::ops::detail
-
-namespace ninfer::ops {
-
-__device__ unsigned long long g_kv_dbg_base[16];
-__device__ int g_kv_dbg_pos[16];
-__device__ int g_kv_dbg_tag[16];
-
-__global__ void kv_dbg_reset_kernel() {
-    for (int i = 8; i < 16; ++i) {
-        g_kv_dbg_base[i] = 0;
-        g_kv_dbg_pos[i]  = -1;
-        g_kv_dbg_tag[i]  = -1;
-    }
-}
-
-void kv_dbg_reset(cudaStream_t stream) { kv_dbg_reset_kernel<<<1, 1, 0, stream>>>(); }
-
-void kv_dbg_dump() {
-    unsigned long long bases[16];
-    int poss[16];
-    int tags[16];
-    cudaMemcpyFromSymbol(bases, g_kv_dbg_base, sizeof(bases));
-    cudaMemcpyFromSymbol(poss, g_kv_dbg_pos, sizeof(poss));
-    cudaMemcpyFromSymbol(tags, g_kv_dbg_tag, sizeof(tags));
-    for (int i = 8; i < 16; ++i) {
-        std::fprintf(stderr, "[KVTRK] page=%d tag=%d base=%llx pos=%d\n", i, tags[i], bases[i],
-                     poss[i]);
-    }
-}
-
-} // namespace ninfer::ops

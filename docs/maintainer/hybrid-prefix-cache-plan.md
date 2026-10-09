@@ -397,9 +397,6 @@ Remaining:
 
 1. Strengthen `exercise_host_tier` in `tests/targets/qwen3_6_27b/test_engine_v100x2_hybrid_real.cpp`
    to assert restored-continuation identity (not just `reused > 0`), matching this gate's criterion.
-2. Remove the session-2/3 investigation instrumentation still in the working tree (write probes +
-   tracker + watch checkpoints + row/byte dumps, all behind `NINFER_PAGECK` / `NINFER_PREFIX_WATCH`
-   and friends) before committing. The session-4 scaffolding was already removed.
 
 ### M3 — persistence and keys
 

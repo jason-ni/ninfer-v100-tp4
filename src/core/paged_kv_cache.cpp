@@ -3,7 +3,6 @@
 #include "core/device.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -19,16 +18,6 @@ std::int32_t checked_i32(std::uint32_t value, const char* label) {
         throw std::invalid_argument(std::string(label) + " must fit positive int32");
     }
     return static_cast<std::int32_t>(value);
-}
-
-// Debug (NINFER_PAGE_TRACE): log every physical-page state transition for pages 0..39 so the
-// owner history of a specific page can be reconstructed. States: 0=free 1=mapped 2=cached.
-void page_trace(const void* pool, std::int32_t page, std::uint8_t old_state, std::uint8_t new_state,
-                const char* op) {
-    if (std::getenv("NINFER_PAGE_TRACE") == nullptr) { return; }
-    if (page < 0 || page >= 40) { return; }
-    std::fprintf(stderr, "[PTRACE] pool=%p page=%d %-12s %u->%u\n", pool, page, op, old_state,
-                 new_state);
 }
 
 std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
@@ -125,12 +114,6 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
     for (std::uint32_t page = 0; page < spec_.page_group_count; ++page) {
         free_page_ids_.push_back(static_cast<std::int32_t>(page));
     }
-    debug_page_state_.assign(spec_.page_group_count, 0);
-}
-
-std::uint8_t PagedKVPool::debug_page_state(std::int32_t page) const noexcept {
-    if (page < 0 || static_cast<std::size_t>(page) >= debug_page_state_.size()) { return 0xFF; }
-    return debug_page_state_[static_cast<std::size_t>(page)];
 }
 
 std::uint32_t PagedKVPool::page_group_count() const noexcept { return spec_.page_group_count; }
@@ -225,9 +208,6 @@ bool PagedKVPool::copy_page_d2h(void* host_dst, std::int32_t page_id,
 
 bool PagedKVPool::copy_page_h2d(const void* host_src, std::int32_t page_id,
                                 cudaStream_t stream) const noexcept {
-    if (page_id >= 8 && page_id < 16) {
-        std::fprintf(stderr, "[H2D] pool=%p page=%d\n", static_cast<const void*>(this), page_id);
-    }
     char* in = const_cast<char*>(static_cast<const char*>(host_src));
     for (std::size_t i = 0; i < planes_.size(); ++i) {
         if (!copy_plane_page<false>(spec_.planes[i], page_id, in,
@@ -280,12 +260,6 @@ PagedKVAllocation PagedKVPool::reserve(std::uint32_t page_entitlement) {
 
 void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream) {
     if (page_ids.empty()) { return; }
-    for (std::int32_t page_id : page_ids) {
-        if (page_id >= 8 && page_id < 16) {
-            std::fprintf(stderr, "[ZERO] pool=%p page=%d\n", static_cast<const void*>(this),
-                         page_id);
-        }
-    }
 
     std::vector<std::int32_t> sorted(page_ids.begin(), page_ids.end());
     std::sort(sorted.begin(), sorted.end());
@@ -369,16 +343,6 @@ std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count,
         free_page_ids_.erase(free_page_ids_.begin(), last);
     }
     mapped_pages_ += count;
-    for (std::int32_t page : out) {
-        const std::uint8_t old_state = debug_page_state_[static_cast<std::size_t>(page)];
-        if (old_state != 0) {
-            std::fprintf(stderr,
-                         "[KVDBG] TAKE pool=%p page=%d was state=%u (double-handout)\n",
-                         static_cast<const void*>(this), page, old_state);
-        }
-        debug_page_state_[static_cast<std::size_t>(page)] = 1;
-        page_trace(this, page, old_state, 1, "take");
-    }
     return out;
 }
 
@@ -387,16 +351,6 @@ void PagedKVPool::return_pages(std::span<const std::int32_t> pages) noexcept {
     free_page_ids_.insert(free_page_ids_.end(), pages.begin(), pages.end());
     std::sort(free_page_ids_.begin(), free_page_ids_.end());
     mapped_pages_ -= static_cast<std::uint32_t>(pages.size());
-    for (std::int32_t page : pages) {
-        const std::uint8_t old_state = debug_page_state_[static_cast<std::size_t>(page)];
-        if (old_state != 1) {
-            std::fprintf(stderr,
-                         "[KVDBG] RETURN pool=%p page=%d was state=%u (not owned)\n",
-                         static_cast<const void*>(this), page, old_state);
-        }
-        debug_page_state_[static_cast<std::size_t>(page)] = 0;
-        page_trace(this, page, old_state, 0, "return");
-    }
 }
 
 void PagedKVPool::add_entitlement(std::uint32_t pages) noexcept { entitled_pages_ += pages; }
@@ -412,11 +366,6 @@ std::vector<std::int32_t> PagedKVPool::acquire_cache_pages(std::uint32_t count) 
     }
     std::vector<std::int32_t> pages = take_pages(count, -1);
     cached_pages_ += count;
-    for (std::int32_t page : pages) {
-        const std::uint8_t old_state = debug_page_state_[static_cast<std::size_t>(page)];
-        debug_page_state_[static_cast<std::size_t>(page)] = 2;
-        page_trace(this, page, old_state, 2, "acquire_cache");
-    }
     return pages;
 }
 
@@ -428,16 +377,6 @@ void PagedKVPool::release_cache_pages(std::span<const std::int32_t> page_ids) no
     cached_pages_ -= static_cast<std::uint32_t>(page_ids.size());
     free_page_ids_.insert(free_page_ids_.end(), page_ids.begin(), page_ids.end());
     std::sort(free_page_ids_.begin(), free_page_ids_.end());
-    for (std::int32_t page : page_ids) {
-        const std::uint8_t old_state = debug_page_state_[static_cast<std::size_t>(page)];
-        if (old_state != 2) {
-            std::fprintf(stderr,
-                         "[KVDBG] RELEASE_CACHE pool=%p page=%d was state=%u (not cache-owned)\n",
-                         static_cast<const void*>(this), page, old_state);
-        }
-        debug_page_state_[static_cast<std::size_t>(page)] = 0;
-        page_trace(this, page, old_state, 0, "release_cache");
-    }
 }
 
 void PagedKVPool::promote_to_cache(std::span<const std::int32_t> page_ids) {
@@ -465,16 +404,6 @@ void PagedKVPool::promote_to_cache(std::span<const std::int32_t> page_ids) {
     entitled_pages_ -= count;
     cached_pages_ += count;
     mapped_pages_ -= count;
-    for (std::int32_t page : page_ids) {
-        const std::uint8_t old_state = debug_page_state_[static_cast<std::size_t>(page)];
-        if (old_state != 1) {
-            std::fprintf(stderr,
-                         "[KVDBG] PROMOTE pool=%p page=%d was state=%u (not owned)\n",
-                         static_cast<const void*>(this), page, old_state);
-        }
-        debug_page_state_[static_cast<std::size_t>(page)] = 2;
-        page_trace(this, page, old_state, 2, "promote");
-    }
 }
 
 void PagedKVPool::acquire_row(std::int32_t row) {

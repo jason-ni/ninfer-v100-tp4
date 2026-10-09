@@ -3,7 +3,6 @@
 #include "core/paged_kv_cache.h"
 
 #include <cstdint>
-#include <cstdio>
 
 namespace ninfer::ops {
 
@@ -11,20 +10,6 @@ inline constexpr int kPagedKVPageShift = 6;
 inline constexpr int kPagedKVPageMask  = kPagedKVPageSize - 1;
 
 static_assert(kPagedKVPageSize == (1 << kPagedKVPageShift));
-
-extern __device__ unsigned long long g_kv_dbg_base[16];
-extern __device__ int g_kv_dbg_pos[16];
-extern __device__ int g_kv_dbg_tag[16];
-
-__device__ __forceinline__ void kv_debug_probe(int tag, const void* base, int page, int pos,
-                                               int lane) {
-    if (lane == 0 && page >= 8 && page < 16) {
-        g_kv_dbg_base[page] = static_cast<unsigned long long>(
-            reinterpret_cast<std::uintptr_t>(base));
-        g_kv_dbg_pos[page] = pos;
-        g_kv_dbg_tag[page] = tag;
-    }
-}
 
 __device__ __forceinline__ std::int32_t paged_kv_physical_page(const std::int32_t* block_table,
                                                                std::int32_t position) {

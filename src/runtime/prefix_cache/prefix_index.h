@@ -352,13 +352,6 @@ public:
 
     [[nodiscard]] std::uint32_t evictable_pages() const noexcept { return evictable_pages_; }
 
-    // Debug: true when a live node with a device copy still names this physical page. Used by the
-    // M2 clobber investigation to detect a page being released while a cache node references it.
-    [[nodiscard]] bool debug_page_referenced(std::size_t pool, std::int32_t page) const noexcept;
-
-    // Debug: ids of every live node (for page-content watchpoints).
-    [[nodiscard]] std::vector<NodeId> debug_live_node_ids() const noexcept;
-
 private:
     BlockNode& node_mut(NodeId id) noexcept { return nodes_[id - 1U]; }
     [[nodiscard]] bool valid(NodeId id) const noexcept {

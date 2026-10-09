@@ -132,27 +132,6 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream) {
-    if (std::getenv("NINFER_BTDBG") != nullptr && cache.block_table.data != nullptr) {
-        static int kapp_seq = 0;
-        ++kapp_seq;
-        std::vector<std::int32_t> raw(48);
-        cudaMemcpyAsync(raw.data(), cache.block_table.data, 48 * sizeof(std::int32_t),
-                        cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
-        // Only dump gappy (non-contiguous) tables: a clean contiguous allocation has raw[i]==raw[0]+i
-        // for every mapped entry (skip unmapped zeros).
-        bool gappy = false;
-        for (int i = 0; i < 48; ++i) {
-            if (raw[i] == 0) { continue; }
-            if (raw[i] != raw[0] + i) { gappy = true; break; }
-        }
-        if (gappy && kapp_seq < 400) {
-            std::fprintf(stderr, "[KAPPBT] seq=%d ne0=%d bytes=%zu GAP raw24:", kapp_seq,
-                         cache.block_table.ne[0], cache.block_table.bytes());
-            for (int i = 0; i < 24; ++i) { std::fprintf(stderr, " %d", raw[i]); }
-            std::fprintf(stderr, "\n");
-        }
-    }
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
     dispatch_gqa_kv_geometry(k.ne[1], [&]<typename Geometry>() {
@@ -161,28 +140,9 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
 }
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
-                                  const Tensor& positions, const Tensor& valid_columns,
-                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                  Tensor& out, cudaStream_t stream) {
-    if (std::getenv("NINFER_BTDBG") != nullptr && cache.block_tables.data != nullptr &&
-        table_rows.data != nullptr) {
-        static int bt_seq = 0;
-        if (bt_seq < 90) {
-            ++bt_seq;
-            std::vector<std::int32_t> raw(64);
-            int row0 = -12345;
-            cudaMemcpyAsync(raw.data(), cache.block_tables.data, 64 * sizeof(std::int32_t),
-                            cudaMemcpyDeviceToHost, stream);
-            cudaMemcpyAsync(&row0, table_rows.data, sizeof(std::int32_t), cudaMemcpyDeviceToHost,
-                            stream);
-            cudaStreamSynchronize(stream);
-            std::fprintf(stderr,
-                         "[BTM] seq=%d ne0=%d ne1=%d row0=%d raw64:", bt_seq, cache.block_tables.ne[0],
-                         cache.block_tables.ne[1], row0);
-            for (int i = 0; i < 64; ++i) { std::fprintf(stderr, " %d", raw[i]); }
-            std::fprintf(stderr, "\n");
-        }
-    }
+                                 const Tensor& positions, const Tensor& valid_columns,
+                                 const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
+                                 Tensor& out, cudaStream_t stream) {
     const auto launch = [&]<bool Masked>() {
         const GqaPrefillBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),

@@ -42,7 +42,6 @@ __global__ void gqa_attention_prefill_fill_bf16_kernel(
     const int lane                  = static_cast<int>(threadIdx.x) & 31;
     const std::int32_t* block_table = metadata.block_table();
     int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
-    kv_debug_probe(5, cache_k, physical_page, position, lane);
     const std::int64_t src_off =
         static_cast<std::int64_t>(d) +
         static_cast<std::int64_t>(kGqaPrefillHeadDim) * (kv_head + Geometry::KVHeads * token);

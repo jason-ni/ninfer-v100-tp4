@@ -3,7 +3,6 @@
 #include "core/paged_kv_cache.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <limits>
 #include <stdexcept>
 
@@ -372,10 +371,6 @@ NodeId PrefixIndex::commit_block(const BlockCommit& commit, bool& adopted) {
         // Adopt the offered pages only when no transfer is in flight on this node: a concurrent
         // restore already owns the destination pages and must not be retargeted underneath it.
         if (record.device_state != Residency::Resident && record.restore_pins == 0U) {
-            std::fprintf(stderr,
-                         "[PCDBG] adopt node=%u depth=%d page=%d was_absent(host=%d)\n",
-                         existing.node, record.depth, commit.pages.page[0],
-                         static_cast<int>(record.host_state));
             record.device_pages  = commit.pages;
             record.device_state  = Residency::Resident;
             link_lru_tail(existing.node);
@@ -398,7 +393,8 @@ NodeId PrefixIndex::commit_block(const BlockCommit& commit, bool& adopted) {
     nodes_[commit.parent - 1U].children.push_back(id);
     link_lru_tail(id);
     adopted = true;
-    return id;}
+    return id;
+}
 
 SlotId PrefixIndex::acquire_slot(std::uint64_t priority) {
     if (!free_slots_.empty()) {
@@ -651,9 +647,6 @@ NodeId PrefixIndex::evict_device_lru() {
         BlockNode& record = nodes_[current - 1U];
         if (record.active_refs == 0 && record.restore_pins == 0 &&
             record.host_state == Residency::Host) {
-            std::fprintf(stderr, "[PCDBG] demote node=%u depth=%d text_page=%d backend_page=%d\n",
-                         current, record.depth, record.device_pages.page[0],
-                         record.device_pages.page[1]);
             if (sink_ != nullptr) { sink_->release_block_pages(record.device_pages); }
             record.device_state = Residency::Absent;
             unlink_lru(current);
@@ -678,28 +671,8 @@ NodeId PrefixIndex::evict_device_lru() {
     return kInvalidNode;
 }
 
-bool PrefixIndex::debug_page_referenced(std::size_t pool, std::int32_t page) const noexcept {
-    if (page < 0) { return false; }
-    for (const BlockNode& record : nodes_) {
-        if (!record.live) { continue; }
-        if (record.device_state != Residency::Resident &&
-            record.device_state != Residency::Filling) {
-            continue;
-        }
-        if (record.device_pages.page[pool] == page) { return true; }
-    }
-    return false;
-}
-
-std::vector<NodeId> PrefixIndex::debug_live_node_ids() const noexcept {
-    std::vector<NodeId> ids;
-    for (std::size_t i = 0; i < nodes_.size(); ++i) {
-        if (nodes_[i].live) { ids.push_back(static_cast<NodeId>(i + 1U)); }
-    }
-    return ids;
-}
-
-std::array<std::uint32_t, kMaxPools> PrefixIndex::evictable_page_counts() const noexcept {    std::array<std::uint32_t, kMaxPools> counts{0U, 0U};
+std::array<std::uint32_t, kMaxPools> PrefixIndex::evictable_page_counts() const noexcept {
+    std::array<std::uint32_t, kMaxPools> counts{0U, 0U};
     for (NodeId id = lru_head_; id != kInvalidNode; id = nodes_[id - 1U].lru_next) {
         const BlockNode& record = nodes_[id - 1U];
         if (record.device_pages.page[0] >= 0) { ++counts[0]; }
@@ -738,9 +711,6 @@ void PrefixIndex::erase_subtree(NodeId node) {
         BlockNode& record = nodes_[current - 1U];
         if (record.lru_linked) { unlink_lru(current); }
         if (record.device_state == Residency::Resident) {
-            std::fprintf(stderr, "[PCDBG] erase node=%u depth=%d text_page=%d backend_page=%d\n",
-                         current, record.depth, record.device_pages.page[0],
-                         record.device_pages.page[1]);
             if (sink_ != nullptr) { sink_->release_block_pages(record.device_pages); }
             record.device_state = Residency::Absent;
         }
@@ -809,8 +779,6 @@ void PrefixIndex::begin_device_fill(NodeId id, PoolPages pages) noexcept {
     if (!valid(id)) { return; }
     BlockNode& record = nodes_[id - 1U];
     if (record.device_state != Residency::Absent) { return; }
-    std::fprintf(stderr, "[PCDBG] fill node=%u depth=%d page=%d (from host slab)\n", id,
-                 record.depth, pages.page[0]);
     record.device_pages = pages;
     record.device_state = Residency::Filling;
     // Pin the node (pages must not be evicted mid-copy) and the source slab (the pool must not

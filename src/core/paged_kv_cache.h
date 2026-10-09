@@ -148,10 +148,6 @@ public:
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
 
-    // Debug: per-page ownership state (0 free, 1 owned/entitled, 2 cache-owned). Temporary
-    // instrumentation for the M2 host-restore clobber investigation.
-    [[nodiscard]] std::uint8_t debug_page_state(std::int32_t page) const noexcept;
-
 private:
     friend class PagedKVAllocation;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
@@ -174,7 +170,6 @@ private:
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;
     std::uint32_t cached_pages_   = 0;
-    std::vector<std::uint8_t> debug_page_state_;
 };
 
 class PagedKVAllocation {
