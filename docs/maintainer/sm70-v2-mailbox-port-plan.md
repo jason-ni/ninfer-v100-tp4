@@ -1,10 +1,13 @@
 # sm70 v2 attention + split reduce + TP mailbox port plan
 
-Status: active. Working plan for porting the three selected optimizations from
-`ninfer-v100-tpx` (`/media/zt/prj/ninfer-v100-tpx`) into this V100X2 fork. Updated as work
-proceeds; the design notes below are the current authority for this port until the changes land,
-after which the affected active documents (`docs/performance.md`, and the comparison document
-`docs/maintainer/sm70-optimization-comparison.md`) are synced and this plan is removed.
+Status: **complete.** All three selected optimizations (#1 INT8 small-T decode attention v2, #5
+small-T split reduce, TP mailbox) are ported, built, and measured (+16.5% committed decode at 65K
+on the available NVFP4 identity, §Measurements). The one open item is the Q4_K_M 85K acceptance
+measurement, which is **permanently blocked on this box**: `/Models` (and the
+`qwen3.8-27b/gguf-q4-k-m` artifact and the 85K corpus) does not exist here, and the same limitation
+is already recorded in `docs/performance.md`. `docs/maintainer/sm70-optimization-comparison.md`
+carries the port status and measurements. This plan is retained as the port's design record because
+its named close-out gate cannot be met locally; it is no longer an active working plan.
 
 ## Scope
 
