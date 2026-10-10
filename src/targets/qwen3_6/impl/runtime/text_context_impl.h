@@ -792,14 +792,19 @@ void TextContext::mixed_prefill_decode_batch(const Tensor& ids, const Tensor& ca
                                              ops::GqaExecutionEnvelope prefill_envelope,
                                              bool prefill_finalize, Tensor& decode_hidden,
                                              Tensor& decode_logits, Tensor& prefill_bonus_logits,
-                                             Tensor& prefill_tail_hidden) {
+                                             Tensor& prefill_tail_hidden,
+                                             Tensor* rewrite_checkpoint_hidden,
+                                             std::int32_t rewrite_checkpoint_column,
+                                             std::int32_t rewrite_checkpoint_state_slot) {
     if (tensor_parallel()) {
         mixed_prefill_decode_batch_parallel(ids, cache_positions, rope_positions,
                                             decode_kv_table_rows, decode_linear_state_slots,
                                             decode_envelope, prefill_kv_table_rows,
                                             prefill_linear_slot, prefill_envelope, prefill_finalize,
                                             decode_hidden, decode_logits, prefill_bonus_logits,
-                                            prefill_tail_hidden);
+                                            prefill_tail_hidden, rewrite_checkpoint_hidden,
+                                            rewrite_checkpoint_column,
+                                            rewrite_checkpoint_state_slot);
         return;
     }
     const std::int32_t T = ids.ne[0];
@@ -853,6 +858,18 @@ void TextContext::mixed_prefill_decode_batch(const Tensor& ids, const Tensor& ca
             ops::rmsnorm(x.slice(1, T - 1, 1), *final_norm_, kCfg.rms_eps, true,
                          prefill_tail_hidden, stream);
             ops::linear(prefill_tail_hidden, *lm_head_, prefill_bonus_logits, stream);
+        }
+        // Rewrite-checkpoint capture: the raw (pre-final-norm) owner hidden at the checkpoint's
+        // flat column plus the owner's GDN state image.
+        if (rewrite_checkpoint_column >= 0 && rewrite_checkpoint_hidden != nullptr) {
+            require_tensor_shape(*rewrite_checkpoint_hidden, DType::BF16, {kCfg.hidden, 1},
+                                 "mixed rewrite checkpoint hidden");
+            Tensor checkpoint_hidden = x.slice(1, rewrite_checkpoint_column, 1);
+            CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden->data, checkpoint_hidden.data,
+                                       checkpoint_hidden.bytes(), cudaMemcpyDeviceToDevice, stream));
+        }
+        if (rewrite_checkpoint_state_slot >= 0) {
+            state_.copy_slot(prefill_linear_slot, rewrite_checkpoint_state_slot, stream);
         }
     }
     work_.reset();
@@ -2937,7 +2954,9 @@ void TextContext::mixed_prefill_decode_batch_parallel(
     ops::GqaExecutionEnvelope decode_envelope, const Tensor& prefill_kv_table_rows,
     std::int32_t prefill_linear_slot, ops::GqaExecutionEnvelope prefill_envelope,
     bool prefill_finalize, Tensor& decode_hidden, Tensor& decode_logits,
-    Tensor& prefill_bonus_logits, Tensor& prefill_tail_hidden) {
+    Tensor& prefill_bonus_logits, Tensor& prefill_tail_hidden,
+    Tensor* rewrite_checkpoint_hidden, std::int32_t rewrite_checkpoint_column,
+    std::int32_t rewrite_checkpoint_state_slot) {
     const ExecutionContext& execution                       = ec();
     const std::array<WorkspaceArena*, kMaximumDevices> ws   = workspaces();
     const std::int32_t T                                    = ids.ne[0];
@@ -3067,6 +3086,24 @@ void TextContext::mixed_prefill_decode_batch_parallel(
                              tail_hidden[r], stream_for(rank));
             });
             logits_parallel(tail_hidden, bonus_windows);
+        }
+        // Rewrite-checkpoint capture (M2). The hidden image is authoritative on rank 0; the GDN
+        // state image is per-rank (TP-sharded state), so every rank copies its own slot.
+        if (rewrite_checkpoint_column >= 0 && rewrite_checkpoint_hidden != nullptr) {
+            require_tensor_shape(*rewrite_checkpoint_hidden, DType::BF16, {kCfg.hidden, 1},
+                                 "mixed rewrite checkpoint hidden");
+            const Tensor checkpoint_hidden = x[0].slice(1, rewrite_checkpoint_column, 1);
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(ctx_.device));
+            CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden->data, checkpoint_hidden.data,
+                                       checkpoint_hidden.bytes(), cudaMemcpyDeviceToDevice,
+                                       ctx_.stream));
+        }
+        if (rewrite_checkpoint_state_slot >= 0) {
+            for_each_rank(execution, [&](int rank) {
+                state_for(rank).copy_slot(prefill_linear_slot, rewrite_checkpoint_state_slot,
+                                          stream_for(rank));
+            });
         }
     }
     for (int rank = 0; rank < tp_count_; ++rank) { ws[rank]->reset(); }

@@ -13,8 +13,8 @@ profile of the mixed unit (TP2, NVFP4 27B, 12.46 s total GPU time) puts the enti
 fused kernels would replace at ~3.4% (GDN recurrence 2.5%, all GQA attention routes ~0.9%), so
 fusing the two sub-batch dispatches into one launch each can only remove launch overhead (<0.5%
 end to end) while reintroducing the §11.1 conv-parity risk — the dominant cost is weight
-dequantization + GEMM + collectives. M2 (prefix/retained-hit), M3 (MTP/DFlash coexistence), and M5
-(Vision) remain unimplemented.
+dequantization + GEMM + collectives. M2 (prefix/retained-hit) is delivered; M3 (MTP/DFlash
+coexistence) and M5 (Vision) remain unimplemented.
 Scope: the Qwen3.6-family hybrid text path (GQA full-attention + GDN linear-attention) at
 `src/targets/qwen3_6`, targeting the V100X2 acceptance workload. 27B/35B-A3B peer variants share
 the design; only the 27B Q4_K_M artifact is required to land the acceptance claim.
@@ -593,13 +593,22 @@ on measured evidence (§9 M1f).
   The remaining ~96% is weight dequantization (~25%), cutlass GEMMs (~33%), and all-reduce (~6%).
   Replacing the two sub-batch dispatches with one ragged launch each removes launch overhead only
   (<0.5% end to end) while reintroducing the §11.1 conv-parity exposure, so it is not pursued.
-- **M2 — prefix / retained-hit interaction.** Scope: the prefill row resumed from a restored
-  block snapshot (`reuse_base = frontier`), KV append extending the owner past the reuse frontier,
-  per-column GDN snapshot stride feeding the hybrid prefix-cache taps at a chunk boundary
-  (§6.2/§6.3, `docs/maintainer/hybrid-prefix-cache-plan.md`). **Exit**: a returning request with a
-  reused prefix run *mixed* == cold-run control (continuation-identical). The delivered
-  `decode_mixed_batch` currently rejects vision, MTP bridges, and skips rewrite-checkpoint capture;
-  M2 owns the checkpoint interaction.
+- **M2 — prefix / retained-hit interaction.** *Delivered.* A reused-prefix prefill owner
+  (`staged.base > 0`) is folded into a mixed round correctly: the mixed path's owner frontier and
+  per-token KV positions are the absolute cursor, not `base + cursor` (the delivered M1 form
+  double-counted the reused prefix, which only manifests with reuse). The owner's rewrite-checkpoint
+  capture (raw hidden at the frontier + GDN state image) and the hybrid prefix-cache block-commit /
+  tap capture now run through a shared `ProgramImplCore::capture_prefix_after_chunk`, so a prefill
+  folded into a mixed round grows the cache exactly as an isolated chunk; a boundary-aligned
+  checkpoint frontier is materialized in the mixed pass. A checkpoint frontier strictly inside the
+  chunk still needs the standalone internal split and is handled by the standalone prefill step
+  (the mixed unit does not force a split, which would perturb the decode batch composition). The
+  block-aligned final-chunk tap cut is shared with the standalone path. **Exit** (met, TP2, NVFP4
+  27B, `ninfer_qwen3_8_27b_v100x2_mixed_reuse_real_test`): the same reused-prefix owner run mixed
+  (with a concurrent decoder forcing the suffix chunks through mixed rounds) reproduces the
+  single-lane reused control exactly (24/24); the same test fails when the base double-count is
+  restored. Along the way the delivered `prefix_tap_slots.reserve()` (no clear) stale-slot bug in
+  the hybrid prefix cache was fixed — a retained lane kept a consumed `kInvalidSlot` at index 0.
 - **M3 — MTP/DFlash coexistence.** Scope: a speculative decode row (`query_len = draft+1`) shares
   the flat stream with the prefill owner; argmax-licensing/replay stays on the Verify path
   (decision 14). **Exit**: MTP/DFlash acceptance + per-request continuation parity vs isolated.

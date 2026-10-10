@@ -280,6 +280,11 @@ public:
     // table_rows`/`decode_linear_state_slots` are device [B]; `prefill_kv_table_rows` is device
     // [1] and `prefill_linear_slot` is the owner's absolute linear-state slot. Produces the B
     // decode rows' hidden/logits (+ the owner's bonus logits when `prefill_finalize`).
+    // `rewrite_checkpoint_hidden`/`rewrite_checkpoint_column`/`rewrite_checkpoint_state_slot` carry
+    // the owner's optional rewrite-checkpoint capture (M2): when `rewrite_checkpoint_column >= 0`
+    // the raw hidden at that flat column is copied into `rewrite_checkpoint_hidden` (rank 0) and the
+    // owner's GDN state into `rewrite_checkpoint_state_slot` (every rank); all three are neutral
+    // (null/-1) when no capture is due.
     void mixed_prefill_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                     const Tensor& rope_positions,
                                     const Tensor& decode_kv_table_rows,
@@ -290,7 +295,10 @@ public:
                                     ops::GqaExecutionEnvelope prefill_envelope,
                                     bool prefill_finalize, Tensor& decode_hidden,
                                     Tensor& decode_logits, Tensor& prefill_bonus_logits,
-                                    Tensor& prefill_tail_hidden);
+                                    Tensor& prefill_tail_hidden,
+                                    Tensor* rewrite_checkpoint_hidden    = nullptr,
+                                    std::int32_t rewrite_checkpoint_column     = -1,
+                                    std::int32_t rewrite_checkpoint_state_slot = -1);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
@@ -469,7 +477,9 @@ private:
         ops::GqaExecutionEnvelope decode_envelope, const Tensor& prefill_kv_table_rows,
         std::int32_t prefill_linear_slot, ops::GqaExecutionEnvelope prefill_envelope,
         bool prefill_finalize, Tensor& decode_hidden, Tensor& decode_logits,
-        Tensor& prefill_bonus_logits, Tensor& prefill_tail_hidden);
+        Tensor& prefill_bonus_logits, Tensor& prefill_tail_hidden,
+        Tensor* rewrite_checkpoint_hidden = nullptr, std::int32_t rewrite_checkpoint_column = -1,
+        std::int32_t rewrite_checkpoint_state_slot = -1);
     // --- tp == 2 MTP -----------------------------------------------------------------------
     // The MTP head is one layer, so its split schedule is the text layer's split schedule with a
     // single instance of each stage: a ROW-parallel stem (no pack -- each rank's K-slice already

@@ -181,6 +181,12 @@ struct MixedBatchContext {
     std::span<const std::int32_t> host_decode_linear_slots;
     // The owner's own text KV-table row, identical on every rank.
     std::int32_t prefill_kv_row = -1;
+    // Owner rewrite-checkpoint capture (M2). When `rewrite_checkpoint_column >= 0`, the mixed pass
+    // copies the raw pre-final-norm hidden at that flat column into `rewrite_checkpoint_hidden`
+    // (rank 0) and copies the owner's GDN state into `rewrite_checkpoint_state_slot` (all ranks).
+    Tensor* rewrite_checkpoint_hidden          = nullptr;
+    std::int32_t rewrite_checkpoint_column     = -1;
+    std::int32_t rewrite_checkpoint_state_slot = -1;
 };
 
 struct MtpBatchContext {

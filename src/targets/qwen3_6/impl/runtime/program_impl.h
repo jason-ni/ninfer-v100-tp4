@@ -1140,6 +1140,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 tap_positions.push_back(aligned);
             }
             sequence.prefix_tap_positions = std::move(tap_positions);
+            // A retained lane's state is reused verbatim, so any tap slots left over from its
+            // previous life (consumed entries are kInvalidSlot) must be dropped before this
+            // request's own slots are reserved, or a stale slot survives at index 0.
+            sequence.prefix_tap_slots.clear();
             sequence.prefix_tap_slots.reserve(sequence.prefix_tap_positions.size());
             for (std::size_t tap = 0; tap < sequence.prefix_tap_positions.size(); ++tap) {
                 const ninfer::prefix_cache::SlotId slot = prefix_index->reserve_snapshot_slot(0);
@@ -2722,6 +2726,121 @@ void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
     sequence.tail_hidden_valid = true;
 }
 
+std::uint32_t ProgramImplCore::cap_final_chunk_for_taps(const SequenceState& sequence,
+                                                        std::uint32_t cursor,
+                                                        std::uint32_t prompt_tokens,
+                                                        std::uint32_t nominal) const {
+    if (prefix_index == nullptr || !sequence.prefix_capture ||
+        sequence.prefix_tap_next >= sequence.prefix_tap_positions.size() ||
+        cursor + nominal != prompt_tokens) {
+        return nominal;
+    }
+    const std::uint32_t kBlock = static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens);
+    const std::uint32_t boundary = (prompt_tokens / kBlock) * kBlock;
+    if (boundary > cursor) { nominal = boundary - cursor; }
+    return nominal;
+}
+
+void ProgramImplCore::capture_prefix_after_chunk(SequenceState& sequence) {
+    if (prefix_index == nullptr || !sequence.prefix_capture) { return; }
+    const std::uint32_t cursor    = sequence.text_kv_valid;
+    const std::uint32_t completed = cursor / ninfer::prefix_cache::kBlockTokens;
+    const std::uint32_t already_committed = sequence.prefix_pinned_nodes.size() - 1;
+    // Commit newly completed blocks. A block the index adopts transfers its page to the cache
+    // (promote_page_at, replicated across the lockstep rank pools); a duplicate commit leaves the
+    // page owned by this allocation so release() returns it normally and it is never handed back to
+    // the free pool while still live in the block table.
+    while (sequence.prefix_pinned_nodes.size() - 1 < completed) {
+        const std::uint32_t b      = sequence.prefix_pinned_nodes.size() - 1; // 0-indexed block.
+        const std::uint32_t parent = sequence.prefix_pinned_nodes[b];         // node for block b-1.
+        const std::int32_t text_page = sequence.kv->text.page_ids()[b];
+        const std::int32_t backend_page =
+            sequence.kv->backend ? sequence.kv->backend->page_ids()[b] : -1;
+        const std::span<TokenId> block_tokens =
+            std::span<TokenId>(sequence.prefix_prompt_tokens).subspan(b * 64, 64);
+        const ninfer::prefix_cache::PoolPages pages{.page = {text_page, backend_page}};
+        bool adopted = false;
+        const ninfer::prefix_cache::NodeId node = prefix_index->commit_block(
+            ninfer::prefix_cache::BlockCommit{
+                .parent      = parent,
+                .lookup_hash = sequence.prefix_block_hashes[b],
+                .extra       = sequence.prefix_block_extras[b],
+                .tokens      = block_tokens,
+                .pages       = pages},
+            adopted);
+        if (node == ninfer::prefix_cache::kInvalidNode) {
+            break; // avoid an infinite loop if the commit is rejected
+        }
+        if (adopted && sequence.kv) {
+            // The index took this page: fold it into the cache-owned set on every rank (lockstep
+            // pools) so release() never returns it.
+            sequence.kv->text.promote_page_at(b);
+            if (sequence.kv->backend) { sequence.kv->backend->promote_page_at(b); }
+            for (int rank = 1; rank < tp; ++rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                if (sequence.kv->text_peer[slot]) {
+                    sequence.kv->text_peer[slot]->promote_page_at(b);
+                }
+                if (sequence.kv->backend_peer[slot]) {
+                    sequence.kv->backend_peer[slot]->promote_page_at(b);
+                }
+            }
+        }
+        // adopted == false: the block duplicates an already-resident node, so the page stays owned
+        // by this allocation and is returned normally by release().
+        sequence.prefix_pinned_nodes.push_back(node);
+        prefix_index->pin_node(node);
+    }
+    (void)already_committed;
+    // Capture tap snapshots at chunk boundaries. Only when the boundary is block-aligned: the
+    // state image copied below is the state after `cursor`, so a mid-block boundary would publish a
+    // snapshot whose frontier is ahead of its state. Defer such taps to the next aligned boundary.
+    const bool capture_aligned =
+        cursor % static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens) == 0;
+    while (capture_aligned && sequence.prefix_tap_next < sequence.prefix_tap_slots.size() &&
+           sequence.prefix_tap_positions[sequence.prefix_tap_next] <= cursor) {
+        const std::uint32_t position = sequence.prefix_tap_positions[sequence.prefix_tap_next];
+        const ninfer::prefix_cache::SlotId slot = sequence.prefix_tap_slots[sequence.prefix_tap_next];
+        const std::int32_t state_slot = LinearStateSlots::snapshot_state_slot(
+            static_cast<std::uint32_t>(slot), max_concurrency, prefix_snapshot_slots);
+        decoder->linear_attention.copy_slot(
+            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), state_slot,
+            device.stream);
+        for (int rank = 1; rank < tp; ++rank) {
+            const auto peer_slot = static_cast<std::size_t>(rank);
+            const ScopedDevice scope(peer[peer_slot]->device.device);
+            peer[peer_slot]->decoder->linear_attention.copy_slot(
+                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), state_slot,
+                peer[peer_slot]->device.stream);
+        }
+        // cursor is block-aligned, so `completed*64 == cursor`; the state image is the state after
+        // exactly `cursor` tokens, so the snapshot frontier is `cursor` with tail_len 0, anchored
+        // on block completed-1.
+        const ninfer::prefix_cache::NodeId anchor = sequence.prefix_pinned_nodes[completed];
+        const std::uint32_t frontier              = cursor;
+        const auto snap_id = prefix_index->add_snapshot(ninfer::prefix_cache::SnapshotRequest{
+            .anchor        = anchor,
+            .frontier      = frontier,
+            .kind          = ninfer::prefix_cache::SnapshotKind::Tap,
+            .priority      = 0,
+            .reserved_slot = slot});
+        // Settle the reserved slot: a published snapshot owns it (or a duplicate holds a different
+        // one), so clear_lane must never release it back to the free list.
+        if (snap_id != ninfer::prefix_cache::kInvalidSnapshot) {
+            const ninfer::prefix_cache::Snapshot* published = prefix_index->snapshot(snap_id);
+            if (published == nullptr || published->device_slot != slot) {
+                prefix_index->release_reserved_slot(slot);
+            }
+            issue_snapshot_write_through(snap_id);
+        } else {
+            prefix_index->release_reserved_slot(slot);
+        }
+        sequence.prefix_tap_slots[sequence.prefix_tap_next] = ninfer::prefix_cache::kInvalidSlot;
+        (void)position;
+        sequence.prefix_tap_next++;
+    }
+}
+
 void ProgramImplCore::copy_round_token() {
     CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.token.data, sizeof(TokenId), cudaMemcpyDeviceToHost,
                                device.stream));
@@ -3134,19 +3253,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         if (staged.cursor < staged.prompt_tokens) {
             std::uint32_t nominal =
                 std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
-            // End the prompt-tail chunk on a block boundary. A tap snapshot's state image is the
-            // state after `cursor`, so it must be captured at an aligned cursor; otherwise the
-            // final (mid-block) tail would publish a snapshot whose frontier lags its state by
-            // `prompt_tokens % 64` tokens and the resume double-consumes those tokens.
-            if (sequence.prefix_capture &&
-                sequence.prefix_tap_next < sequence.prefix_tap_positions.size() &&
-                staged.cursor + nominal == staged.prompt_tokens) {
-                const std::uint32_t kBlock =
-                    static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens);
-                const std::uint32_t boundary =
-                    (staged.prompt_tokens / kBlock) * kBlock;
-                if (boundary > staged.cursor) { nominal = boundary - staged.cursor; }
-            }
+            // End the prompt-tail chunk on a block boundary so a pending tail tap can capture at an
+            // aligned cursor (see cap_final_chunk_for_taps).
+            nominal = cap_final_chunk_for_taps(sequence, staged.cursor, staged.prompt_tokens, nominal);
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
@@ -3181,118 +3290,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
 
             // Hybrid prefix cache: commit newly completed blocks and capture tap snapshots at
-            // chunk boundaries. Runs for both cold and reused prefills so the cache grows as
-            // conversations progress.
-            if (prefix_index != nullptr && sequence.prefix_capture) {
-                const std::uint32_t cursor = staged.cursor;
-                const std::uint32_t completed = cursor / ninfer::prefix_cache::kBlockTokens;
-                const std::uint32_t already_committed =
-                    sequence.prefix_pinned_nodes.size() - 1;
-                // Commit newly completed blocks. A block the index adopts transfers its page to the
-                // cache (promote_page_at, replicated across the lockstep rank pools); a duplicate
-                // commit leaves the page owned by this allocation so release() returns it normally
-                // and it is never handed back to the free pool while still live in the block table.
-                while (sequence.prefix_pinned_nodes.size() - 1 < completed) {
-                    const std::uint32_t b = sequence.prefix_pinned_nodes.size() - 1; // 0-indexed block number.
-                    const std::uint32_t parent = sequence.prefix_pinned_nodes[b];    // node for block (b-1), or root if b=0.
-                    const std::int32_t text_page = sequence.kv->text.page_ids()[b];
-                    const std::int32_t backend_page =
-                        sequence.kv->backend ? sequence.kv->backend->page_ids()[b] : -1;
-                    const std::span<TokenId> block_tokens =
-                        std::span<TokenId>(sequence.prefix_prompt_tokens).subspan(b * 64, 64);
-                    const ninfer::prefix_cache::PoolPages pages{
-                        .page = {text_page, backend_page}};
-                    bool adopted = false;
-                    const ninfer::prefix_cache::NodeId node = prefix_index->commit_block(
-                        ninfer::prefix_cache::BlockCommit{
-                            .parent      = parent,
-                            .lookup_hash = sequence.prefix_block_hashes[b],
-                            .extra       = sequence.prefix_block_extras[b],
-                            .tokens      = block_tokens,
-                            .pages       = pages},
-                        adopted);
-                    if (node != ninfer::prefix_cache::kInvalidNode) {
-                        if (adopted && sequence.kv) {
-                            // The index took this page: fold it into the cache-owned set on every
-                            // rank (lockstep pools) so release() never returns it.
-                            sequence.kv->text.promote_page_at(b);
-                            if (sequence.kv->backend) {
-                                sequence.kv->backend->promote_page_at(b);
-                            }
-                            for (int rank = 1; rank < tp; ++rank) {
-                                const auto slot = static_cast<std::size_t>(rank);
-                                if (sequence.kv->text_peer[slot]) {
-                                    sequence.kv->text_peer[slot]->promote_page_at(b);
-                                }
-                                if (sequence.kv->backend_peer[slot]) {
-                                    sequence.kv->backend_peer[slot]->promote_page_at(b);
-                                }
-                            }
-                        }
-                        // adopted == false: the block duplicates an already-resident node, so the
-                        // page stays owned by this allocation and is returned normally by
-                        // release(); it is never double-freed while live in the block table.
-                        sequence.prefix_pinned_nodes.push_back(node);
-                        prefix_index->pin_node(node);
-                    } else {
-                        break; // avoid an infinite loop if the commit is rejected
-                    }
-                }
-                // Capture tap snapshots at chunk boundaries. Only when the boundary is block-aligned:
-                // the state image copied below is the state after `cursor`, so a mid-block boundary
-                // (e.g. from a rewrite-checkpoint split) would publish a snapshot whose frontier is
-                // ahead of its state. Defer such taps to the next aligned boundary.
-                const bool capture_aligned =
-                    cursor % static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens) == 0;
-                while (capture_aligned &&
-                       sequence.prefix_tap_next < sequence.prefix_tap_slots.size() &&
-                       sequence.prefix_tap_positions[sequence.prefix_tap_next] <= cursor) {
-                    const std::uint32_t position = sequence.prefix_tap_positions[sequence.prefix_tap_next];
-                    const ninfer::prefix_cache::SlotId slot =
-                        sequence.prefix_tap_slots[sequence.prefix_tap_next];
-                    const std::int32_t state_slot = LinearStateSlots::snapshot_state_slot(
-                        static_cast<std::uint32_t>(slot), max_concurrency, prefix_snapshot_slots);
-                    decoder->linear_attention.copy_slot(
-                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                        state_slot, device.stream);
-                    for (int rank = 1; rank < tp; ++rank) {
-                        const auto peer_slot = static_cast<std::size_t>(rank);
-                        const ScopedDevice scope(peer[peer_slot]->device.device);
-                        peer[peer_slot]->decoder->linear_attention.copy_slot(
-                            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                            state_slot, peer[peer_slot]->device.stream);
-                    }
-                    // cursor is block-aligned (capture_aligned), so `completed*64 == cursor`. The
-                    // state image copied above is the state after exactly `cursor` tokens, so the
-                    // snapshot's frontier is `cursor` and its tail_len is 0. anchor node =
-                    // prefix_pinned_nodes[completed] (block completed-1).
-                    const ninfer::prefix_cache::NodeId anchor =
-                        sequence.prefix_pinned_nodes[completed];
-                    const std::uint32_t frontier = cursor;
-                    const auto snap_id = prefix_index->add_snapshot(ninfer::prefix_cache::SnapshotRequest{
-                        .anchor        = anchor,
-                        .frontier      = frontier,
-                        .kind          = ninfer::prefix_cache::SnapshotKind::Tap,
-                        .priority      = 0,
-                        .reserved_slot = slot});
-                    // Settle the reserved slot: a published snapshot owns it (or a duplicate holds
-                    // a different one), so clear_lane must never release it back to the free list.
-                    if (snap_id != ninfer::prefix_cache::kInvalidSnapshot) {
-                        const ninfer::prefix_cache::Snapshot* published =
-                            prefix_index->snapshot(snap_id);
-                        if (published == nullptr || published->device_slot != slot) {
-                            prefix_index->release_reserved_slot(slot);
-                        }
-                        issue_snapshot_write_through(snap_id);
-                    } else {
-                        prefix_index->release_reserved_slot(slot);
-                    }
-                    sequence.prefix_tap_slots[sequence.prefix_tap_next] =
-                        ninfer::prefix_cache::kInvalidSlot;
-                    (void)position;
-                    sequence.prefix_tap_next++;
-                }
-            }
+            // chunk boundaries. Shared with the mixed unit so a prefill folded into a mixed round
+            // grows the cache identically.
+            capture_prefix_after_chunk(sequence);
 
             if (!result.finalized) {
                 if (staged.cursor == staged.prompt_tokens) {
@@ -3581,15 +3581,25 @@ ProgramImplCore::decode_mixed_batch(std::span<const std::uint32_t> lanes,
         staged.cursor > staged.prompt_tokens) {
         throw std::logic_error("mixed unit does not support this prefill mode");
     }
-    // A planned rewrite-checkpoint capture is skipped for now: the mixed card has no
-    // rewrite-checkpoint hidden output wired, so the owner sequence keeps its previous checkpoint
-    // (invalid for a cold request, which only makes a later reuse fall back to cold). M2 owns the
-    // prefix / retained-checkpoint interaction with mixed units.
+    // M2: the mixed owner participates in the retained-checkpoint and hybrid-prefix machinery
+    // exactly as an isolated prefill chunk does. `staged.cursor` is already an absolute prompt/KV
+    // position (it starts at `staged.base`), so the owner frontier and the per-token KV positions
+    // are the cursor itself; adding `staged.base` again would double-count the reused prefix.
     const std::uint32_t remaining = staged.prompt_tokens - staged.cursor;
     if (remaining == 0) { throw std::logic_error("mixed unit owner has no prompt left"); }
-    const std::uint32_t nominal        = std::min(prefill_chunk, remaining);
+    std::uint32_t nominal = std::min(prefill_chunk, remaining);
+    // End the prompt-tail chunk on a block boundary so a pending tail tap captures at an aligned
+    // cursor (shared with the standalone prefill path).
+    nominal = cap_final_chunk_for_taps(owner_sequence, staged.cursor, staged.prompt_tokens, nominal);
+    // The owner's rewrite-checkpoint capture is only materialized when the checkpoint frontier lands
+    // exactly on the owner chunk end. A frontier strictly inside the chunk needs the standalone
+    // PrefillImpl internal split, which a single flat mixed pass cannot express; that case is left
+    // to the standalone prefill step, so the mixed unit never forces a chunk split (which would
+    // perturb the decode batch composition).
+    const RewriteCheckpointSpec* rewrite_checkpoint_capture =
+        staged.rewrite_checkpoint_capture ? &*staged.rewrite_checkpoint_capture : nullptr;
     const bool finalize                = staged.cursor + nominal == staged.prompt_tokens;
-    const std::uint32_t owner_frontier = staged.base + staged.cursor + nominal;
+    const std::uint32_t owner_frontier = staged.cursor + nominal;
     if (owner_frontier > capacity) {
         throw std::logic_error("mixed unit owner frontier exceeds capacity");
     }
@@ -3599,6 +3609,18 @@ ProgramImplCore::decode_mixed_batch(std::span<const std::uint32_t> lanes,
     if (T > mixed.tokens.ne[0] || B > mixed.decode_kv_table_rows.ne[0]) {
         throw std::logic_error("mixed unit exceeds its configured frame");
     }
+    // The owner's rewrite checkpoint is materialized when a capture was planned and the chunk now
+    // ends exactly on its frontier: the mixed pass writes the raw hidden of the owner's last token
+    // and copies the owner's GDN state into the checkpoint slot.
+    const bool captures_checkpoint = rewrite_checkpoint_capture != nullptr &&
+                                     rewrite_checkpoint_capture->frontier > staged.cursor &&
+                                     rewrite_checkpoint_capture->frontier == owner_frontier;
+    const std::int32_t rewrite_checkpoint_column =
+        captures_checkpoint ? B + c - 1 : -1;
+    const std::int32_t rewrite_checkpoint_state_slot =
+        captures_checkpoint
+            ? LinearStateSlots::rewrite_checkpoint_state_slot(owner_lane, max_concurrency)
+            : -1;
     qwen3_6::MixedDecodeControl& control = mixed_host_control;
     control                              = qwen3_6::MixedDecodeControl{};
     control.decode_rows         = B;
@@ -3634,7 +3656,7 @@ ProgramImplCore::decode_mixed_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t prompt_index = staged.cursor + static_cast<std::uint32_t>(t);
             mixed_host_tokens[B + t]         = staged.prompt.token_ids[prompt_index];
             mixed_host_cache_positions[B + t] =
-                checked_i32(staged.base + prompt_index, "mixed owner position");
+                checked_i32(prompt_index, "mixed owner position");
             mixed_host_rope_positions[B + t] = prompt_rope_position(staged.prompt, prompt_index)[0];
         }
         std::int32_t prefill_kv_row = owner_sequence.kv->text.bound_row();
@@ -3659,7 +3681,10 @@ ProgramImplCore::decode_mixed_batch(std::span<const std::uint32_t> lanes,
                                           static_cast<std::size_t>(B)),
             std::span<const std::int32_t>(mixed_host_decode_linear_slots.data(),
                                           static_cast<std::size_t>(B)),
-            prefill_kv_row};
+            prefill_kv_row,
+            &owner_sequence.rewrite_checkpoint_hidden,
+            rewrite_checkpoint_column,
+            rewrite_checkpoint_state_slot};
         mark_workspace_usage(workspace_plan.mixed_round);
         schedule::mixed_prefill_decode_batch(schedule_state);
         synchronize_peers();
@@ -3697,6 +3722,15 @@ ProgramImplCore::decode_mixed_batch(std::span<const std::uint32_t> lanes,
         owner_result.processed_prompt_tokens = nominal;
         staged.cursor += nominal;
         owner_sequence.text_kv_valid = owner_frontier;
+        // Hybrid prefix cache: commit newly completed blocks and capture tap snapshots at chunk
+        // boundaries, exactly as the standalone prefill path does after a chunk.
+        capture_prefix_after_chunk(owner_sequence);
+        if (captures_checkpoint) {
+            owner_sequence.rewrite_checkpoint = RewriteCheckpoint{
+                .valid    = true,
+                .kind     = rewrite_checkpoint_capture->kind,
+                .frontier = owner_frontier};
+        }
         if (finalize) {
             const TokenId bonus = static_cast<TokenId>(mixed_host_bonus_token);
             validate_licensed_tokens(std::span<const TokenId>(&bonus, 1));

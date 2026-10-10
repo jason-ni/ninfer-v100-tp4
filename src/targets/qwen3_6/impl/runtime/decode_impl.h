@@ -175,7 +175,10 @@ void mixed_prefill_decode_batch(MixedBatchContext& state) {
     card.mixed_prefill_decode_batch(ids, cpos, rpos, dkv, dslots, decode_envelope,
                                     mixed.prefill_kv_table_row, control.prefill_linear_slot,
                                     prefill_envelope, control.prefill_finalize != 0, hidden, logits,
-                                    mixed.bonus_logits, mixed.prefill_tail_hidden);
+                                    mixed.bonus_logits, mixed.prefill_tail_hidden,
+                                    state.rewrite_checkpoint_hidden,
+                                    state.rewrite_checkpoint_column,
+                                    state.rewrite_checkpoint_state_slot);
     ops::scatter(hidden, lanes, state.continuation_hidden_store, stream);
     ops::sample(logits, sampled, TextConfig::token_domain, mixed.sampling, cpos.slice(0, 0, B),
                 ops::kSamplePurposeDecode, state.execution.work, stream);

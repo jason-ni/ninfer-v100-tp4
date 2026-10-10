@@ -398,6 +398,13 @@ Remaining:
 1. Strengthen `exercise_host_tier` in `tests/targets/qwen3_6_27b/test_engine_v100x2_hybrid_real.cpp`
    to assert restored-continuation identity (not just `reused > 0`), matching this gate's criterion.
 
+Found during the L2 mixed-forward M2 work (2026-10-10): the tap-slot reservation loop in
+`ProgramImplCore::start_prefill_lane` grew `sequence.prefix_tap_slots` with `reserve()` +
+`push_back` and never cleared it. A retained lane's `SequenceState` is reused verbatim, and a
+consumed tap slot is set to `kInvalidSlot` (`-1`), so a lane reused by a second capturing request
+kept that `-1` at index 0 and `capture_prefix_after_chunk` then called `snapshot_state_slot` with it
+(`index >= snapshot_slots` -> throw). Fixed by clearing `prefix_tap_slots` before re-reserving.
+
 ### M3 — persistence and keys
 
 Deliverables:

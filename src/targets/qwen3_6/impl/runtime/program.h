@@ -548,6 +548,20 @@ private:
     void synchronize_peers() noexcept;
     void reset_peer_work() noexcept;
     void copy_tail(SequenceState& sequence, const Tensor& source);
+    // Hybrid prefix cache: commit every newly completed block and capture the tap snapshots whose
+    // frontier the sequence's text KV has now reached, using `sequence.text_kv_valid` as the
+    // completed cursor. Reached from both the standalone prefill step (advance_prefill) and the
+    // mixed unit (decode_mixed_batch) so a prefill folded into a mixed round grows the cache
+    // exactly as an isolated chunk does. No-op unless the sequence is capturing.
+    void capture_prefix_after_chunk(SequenceState& sequence);
+    // Block-aligned final-chunk cut: when a capturing sequence is about to finish its prompt and a
+    // pending tap still lies at the tail, cap `nominal` so the chunk ends on a kBlockTokens
+    // boundary (a tap's state image must be captured at an aligned cursor). Mirrors the cut in
+    // advance_prefill. Returns the possibly-reduced chunk length.
+    [[nodiscard]] std::uint32_t cap_final_chunk_for_taps(const SequenceState& sequence,
+                                                         std::uint32_t cursor,
+                                                         std::uint32_t prompt_tokens,
+                                                         std::uint32_t nominal) const;
     void copy_round_token();
     void copy_round_logits();
     void resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
