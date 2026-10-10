@@ -243,7 +243,6 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
 
     __shared__ float reduce[256];
     __shared__ float weights[Geometry::DecodeSplits];
-    __shared__ float values[256];
 
     float local_m = -CUDART_INF_F;
     for (int split = tid; split < active_split_count; split += blockDim.x) {
@@ -289,38 +288,52 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     }
     const float head_l = reduce[0];
 
-    // Fetch consecutive split vectors cooperatively, then sum them in their original
-    // ascending order. Weight sharing removes repeated exp/stat loads; staging overlaps
-    // the vector reads without changing the FP32 denominator or numerator association.
+    // The split loop is shared across the block: group g sums splits g, g+Groups, ... and the
+    // group sums are combined through shared memory. The old form staged one split per group
+    // through `values[]` with two barriers per batch and only group 0 accumulating, which left
+    // three quarters of the threads idle and issued one guarded load at a time (latency-bound);
+    // this form gives every thread its own split stream with an x8 unroll, so several independent
+    // partial-acc loads stay in flight per output element. It is branch-free: a zero weight is a
+    // neutral split whose partial is 0, and multiplying that 0 by the negative sentinel weight
+    // contributes nothing. The FP32 numerator sum stays in ascending split order within each
+    // group and the group sums are re-added in group order.
     static_assert(DChunk >= 32 && 256 % DChunk == 0);
-    constexpr int kSplitTile = 256 / DChunk;
-    const int group = tid / DChunk;
+    constexpr int kSplitGroups = 256 / DChunk;
+    const int group   = tid / DChunk;
     const int local_d = tid % DChunk;
-    const int d = d_start + local_d;
-    float numerator = 0.0f;
+    const int d       = d_start + local_d;
+    float numerator   = 0.0f;
     if (head_l > 0.0f) {
-        for (int first = 0; first < active_split_count; first += kSplitTile) {
-            const int split = first + group;
-            float value = 0.0f;
-            if (split < active_split_count && weights[split] >= 0.0f) {
-                value = __bfloat162float(
-                    partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)]);
-            }
-            values[tid] = value;
-            __syncthreads();
-            if (group == 0) {
+        int split = group;
+        for (; split + 7 * kSplitGroups < active_split_count; split += 8 * kSplitGroups) {
+            float values[8];
 #pragma unroll
-                for (int item = 0; item < kSplitTile; ++item) {
-                    const int source = first + item;
-                    if (source < active_split_count && weights[source] >= 0.0f) {
-                        numerator += values[item * DChunk + local_d] * weights[source];
-                    }
-                }
+            for (int item = 0; item < 8; ++item) {
+                values[item] = __bfloat162float(partial_acc[gqa_partial_acc_index<Geometry>(
+                    q_head, d, token, split + item * kSplitGroups, tokens)]);
             }
-            __syncthreads();
+#pragma unroll
+            for (int item = 0; item < 8; ++item) {
+                numerator += values[item] * weights[split + item * kSplitGroups];
+            }
+        }
+        for (; split < active_split_count; split += kSplitGroups) {
+            numerator += __bfloat162float(
+                             partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split,
+                                                                         tokens)]) *
+                         weights[split];
         }
     }
-    if (group != 0) { return; }
+    if constexpr (kSplitGroups > 1) {
+        __shared__ float group_sums[kSplitGroups][DChunk];
+        if (group < kSplitGroups && d < kGqaHeadDim) { group_sums[group][local_d] = numerator; }
+        __syncthreads();
+        if (group != 0) { return; }
+        numerator = 0.0f;
+#pragma unroll
+        for (int g = 0; g < kSplitGroups; ++g) { numerator += group_sums[g][local_d]; }
+    }
+    if (group != 0 || d >= kGqaHeadDim) { return; }
     bool valid = true;
     if constexpr (Masked) {
         int absolute_column = token;
