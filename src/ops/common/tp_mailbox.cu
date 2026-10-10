@@ -381,6 +381,7 @@ struct TpMailboxPlan::Impl {
     TpMailboxTransport transport = TpMailboxTransport::Nccl;
     HostMailbox* host            = nullptr;
     std::array<HostMailbox*, kRanks> host_dev{};
+    std::array<int, kRanks> device{-1, -1, -1, -1};
     std::array<Inbox*, kRanks> inbox{};
     std::array<std::uint64_t*, kRanks> steps{};
     std::array<std::uint64_t*, kRanks> gsteps{};
@@ -393,7 +394,12 @@ struct TpMailboxPlan::Impl {
             (void)cudaFreeHost(host);
             host = nullptr;
         }
+        // Device allocations belong to different devices; each free runs under its owner.
+        int previous = -1;
+        (void)cudaGetDevice(&previous);
         for (std::size_t r = 0; r < kRanks; ++r) {
+            if (device[r] < 0) { continue; }
+            (void)cudaSetDevice(device[r]);
             if (inbox[r] != nullptr) {
                 (void)cudaFree(inbox[r]);
                 inbox[r] = nullptr;
@@ -411,6 +417,7 @@ struct TpMailboxPlan::Impl {
                 peer_ptrs[r] = nullptr;
             }
         }
+        if (previous >= 0) { (void)cudaSetDevice(previous); }
     }
 };
 
@@ -559,6 +566,7 @@ void launch_nccl_allreduce(const ExecutionContext& ec,
 
 std::unique_ptr<TpMailboxPlan::Impl> init_plan(const ExecutionContext& ec,
                                                const std::array<ncclComm_t, kMaximumDevices>& comms) {
+    DeviceGuard guard;
     auto impl    = std::make_unique<TpMailboxPlan::Impl>();
     impl->tp     = ec.tp;
 
@@ -582,6 +590,7 @@ std::unique_ptr<TpMailboxPlan::Impl> init_plan(const ExecutionContext& ec,
     // Per-rank inbox, step counters, and the peer-pointer table the device kernels index. The
     // tables are published only after every inbox exists, or a table would hold a null peer.
     for (int r = 0; r < impl->tp; ++r) {
+        impl->device[r] = ec.dev[r]->device;
         DeviceGuard::set(ec.dev[r]->device);
         CUDA_CHECK(cudaMalloc(&impl->inbox[r], sizeof(Inbox)));
         CUDA_CHECK(cudaMemset(impl->inbox[r], 0, sizeof(Inbox)));
