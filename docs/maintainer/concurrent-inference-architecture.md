@@ -29,10 +29,9 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 ### 1.2 Non-goals
 
 - request preemption、swap 或 pause/resume；
-- 多请求 batched prefill 或 prefill/decode mixed forward；
-- 多 GPU 或 distributed inference；
-- priority、tenant QoS 或 deadline-aware GPU scheduling；
 - 面向数十至数百请求的通用 continuous batching；
+- priority、tenant QoS 或 deadline-aware GPU scheduling；
+- 多 GPU 或 distributed inference；
 - serving 期间为新 shape 动态捕获 CUDA Graph。
 
 ### 1.3 Required sequence-state substrate

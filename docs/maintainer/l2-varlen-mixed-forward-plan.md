@@ -682,7 +682,7 @@ single flat `[hidden, B+c]` stream, the mixed frame, phase, workspace, `run_mixe
 M2 is delivered (the retained-prefix owner folded through the mixed owner, §9). The two ragged
 kernels (#1, #2) were the ~1–2 engineer-weeks-each critical path and are **dropped** on the measured
 <0.5% end-to-end payoff (§9 M1f); the prefill-GDN conv-parity proof they would have required is
-therefore not on any active path. **M3 is delivered** (shared verify-slab pass, non-tail owner
+therefore not on any active path. **M3 is delivered** (shared verify-slab pass, all bridge-free
 chunks; decision 14 + §9). Remaining, outside L2: M5 ≈ 1–2 wks (Vision); DFlash may adopt the same
 M3 slab form (not yet wired).
 
@@ -740,21 +740,14 @@ M3 slab form (not yet wired).
 
 ## Relationship to the architecture doc
 
-L2 lifts **§1.2** (the "prefill/decode mixed forward / multi-request batched prefill" non-goal at
-`concurrent-inference-architecture.md:32`) for the mixed case while leaving the other non-goals
-(prepemption, general continuous batching, dynamic serving-time graph capture) intact. It
-re-opens **§7.1** (the two-unit model `PrefillChunk | DecodeRound` at `:765`) by adding a third
-serial unit `MixedUnit(decode-ready ∪ owner-chunk)`, and rewrites the **§7.3** decode/prefill
-alternation (`:799`) to `Mixed → Mixed` when both are runnable with pure-unit fallback. It extends
-**§8** (batched model execution): the whole-batch `current_tokens[B] → [D,1,B]` layout (§8.5 `:999`,
-§8.2 `:889`) becomes a flat ragged `[hidden, B+c]` with `query_start_loc`/`seqused_k` for the mixer
-operands (§8.6 `:1018-1019` already names "ragged batch" for full attention and per-row recurrent
-handles for GDN — L2 makes that the actual mechanism rather than the uniform-`[W,B]`+`valid_
-columns` shortcut), and **§8.8** (`:1056`) is superseded: the prefill unit now *does* hold a
-temporary folded row inside a decode round (rather than a standalone single-sequence unit that
-joins decode only at the next boundary). L2 **preserves** §2.1 (maximal batched decode), §2.5
-(one prefill owner), §5.6 (admission-turn gate), §6.2 (per-request entitlement bounds the round's
-state growth, incl. the folded prefill row), and the CUDA-graph model §9 (decode-only exact-B
-graphs unchanged; the mixed unit is eager, uncaptured). `docs/maintainer/paged-kv-cache.md` is
-unchanged (decision 8) — the substrate already supports the per-sequence/per-row addressing the
+L2 removes the "prefill/decode mixed forward / multi-request batched prefill" non-goal from
+§1.2 of `concurrent-inference-architecture.md`; the other non-goals (preemption, general continuous
+batching, dynamic serving-time graph capture, and distributed inference) are unchanged. §7.1 now
+describes the third serial unit `MixedUnit(decode-ready ∪ owner-chunk)` alongside
+`PrefillChunk | DecodeRound`, and the MTP form (`MtpMixedBatchContext` with the same owner-bridge
+predicate as the ordinary path). §§7.2–7.3 document that a mixed unit is the only unit that may
+contain a prefill row while decode rows are present, and the unit's `text_phase` is
+`TextPhase::Mixed`. §9 (CUDA Graph model) is unchanged: the mixed unit is eager-uncaptured, and
+decode-only rounds still use exact-B graphs. The architecture doc `docs/maintainer/paged-kv-cache.md`
+is unchanged (decision 8); the substrate already supports the per-sequence/per-row addressing the
 varlen ops consume.
