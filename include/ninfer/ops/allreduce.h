@@ -13,20 +13,31 @@
 // separate two-rank and four-rank path. At tp == 1 every collective is a validation-only no-op; at
 // tp == 2 the same grouped NCCL calls are simply a two-rank exchange.
 //
-// TRANSPORT. Cross-device traffic runs over NCCL, one communicator per rank, which on this
-// V100-SXM2 mesh uses the NVLink P2P fabric directly (measured ~48 GB/s per direction on every
-// ordered pair). Every collective is issued as a grouped per-rank call: ncclGroupStart(), one
-// nccl call per rank on that rank's own DeviceContext::stream, ncclGroupEnd(). Grouping is
-// mandatory here because a single host thread drives all communicators; without it the first
-// collective deadlocks waiting for a peer call the same thread has not issued yet.
+// TRANSPORT. Cross-device traffic runs over NCCL, one communicator per rank, on this V100-SXM2
+// mesh over the NVLink P2P fabric directly (measured ~48 GB/s per direction on every ordered
+// pair). Every collective is issued as a grouped per-rank call: ncclGroupStart(), one nccl call
+// per rank on that rank's own DeviceContext::stream, ncclGroupEnd(). Grouping is mandatory here
+// because a single host thread drives all communicators; without it the first collective
+// deadlocks waiting for a peer call the same thread has not issued yet.
+//
+// SMALL-MESSAGE FAST PATH. At construction the collective set probes a mailbox transport for BF16
+// messages up to 128 KB (the 128 row-parallel all-reduces of one decode round are 10-128 KB) and
+// for the vocabulary row gather: a purpose-built kernel that publishes one slice per CTA into a
+// mapped pinned host block or a peer device inbox, spins on per-block step flags, and folds the
+// per-rank contributions in rank order. It measures faster than NCCL's small-message protocol on
+// this box, keeps the step counters in device memory so CUDA-Graph replays stay correct, and
+// produces bitwise-identical bytes on every rank. `NINFER_TP_MAILBOX=0` disables it; every
+// message over the capacity, of another dtype, or of a shape the fast path does not cover falls
+// back to NCCL. See docs/maintainer/sm70-v2-mailbox-port-plan.md.
 //
 // The calls are stream-ordered GPU work with no host round trip, host-memory spin flag, or
 // explicit host staging, so they are CUDA-Graph capturable. Ordering between consecutive
-// collectives comes from NCCL's own stream semantics; there are no cross-stream cudaEvents, which
-// is what lets each rank be captured into its own independent graph.
+// collectives comes from the stream semantics of the transport in use; there are no cross-stream
+// cudaEvents, which is what lets each rank be captured into its own independent graph.
 //
-// The all-reduce is a plain in-place ncclAllReduce(ncclSum) on every rank and is NOT guaranteed
-// bitwise-identical across ranks (NCCL may associate the reduction differently per rank). That is
+// The all-reduce is a plain in-place ncclAllReduce(ncclSum) on every rank on the fallback path and
+// is NOT guaranteed bitwise-identical across ranks there (NCCL may associate the reduction
+// differently per rank). The mailbox fast path is bitwise-identical on every rank. Both are
 // consistent with the Op oracle (an FP64 sum rounded once to BF16) and with the reference
 // tensor-parallel implementations; rank-to-rank lockstep is preserved because every token decision
 // is taken on rank 0 and published to the peers with broadcast_rank0.
@@ -57,8 +68,13 @@
 
 #include <array>
 #include <cstddef>
+#include <memory>
 
 namespace ninfer::ops {
+
+namespace detail {
+class TpMailboxPlan;
+} // namespace detail
 
 // Owns one NCCL communicator per rank for an ExecutionContext with `tp` in {1,2,4}. Construction
 // is a one-time startup cost (ncclCommInitAll over the device ids); the collectives below only
@@ -98,9 +114,20 @@ public:
         return true;
     }
 
+    // Small-message fast-path dispatch for the free collective ops. Both return false when the
+    // probed mailbox cannot carry the call (no plan, transport NCCL, wrong dtype, capacity), in
+    // which case the caller runs the grouped NCCL route.
+    [[nodiscard]] bool mailbox_allreduce_bf16(const std::array<Tensor, kMaximumDevices>& buffer,
+                                              const ExecutionContext& ec) const;
+    [[nodiscard]] bool mailbox_allgather_rows_bf16(
+        const std::array<Tensor, kMaximumDevices>& destination,
+        const std::array<Tensor, kMaximumDevices>& part, const ExecutionContext& ec) const;
+
 private:
     int tp_ = 0;
     std::array<ncclComm_t, kMaximumDevices> comms_{};
+    // Probed small-message transport; null when tp == 1, disabled, or nothing beat NCCL.
+    std::unique_ptr<detail::TpMailboxPlan> mailbox_;
 };
 
 /**

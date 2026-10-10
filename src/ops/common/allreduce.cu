@@ -5,6 +5,7 @@
 
 #include "core/device.h"
 #include "core/dtype.h"
+#include "ops/common/tp_mailbox.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -126,6 +127,9 @@ CollectiveComms::CollectiveComms(const ExecutionContext& execution) : tp_(execut
         throw std::runtime_error(std::string("ncclCommInitAll: ") + ncclGetErrorString(init));
     }
     for (int rank = 0; rank < tp_; ++rank) comms_[rank] = comms[rank];
+    // The mailbox probe self-checks and races NCCL on a decode-sized message; any failure leaves
+    // the NCCL path in charge.
+    mailbox_ = detail::TpMailboxPlan::create(execution, comms_);
 }
 
 CollectiveComms::~CollectiveComms() {
@@ -138,7 +142,7 @@ CollectiveComms::~CollectiveComms() {
 }
 
 CollectiveComms::CollectiveComms(CollectiveComms&& other) noexcept
-    : tp_(other.tp_), comms_(other.comms_) {
+    : tp_(other.tp_), comms_(other.comms_), mailbox_(std::move(other.mailbox_)) {
     other.tp_ = 0;
     other.comms_.fill(nullptr);
 }
@@ -148,12 +152,24 @@ CollectiveComms& CollectiveComms::operator=(CollectiveComms&& other) noexcept {
         for (int rank = 0; rank < tp_; ++rank) {
             if (comms_[rank] != nullptr) ncclCommDestroy(comms_[rank]);
         }
-        tp_    = other.tp_;
-        comms_ = other.comms_;
+        tp_      = other.tp_;
+        comms_   = other.comms_;
+        mailbox_ = std::move(other.mailbox_);
         other.tp_ = 0;
         other.comms_.fill(nullptr);
     }
     return *this;
+}
+
+bool CollectiveComms::mailbox_allreduce_bf16(const std::array<Tensor, kMaximumDevices>& buffer,
+                                             const ExecutionContext& ec) const {
+    return mailbox_ != nullptr && mailbox_->allreduce_bf16(buffer, ec);
+}
+
+bool CollectiveComms::mailbox_allgather_rows_bf16(
+    const std::array<Tensor, kMaximumDevices>& destination,
+    const std::array<Tensor, kMaximumDevices>& part, const ExecutionContext& ec) const {
+    return mailbox_ != nullptr && mailbox_->allgather_rows_bf16(destination, part, ec);
 }
 
 void allreduce_sum(const std::array<Tensor, kMaximumDevices>& buffer,
@@ -177,6 +193,9 @@ void allreduce_sum(const std::array<Tensor, kMaximumDevices>& buffer,
 
     const std::size_t elems = element_count(buffer[0]);
     if (elems == 0) return;
+
+    // Small BF16 messages take the probed mailbox transport; everything else stays on NCCL.
+    if (comms.mailbox_allreduce_bf16(buffer, ec)) { return; }
 
     const CurrentDeviceGuard guard;
     nccl_check(ncclGroupStart(), kOp);
@@ -228,6 +247,10 @@ void allgather_rows(const std::array<Tensor, kMaximumDevices>& destination,
             std::string(kOp) + ": part row counts must sum to the destination rows");
     if (tp == 1) return;
     if (total_elems == 0) return;
+
+    // The sharded-head gathers are BF16 block relocations inside the mailbox capacity; the
+    // generic uneven case and oversized images stay on NCCL.
+    if (comms.mailbox_allgather_rows_bf16(destination, part, ec)) { return; }
 
     const CurrentDeviceGuard guard;
     nccl_check(ncclGroupStart(), kOp);

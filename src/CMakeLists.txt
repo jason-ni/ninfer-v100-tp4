@@ -68,6 +68,7 @@ endif()
 add_library(ninfer_ops STATIC
   ops/linear/ggml_k/ggml_k.cu
   ops/common/allreduce.cu
+  ops/common/tp_mailbox.cu
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
