@@ -13,8 +13,13 @@ profile of the mixed unit (TP2, NVFP4 27B, 12.46 s total GPU time) puts the enti
 fused kernels would replace at ~3.4% (GDN recurrence 2.5%, all GQA attention routes ~0.9%), so
 fusing the two sub-batch dispatches into one launch each can only remove launch overhead (<0.5%
 end to end) while reintroducing the §11.1 conv-parity risk — the dominant cost is weight
-dequantization + GEMM + collectives. M2 (prefix/retained-hit) is delivered; M3 (MTP/DFlash
-coexistence) and M5 (Vision) remain unimplemented.
+dequantization + GEMM + collectives. M2 (prefix/retained-hit) is delivered (see §9). **L2 is closed
+here:** M3 (MTP/DFlash coexistence) and M5 (Vision) are deliberately not pursued. M3 reduces to a
+`MixedMtpUnit` that runs the MTP verify batch and the owner prefill as two separate passes (the
+append-only MTP verify domain is `T ≤ 16`, so it cannot share the flat stream with a prefill chunk
+without the dropped varlen kernels), sharing no linears and so interleaving only; it is a ~2-week
+architectural addition that does not touch the single-request acceptance (which never mixes). M5 is
+a similar-scale capability for the NVFP4/groupwise identities only.
 Scope: the Qwen3.6-family hybrid text path (GQA full-attention + GDN linear-attention) at
 `src/targets/qwen3_6`, targeting the V100X2 acceptance workload. 27B/35B-A3B peer variants share
 the design; only the 27B Q4_K_M artifact is required to land the acceptance claim.
@@ -609,13 +614,14 @@ on measured evidence (§9 M1f).
   single-lane reused control exactly (24/24); the same test fails when the base double-count is
   restored. Along the way the delivered `prefix_tap_slots.reserve()` (no clear) stale-slot bug in
   the hybrid prefix cache was fixed — a retained lane kept a consumed `kInvalidSlot` at index 0.
-- **M3 — MTP/DFlash coexistence.** Scope: a speculative decode row (`query_len = draft+1`) shares
-  the flat stream with the prefill owner; argmax-licensing/replay stays on the Verify path
-  (decision 14). **Exit**: MTP/DFlash acceptance + per-request continuation parity vs isolated.
-- **M5 — Vision.** Scope: the multimodal prefill row in the mixed batch (3-axis MRoPE ragged,
-  vision scatter into the flat residual, sharded VP encode folded into the owner's unit,
-  `text_context_impl.h:2121`). **Exit**: vision-grounded parity (the `image_natural.json`
-  mailbox-24 case) with a coexisting decode round.
+- **M3 — MTP/DFlash coexistence.** *Not pursued* (see the status header): a `MixedMtpUnit` that runs
+  the MTP verify batch plus the owner prefill as two passes, sharing no linears, for a ~2-week cost
+  and no effect on the single-request acceptance. Original scope was a speculative decode row
+  (`query_len = draft+1`) sharing the flat stream with the prefill owner, argmax-licensing/replay
+  staying on the Verify path (decision 14).
+- **M5 — Vision.** *Not pursued* (see the status header): the multimodal prefill row in the mixed
+  batch (3-axis MRoPE ragged, vision scatter into the flat residual, sharded VP encode folded into
+  the owner's unit) — a similar-scale capability for the NVFP4/groupwise identities only.
 
 TP>1 (originally M4) is delivered inside M1: per-rank frame slices, `run_layers_parallel(Phase::
 Mixed)`, the existing split leaves, and the rank-0 bonus gather. No separate milestone remains.
