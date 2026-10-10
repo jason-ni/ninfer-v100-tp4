@@ -823,8 +823,9 @@ int verify_rejections() {
         ++failures;
     }
     // Head counts that are not a registered geometry stay rejected: a shard extent is only legal
-    // where it was registered, and 12|4 / 6|1 are not.
-    for (const std::int32_t q_heads : {6, 8, 12 + 1, 20}) {
+    // where it was registered. 6 heads is the registered tp4 shard (6|1), so the rejected set is
+    // the head counts with no geometry at all.
+    for (const std::int32_t q_heads : {8, 12 + 1, 20}) {
         try {
             (void)ops::gqa_attention_workspace_capacity_bytes(q_heads, DType::I8, {1, 4096}, 1, 1,
                                                               6);
