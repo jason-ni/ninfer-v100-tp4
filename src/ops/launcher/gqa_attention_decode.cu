@@ -7,6 +7,7 @@
 #include "ops/kernel/gqa_attention_decode_i8.cuh"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/kernel/gqa_attention_decode_i8_tc_volta.cuh"
+#include "ops/kernel/gqa_attention_decode_i8_tc_volta_v2.cuh"
 #include "ops/kernel/gqa_attention_prefill_volta.cuh"
 #endif
 #include "core/device.h" // CUDA_CHECK
@@ -15,6 +16,7 @@
 #include "ninfer/ops/gqa_attention.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -164,6 +166,47 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     // bf16 measurements put it 2.5x behind at width 1). See the V100 performance summary.
     if constexpr (TokenTile >= kVoltaTcDecodeMinWidth) {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+        // The key-split variant covers one 32-row Volta tile: tokens * GroupSize <= 32. Its
+        // zero-redundancy QK^T, 64-key tiles, and register-prefetched staging are what the
+        // long-window decode needs; the wider rows (T = 6 for the group-of-six 27B geometries,
+        // T >= 5 for the group-of-eight 35B) stay on the phase-1 two-pass kernel.
+        if constexpr (TokenTile * Geometry::GroupSize <= 32) {
+            // A/B and bisection knob: NINFER_SM70_ATTN_V2=0 keeps the phase-1 kernel for the
+            // shapes the key-split variant covers. Default on.
+            static const bool use_v2 = [] {
+                const char* env = std::getenv("NINFER_SM70_ATTN_V2");
+                return env == nullptr || env[0] != '0';
+            }();
+            if (use_v2) {
+                constexpr std::size_t kSmemBytes = kGqaSmallTI8VoltaV2SmemBytes<Geometry>;
+                const auto v2_kernel =
+                    gqa_attention_small_t_tc_volta_partial_i8_v2_kernel<Geometry, TokenTile,
+                                                                        MultiBatch, Masked,
+                                                                        CacheInput>;
+                ensure_func_attr_per_device(v2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            static_cast<int>(kSmemBytes));
+                v2_kernel<<<grid, kGqaSmallTI8VoltaV2Warps * 32, kSmemBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data), input,
+                    static_cast<const std::int32_t*>(pos.data),
+                    static_cast<std::int8_t*>(cache_k.data),
+                    static_cast<std::int8_t*>(cache_v.data),
+                    static_cast<__half*>(cache_k_scale.data),
+                    static_cast<__half*>(cache_v_scale.data),
+                    static_cast<const std::int32_t*>(cache.block_tables.data),
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                    invocation.table_rows == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.table_rows->data),
+                    cache.block_tables.ne[0], invocation.width, invocation.full_width,
+                    invocation.column_begin, logical_capacity, scale,
+                    static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+        }
         gqa_attention_small_t_tc_volta_partial_i8_kernel<Geometry, TokenTile, 4, MultiBatch, Masked,
                                                          CacheInput><<<grid, 128, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), input,

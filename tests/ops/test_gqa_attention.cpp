@@ -491,20 +491,30 @@ int run_geometry(const Geometry& geometry) {
 }
 
 int run_int8_split_policy_cases() {
-    // Volta's TP2 INT8 producer must use the same active split policy as its reducer.
+    // Volta's INT8 producer must use the same active split policy as its reducer.
     // The short windows demand more splits than BF16; the loose 6K envelope permits
     // more launches than the INT8 policy consumes, exposing the opposite mismatch.
     // A1 and A3 both compare every output directly with the fixture's FP64 oracle.
-    constexpr Geometry geometry{"qwen3_6_27b_tp2", 12, 2};
-    constexpr AttentionCase cases[] = {
-        {5, 252, 257, 601u},
-        {6, 139, 145, 602u},
-        {6, 6138, 8199, 603u},
+    struct PolicyCase {
+        Geometry geometry;
+        AttentionCase attention;
+    };
+    constexpr PolicyCase cases[] = {
+        {Geometry{"qwen3_6_27b_tp2", 12, 2}, {5, 252, 257, 601u}},
+        {Geometry{"qwen3_6_27b_tp2", 12, 2}, {6, 139, 145, 602u}},
+        {Geometry{"qwen3_6_27b_tp2", 12, 2}, {6, 6138, 8199, 603u}},
+        // The tp4 shard (6|1, DecodeSplitScale 4) at the widest row tile the key-split v2
+        // producer covers (T=5 -> 30 rows). T=6 (36 rows) falls back to the phase-1 two-pass
+        // kernel, which the second case exercises through the same paged cache.
+        {Geometry{"qwen3_6_27b_tp4", 6, 1}, {5, 252, 257, 604u}},
+        {Geometry{"qwen3_6_27b_tp4", 6, 1}, {6, 6138, 8199, 605u}},
     };
     int failures = 0;
-    for (const AttentionCase& test_case : cases) {
-        failures += run_a1_case(geometry, DType::I8, test_case, MappingPattern::Fragmented);
-        failures += run_a3_case(geometry, DType::I8, test_case, MappingPattern::Fragmented);
+    for (const PolicyCase& test_case : cases) {
+        failures +=
+            run_a1_case(test_case.geometry, DType::I8, test_case.attention, MappingPattern::Fragmented);
+        failures +=
+            run_a3_case(test_case.geometry, DType::I8, test_case.attention, MappingPattern::Fragmented);
     }
     return failures;
 }
