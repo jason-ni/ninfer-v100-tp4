@@ -762,14 +762,25 @@ request 都进入相同 prefill/decode schedule 和 compact batch formation。
 
 ### 7.1 GPU scheduling units
 
-Scheduler 只提交两类 GPU work：
+Scheduler 只提交三类 GPU work：
 
 ```text
 PrefillChunk(request)
 DecodeRound(all decode-ready requests)
+MixedUnit(all decode-ready requests + one prefill owner chunk)   // ordinary backend, C >= 2
 ```
 
 完整 request 不是 scheduling unit。所有 GPU work 在一条 execution lane 上串行执行。
+
+MixedUnit 是 L2 mixed forward 的调度形态（`docs/maintainer/l2-varlen-mixed-forward-plan.md`）：
+当一个 prefill owner 存在、decode membership 非空、且该 Program 规划了 mixed frame（ordinary
+backend 且 `max_concurrency >= 2`）时，boundary 用一个 MixedUnit 取代一轮
+`DecodeRound -> PrefillChunk`。它在一个 flat `[hidden, B + c]` eager pass 上同时执行 B 个 decode
+rows 和 owner 的下一个 chunk（`TextPhase::Mixed`，逐 mixer 子批分派）；decode half 按
+DecodeRound 语义 resolve，owner half 按 PrefillChunk 语义 resolve，§2.5 的 one-owner 不变式
+（一个 MixedUnit 最多携带一个 owner，其 chunk 仍受 §6.2 entitlement 约束，且仍是 latency-bounded
+unit）不变。MixedUnit 从不 graph-capture；纯 decode rounds 仍使用其 exact-B graphs。MTP/DFlash
+backend 与 Vision prefill 暂不进入 mixed frame。
 
 Model Runtime 拥有一份地址稳定的 shared workspace，由串行的 GPU units 复用，不按 request
 复制。Prefill owner 可在 Vision/Text phases 及多个 chunks 之间持有一份 request-transient lease；
@@ -799,7 +810,9 @@ boundary 最多发布一个新 admitted request。
 调度策略为：
 
 ```text
-if the completed unit was a DecodeRound and a prefill owner exists:
+if a prefill owner exists and decode-ready requests exist and the mixed frame is planned:
+    run one MixedUnit(decode-ready rows + owner's next chunk)
+else if the completed unit was a DecodeRound and a prefill owner exists:
     run one latency-bounded PrefillChunk
 else if one or more requests are DECODE_READY:
     run one DecodeRound containing all of them
@@ -809,10 +822,11 @@ else:
     remain idle
 ```
 
-因此 decode 和 prefill 同时持续 runnable 时：
+因此 decode 和 prefill 同时持续 runnable 时（ordinary backend、`C >= 2`）：
 
 ```text
-DecodeRound -> PrefillChunk -> DecodeRound -> PrefillChunk -> ...
+MixedUnit -> MixedUnit -> ...           # mixed frame planned
+DecodeRound -> PrefillChunk -> ...      # no mixed frame (MTP/DFlash backend or C == 1)
 ```
 
 没有 decode-ready request 时，prefill chunks 连续执行；没有 prefill owner 时，decode rounds 连续执行。

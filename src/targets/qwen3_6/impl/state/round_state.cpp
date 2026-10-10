@@ -67,6 +67,29 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             add_tensor(builder, DType::BF16,
                        {spec.hidden, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
                        "ordinary decode hidden");
+        if (spec.mixed_token_capacity > 0) {
+            MixedDecodeStateLayout& mixed = ordinary.mixed.emplace();
+            mixed.control =
+                builder.add(sizeof(MixedDecodeControl), kArenaAlign, "mixed decode control");
+            const auto tokens =
+                checked_i32(spec.mixed_token_capacity, "mixed token capacity exceeds int32");
+            const auto batch =
+                checked_i32(spec.batch_capacity, "mixed batch capacity exceeds int32");
+            mixed.tokens          = add_tensor(builder, DType::I32, {tokens}, "mixed tokens");
+            mixed.cache_positions = add_tensor(builder, DType::I32, {tokens}, "mixed cache positions");
+            mixed.rope_positions  = add_tensor(builder, DType::I32, {tokens}, "mixed rope positions");
+            mixed.decode_kv_table_rows =
+                add_tensor(builder, DType::I32, {batch}, "mixed decode KV rows");
+            mixed.decode_linear_state_slots =
+                add_tensor(builder, DType::I32, {batch}, "mixed decode linear slots");
+            mixed.prefill_kv_table_row =
+                add_tensor(builder, DType::I32, {1}, "mixed prefill KV row");
+            mixed.prefill_tail_hidden =
+                add_tensor(builder, DType::BF16, {spec.hidden, 1}, "mixed prefill tail hidden");
+            mixed.bonus_logits =
+                add_tensor(builder, DType::BF16, {spec.output_rows, 1}, "mixed bonus logits");
+            mixed.bonus_token = add_tensor(builder, DType::I32, {1}, "mixed bonus token");
+        }
     }
     layout.token      = add_tensor(builder, DType::I32, {1}, "step token");
     layout.pos        = add_tensor(builder, DType::I32, {1}, "step position");
@@ -80,7 +103,8 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
 
 OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
                                          const OrdinaryDecodeStateLayout& layout,
-                                         std::uint32_t batch_capacity) {
+                                         std::uint32_t batch_capacity,
+                                         std::uint32_t mixed_token_capacity) {
     if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency) {
         throw std::invalid_argument("ordinary decode batch capacity must be in [1,8]");
     }
@@ -107,6 +131,46 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
                             DType::I32, {count});
     logits         = layout.logits.bind(backing);
     hidden         = layout.hidden.bind(backing);
+    if (layout.mixed) {
+        if (mixed_token_capacity == 0) {
+            throw std::logic_error("ordinary decode mixed layout requires a token capacity");
+        }
+        mixed.emplace(backing, *layout.mixed, mixed_token_capacity, batch_capacity);
+    }
+}
+
+OrdinaryDecodeState::MixedState::MixedState(DeviceSpan backing,
+                                            const MixedDecodeStateLayout& layout,
+                                            std::uint32_t token_capacity,
+                                            std::uint32_t batch_capacity) {
+    if (token_capacity == 0 || batch_capacity == 0 || batch_capacity > kMaximumConcurrency) {
+        throw std::invalid_argument("mixed decode state dimensions are outside the domain");
+    }
+    static_assert(std::is_standard_layout_v<MixedDecodeControl>);
+    control               = layout.control.bind(backing);
+    tokens                = layout.tokens.bind(backing);
+    cache_positions       = layout.cache_positions.bind(backing);
+    rope_positions        = layout.rope_positions.bind(backing);
+    decode_kv_table_rows  = layout.decode_kv_table_rows.bind(backing);
+    decode_linear_state_slots = layout.decode_linear_state_slots.bind(backing);
+    prefill_kv_table_row  = layout.prefill_kv_table_row.bind(backing);
+    prefill_tail_hidden   = layout.prefill_tail_hidden.bind(backing);
+    sampling              = reinterpret_cast<const ops::SamplingConfig*>(
+        static_cast<const unsigned char*>(control.data) + offsetof(MixedDecodeControl, sampling));
+    prefill_sampling      = reinterpret_cast<const ops::SamplingConfig*>(
+        static_cast<const unsigned char*>(control.data) +
+        offsetof(MixedDecodeControl, prefill_sampling));
+    bonus_position = Tensor(static_cast<unsigned char*>(control.data) +
+                                offsetof(MixedDecodeControl, prefill_bonus_position),
+                            DType::I32, {1});
+    lanes = Tensor(static_cast<unsigned char*>(control.data) + offsetof(MixedDecodeControl, lanes),
+                   DType::I32, {static_cast<std::int32_t>(kMaximumConcurrency)});
+    bonus_logits = layout.bonus_logits.bind(backing);
+    bonus_token  = layout.bonus_token.bind(backing);
+    if (tokens.ne[0] != static_cast<std::int32_t>(token_capacity) ||
+        decode_kv_table_rows.ne[0] != static_cast<std::int32_t>(batch_capacity)) {
+        throw std::logic_error("mixed decode layout does not match its configured dimensions");
+    }
 }
 
 void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layout) {
@@ -343,7 +407,8 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
 RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (!layout.complete) { throw std::invalid_argument("RoundState layout is incomplete"); }
     if (layout.ordinary) {
-        ordinary.emplace(backing, *layout.ordinary, layout.spec.batch_capacity);
+        ordinary.emplace(backing, *layout.ordinary, layout.spec.batch_capacity,
+                         layout.spec.mixed_token_capacity);
     }
     token                = layout.token.bind(backing);
     pos                  = layout.pos.bind(backing);

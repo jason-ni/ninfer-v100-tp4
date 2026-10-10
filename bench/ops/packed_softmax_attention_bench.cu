@@ -205,9 +205,9 @@ public:
           v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kHeads * tokens_)),
           cu_seqlens_((segment_lengths_.size() + 1) * sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kHeads * tokens_ * 2)),
-          workspace_bytes_(ops::vision_attention_workspace_capacity_bytes(
-              tokens_, tokens_, static_cast<std::int32_t>(segment_lengths_.size()),
-              static_cast<std::int32_t>(segment_lengths_.size()))),
+workspace_bytes_(ops::vision_attention_workspace_capacity_bytes(
+               tokens_, tokens_, static_cast<std::int32_t>(segment_lengths_.size()),
+               static_cast<std::int32_t>(segment_lengths_.size()), kHeads)),
           workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
           q_tensor_(q_.p, DType::BF16, {kHeadDim, kHeads, tokens_}),
           k_tensor_(k_.p, DType::BF16, {kHeadDim, kHeads, tokens_}),

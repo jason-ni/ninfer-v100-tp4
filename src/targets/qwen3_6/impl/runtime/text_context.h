@@ -273,6 +273,24 @@ public:
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_slots, ops::GqaExecutionEnvelope envelope,
                                Tensor& hidden, Tensor& logits);
+    // L2 flat ragged mixed pass: one forward over T = B decode rows (columns [0,B)) plus one
+    // prefill owner row (columns [B, T)). The linear leaves run flat over T; the two mixer leaves
+    // dispatch per sub-batch (existing batched-decode op on [0,B), existing single-prefill op on
+    // [B,T)). `ids`/`cache_positions`/`rope_positions` are device [T] decode-first. `decode_kv_
+    // table_rows`/`decode_linear_state_slots` are device [B]; `prefill_kv_table_rows` is device
+    // [1] and `prefill_linear_slot` is the owner's absolute linear-state slot. Produces the B
+    // decode rows' hidden/logits (+ the owner's bonus logits when `prefill_finalize`).
+    void mixed_prefill_decode_batch(const Tensor& ids, const Tensor& cache_positions,
+                                    const Tensor& rope_positions,
+                                    const Tensor& decode_kv_table_rows,
+                                    const Tensor& decode_linear_state_slots,
+                                    ops::GqaExecutionEnvelope decode_envelope,
+                                    const Tensor& prefill_kv_table_rows,
+                                    std::int32_t prefill_linear_slot,
+                                    ops::GqaExecutionEnvelope prefill_envelope,
+                                    bool prefill_finalize, Tensor& decode_hidden,
+                                    Tensor& decode_logits, Tensor& prefill_bonus_logits,
+                                    Tensor& prefill_tail_hidden);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
@@ -371,6 +389,8 @@ private:
     [[nodiscard]] const MtpW& mtp_weights() const;
     void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
+    void attn_mix_mixed(const FullLayerW& weights, Tensor& x, int index);
+    void gdn_mix_mixed(const GdnLayerW& weights, Tensor& x, int index);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);
 
@@ -439,6 +459,17 @@ private:
                                    const Tensor& linear_state_slots,
                                    ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                    Tensor& logits);
+    // The tp2..4 mixed pass. Same contract as the public single-device overload, except every
+    // per-rank frame is derived here from each peer's own mixed state: the control tensors are
+    // rank-invariant values written into each frame by the schedule, but a tensor view carries a
+    // device address, so each rank's slice must be named from that rank's frame.
+    void mixed_prefill_decode_batch_parallel(
+        const Tensor& ids, const Tensor& cache_positions, const Tensor& rope_positions,
+        const Tensor& decode_kv_table_rows, const Tensor& decode_linear_state_slots,
+        ops::GqaExecutionEnvelope decode_envelope, const Tensor& prefill_kv_table_rows,
+        std::int32_t prefill_linear_slot, ops::GqaExecutionEnvelope prefill_envelope,
+        bool prefill_finalize, Tensor& decode_hidden, Tensor& decode_logits,
+        Tensor& prefill_bonus_logits, Tensor& prefill_tail_hidden);
     // --- tp == 2 MTP -----------------------------------------------------------------------
     // The MTP head is one layer, so its split schedule is the text layer's split schedule with a
     // single instance of each stage: a ROW-parallel stem (no pack -- each rank's K-slice already
@@ -553,6 +584,20 @@ private:
     const ops::GqaExecutionEnvelope* active_gqa_envelope_ = nullptr;
     std::int32_t active_sequence_batch_                   = 0;
     std::int32_t active_sequence_width_                   = 0;
+    // L2 mixed pass: the decode half is bound through the `active_*` bindings above (B rows);
+    // the prefill owner half carries only what differs (its own kv-table row per rank, linear slot,
+    // and envelope). `active_mixed_` is null outside a `Phase::Mixed` run.
+    struct MixedOwnerState {
+        std::int32_t decode_rows        = 0;
+        std::int32_t prefill_len        = 0;
+        // Indexed by rank. The row index is logically identical on every rank, but each rank reads
+        // ITS OWN frame's copy: a tensor view is a device address, so rank 1 cannot read rank 0's.
+        std::array<const Tensor*, kMaximumDevices> prefill_kv_rows{};
+        std::int32_t prefill_linear_slot = 0;
+        ops::GqaExecutionEnvelope prefill_envelope{};
+        bool finalize                 = false;
+    };
+    const MixedOwnerState* active_mixed_                   = nullptr;
     std::int32_t rope_delta_                              = 0;
     std::int32_t linear_state_current_slot_               = 0;
     std::int32_t linear_state_rewrite_checkpoint_slot_    = 0;

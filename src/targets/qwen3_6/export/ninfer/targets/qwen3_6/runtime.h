@@ -21,6 +21,7 @@ namespace ninfer::targets::qwen3_6 {
 enum class TextPhase {
     Prefill,
     Verify,
+    Mixed,
 };
 
 struct GraphExecutionProfile {
@@ -169,6 +170,10 @@ public:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::MixedBatchResult
+    decode_mixed_batch(std::span<const std::uint32_t> lanes,
+                       std::span<const runtime::RoundBudget> budgets, std::uint32_t owner_lane);
+    [[nodiscard]] bool supports_mixed_unit() const noexcept;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,

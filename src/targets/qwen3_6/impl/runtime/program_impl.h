@@ -429,6 +429,17 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
             *ordinary_peer_host_ingress[slot] = {};
         }
     }
+    if (io.ordinary && io.ordinary->mixed) {
+        const qwen3_6::OrdinaryDecodeState::MixedState& mixed = *io.ordinary->mixed;
+        mixed_host_tokens.assign(static_cast<std::size_t>(mixed.tokens.ne[0]), 0);
+        mixed_host_cache_positions.assign(static_cast<std::size_t>(mixed.cache_positions.ne[0]), 0);
+        mixed_host_rope_positions.assign(static_cast<std::size_t>(mixed.rope_positions.ne[0]), 0);
+        mixed_host_decode_kv_rows.assign(
+            static_cast<std::size_t>(mixed.decode_kv_table_rows.ne[0]), 0);
+        mixed_host_decode_linear_slots.assign(
+            static_cast<std::size_t>(mixed.decode_linear_state_slots.ne[0]), 0);
+        mixed_host_egress = {};
+    }
     if (mtp_host) {
         mtp_host_ingress = static_cast<qwen3_6::MtpDecodeIngress*>(mtp_host->data());
         mtp_host_egress  = reinterpret_cast<qwen3_6::MtpDecodeEgress*>(
@@ -3518,6 +3529,213 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
         }
+        throw;
+    }
+}
+
+runtime::MixedBatchResult
+ProgramImplCore::decode_mixed_batch(std::span<const std::uint32_t> lanes,
+                                    std::span<const runtime::RoundBudget> budgets,
+                                    std::uint32_t owner_lane) {
+    if (speculative_backend != SpeculativeBackend::None) {
+        throw std::logic_error("mixed unit requires the ordinary backend");
+    }
+    if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size() ||
+        owner_lane >= max_concurrency) {
+        throw std::invalid_argument("mixed unit membership is invalid");
+    }
+    if (!io.ordinary || !io.ordinary->mixed) {
+        throw std::logic_error("mixed unit requires the mixed frame");
+    }
+    qwen3_6::OrdinaryDecodeState::MixedState& mixed = *io.ordinary->mixed;
+
+    std::uint32_t maximum_frontier = 0;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::uint32_t lane = lanes[row];
+        if (lane >= max_concurrency || lane == owner_lane ||
+            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
+                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
+            throw std::invalid_argument("mixed unit contains an invalid or duplicate lane");
+        }
+        const SequenceState& sequence = sequences[lane];
+        const RequestControl& request = requests[lane];
+        if (request.lifecycle != Lifecycle::Active ||
+            budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
+            sequence.kv->text.bound_row() < 0 || sequence.execution_frontier >= capacity ||
+            sequence.ledger_frontier != sequence.execution_frontier + 1 ||
+            sequence.ledger.size() != sequence.ledger_frontier ||
+            sequence.prefix_identity.size() != sequence.ledger_frontier) {
+            throw std::logic_error("mixed unit row is not decode-ready");
+        }
+        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+    }
+
+    SequenceState& owner_sequence = sequences[owner_lane];
+    RequestControl& owner_request = requests[owner_lane];
+    if (owner_request.lifecycle != Lifecycle::Prefilling || !owner_request.prefill ||
+        !owner_sequence.kv || owner_sequence.kv->text.bound_row() < 0) {
+        throw std::logic_error("mixed unit owner is not an active prefill");
+    }
+    RequestControl::Prefill& staged = *owner_request.prefill;
+    if (staged.vision || staged.prepare_mtp || staged.mtp_bridge != MtpBridgeMode::None ||
+        staged.cursor > staged.prompt_tokens) {
+        throw std::logic_error("mixed unit does not support this prefill mode");
+    }
+    // A planned rewrite-checkpoint capture is skipped for now: the mixed card has no
+    // rewrite-checkpoint hidden output wired, so the owner sequence keeps its previous checkpoint
+    // (invalid for a cold request, which only makes a later reuse fall back to cold). M2 owns the
+    // prefix / retained-checkpoint interaction with mixed units.
+    const std::uint32_t remaining = staged.prompt_tokens - staged.cursor;
+    if (remaining == 0) { throw std::logic_error("mixed unit owner has no prompt left"); }
+    const std::uint32_t nominal        = std::min(prefill_chunk, remaining);
+    const bool finalize                = staged.cursor + nominal == staged.prompt_tokens;
+    const std::uint32_t owner_frontier = staged.base + staged.cursor + nominal;
+    if (owner_frontier > capacity) {
+        throw std::logic_error("mixed unit owner frontier exceeds capacity");
+    }
+    const std::int32_t B = static_cast<std::int32_t>(lanes.size());
+    const std::int32_t c = static_cast<std::int32_t>(nominal);
+    const std::int32_t T = B + c;
+    if (T > mixed.tokens.ne[0] || B > mixed.decode_kv_table_rows.ne[0]) {
+        throw std::logic_error("mixed unit exceeds its configured frame");
+    }
+    qwen3_6::MixedDecodeControl& control = mixed_host_control;
+    control                              = qwen3_6::MixedDecodeControl{};
+    control.decode_rows         = B;
+    control.prefill_len         = c;
+    control.prefill_linear_slot = LinearStateSlots::current_state_slot(owner_lane, max_concurrency);
+    control.prefill_finalize    = finalize ? 1 : 0;
+    control.prefill_sampling_valid = sampling_config.data != nullptr ? 1 : 0;
+    control.prefill_bonus_position = checked_i32(owner_frontier, "mixed bonus position");
+    control.decode_min_visible     = 1;
+    control.decode_max_visible     = maximum_frontier + 1;
+    control.prefill_min_visible    = owner_frontier;
+    control.prefill_max_visible    = owner_frontier;
+    control.prefill_sampling       = owner_request.sampling_host;
+
+    const auto started = Clock::now();
+    try {
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            SequenceState& sequence       = sequences[lanes[row]];
+            const RequestControl& request = requests[lanes[row]];
+            const std::uint32_t frontier  = sequence.execution_frontier;
+            mixed_host_tokens[row]          = sequence.ledger.back();
+            mixed_host_cache_positions[row] = checked_i32(frontier, "mixed position");
+            mixed_host_rope_positions[row] =
+                checked_i32(frontier, "mixed RoPE position") + sequence.rope_delta;
+            mixed_host_decode_kv_rows[row] = sequence.kv->text.bound_row();
+            mixed_host_decode_linear_slots[row] =
+                LinearStateSlots::current_state_slot(lanes[row], max_concurrency);
+            control.lanes[row]    = static_cast<std::int32_t>(lanes[row]);
+            control.sampling[row] = request.sampling_host;
+            materialize_sequence_kv(sequence, frontier + 1, 0);
+        }
+        for (std::int32_t t = 0; t < c; ++t) {
+            const std::uint32_t prompt_index = staged.cursor + static_cast<std::uint32_t>(t);
+            mixed_host_tokens[B + t]         = staged.prompt.token_ids[prompt_index];
+            mixed_host_cache_positions[B + t] =
+                checked_i32(staged.base + prompt_index, "mixed owner position");
+            mixed_host_rope_positions[B + t] = prompt_rope_position(staged.prompt, prompt_index)[0];
+        }
+        std::int32_t prefill_kv_row = owner_sequence.kv->text.bound_row();
+        materialize_sequence_kv(owner_sequence, owner_frontier, 0);
+
+        schedule::MixedBatchContext schedule_state{
+            {device, model, work, decoder->linear_attention,
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+             proposal_head, rope_frequency, peer_ptrs(), tp},
+            decoder->text_kv,
+            *io.ordinary,
+            control,
+            mixed_host_egress,
+            &mixed_host_bonus_token,
+            tail_hidden_store,
+            std::span<const std::int32_t>(mixed_host_tokens.data(), static_cast<std::size_t>(T)),
+            std::span<const std::int32_t>(mixed_host_cache_positions.data(),
+                                          static_cast<std::size_t>(T)),
+            std::span<const std::int32_t>(mixed_host_rope_positions.data(),
+                                          static_cast<std::size_t>(T)),
+            std::span<const std::int32_t>(mixed_host_decode_kv_rows.data(),
+                                          static_cast<std::size_t>(B)),
+            std::span<const std::int32_t>(mixed_host_decode_linear_slots.data(),
+                                          static_cast<std::size_t>(B)),
+            prefill_kv_row};
+        mark_workspace_usage(workspace_plan.mixed_round);
+        schedule::mixed_prefill_decode_batch(schedule_state);
+        synchronize_peers();
+        device.synchronize();
+        const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            SequenceState& sequence    = sequences[lanes[row]];
+            RequestControl& request    = requests[lanes[row]];
+            const std::uint32_t base_E = sequence.execution_frontier;
+            const std::uint32_t base_S = sequence.ledger_frontier;
+            const TokenId token        = mixed_host_egress.sampled_tokens[row];
+            validate_licensed_tokens(std::span<const TokenId>(&token, 1));
+            sequence.text_kv_valid     = base_E + 1;
+            sequence.tail_hidden_valid = true;
+            sequence.ledger.push_back(token);
+            sequence.prefix_identity.append_generated(1, sequence.rope_delta);
+            request.pending   = PendingCandidate{.kind          = PendingKind::Ordinary,
+                                                 .base_E        = base_E,
+                                                 .base_S        = base_S,
+                                                 .prompt_tokens = 0,
+                                                 .produced      = 1};
+            request.lifecycle = Lifecycle::Pending;
+            request.timings.decode_seconds += seconds;
+        }
+
+        const std::uint32_t prompt_tokens = staged.prompt_tokens;
+        runtime::PrefillStepResult owner_result;
+        owner_result.summary = runtime::BeginSummary{
+            .prompt_tokens        = prompt_tokens,
+            .reused_prompt_tokens = staged.base,
+            .prefix_reuse_path    = staged.reuse,
+            .prefix_reuse_reason  = staged.reuse_reason,
+            .prefix_divergence    = staged.reuse_divergence};
+        owner_result.processed_prompt_tokens = nominal;
+        staged.cursor += nominal;
+        owner_sequence.text_kv_valid = owner_frontier;
+        if (finalize) {
+            const TokenId bonus = static_cast<TokenId>(mixed_host_bonus_token);
+            validate_licensed_tokens(std::span<const TokenId>(&bonus, 1));
+            if (staged.cursor != staged.prompt_tokens) {
+                throw std::logic_error("mixed owner sampled before the prompt frontier");
+            }
+            copy_tail(owner_sequence, mixed.prefill_tail_hidden);
+            owner_sequence.ledger.push_back(bonus);
+            owner_sequence.prefix_identity.append_generated(1, owner_sequence.rope_delta);
+            owner_sequence.tail_hidden_valid = true;
+            staged.prompt.release_all_media_payloads();
+            owner_request.prefill.reset();
+            owner_request.pending =
+                PendingCandidate{.kind          = PendingKind::Begin,
+                                 .base_E        = 0,
+                                 .base_S        = 0,
+                                 .prompt_tokens = prompt_tokens,
+                                 .produced      = 1};
+            owner_request.lifecycle = Lifecycle::Pending;
+            owner_result.round = runtime::GeneratedRound{
+                .tokens = std::span<const TokenId>(&mixed_host_bonus_token, 1)};
+            owner_result.complete = true;
+        }
+        return runtime::MixedBatchResult{
+            .decode = runtime::BatchedGeneratedRound{
+                .tokens = std::span<const TokenId>(mixed_host_egress.sampled_tokens.data(),
+                                                   lanes.size()),
+                .row_counts = {},
+                .row_stride = 1},
+            .owner = owner_result};
+    } catch (...) {
+        try {
+            synchronize_peers();
+            device.synchronize();
+        } catch (...) {}
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
+        clear_lane(owner_sequence, owner_request);
         throw;
     }
 }

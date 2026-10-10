@@ -300,6 +300,16 @@ public:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
+    // L2 mixed unit: one flat ragged pass over the decode-ready lanes plus the staged prefill
+    // owner's next chunk. Returns the decode rows' tokens (ordinary round shape) and the owner's
+    // step. Requires the ordinary backend; M1 rejects vision, MTP bridges and prefix taps.
+    [[nodiscard]] runtime::MixedBatchResult
+    decode_mixed_batch(std::span<const std::uint32_t> lanes,
+                       std::span<const runtime::RoundBudget> budgets, std::uint32_t owner_lane);
+    // True iff this Program planned the L2 mixed frame (ordinary backend, concurrency >= 2).
+    [[nodiscard]] bool supports_mixed_unit() const noexcept {
+        return io.ordinary.has_value() && io.ordinary->mixed.has_value();
+    }
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,
@@ -438,6 +448,17 @@ public:
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     qwen3_6::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;
+    // L2 mixed unit host staging. The control block is uploaded whole by the schedule body; the
+    // flat [T] token/position/rope arrays and the decode-row selectors are uploaded per unit
+    // before the body runs. Sized at construction from the mixed frame's configured capacities.
+    qwen3_6::MixedDecodeControl mixed_host_control;
+    std::vector<std::int32_t> mixed_host_tokens;
+    std::vector<std::int32_t> mixed_host_cache_positions;
+    std::vector<std::int32_t> mixed_host_rope_positions;
+    std::vector<std::int32_t> mixed_host_decode_kv_rows;
+    std::vector<std::int32_t> mixed_host_decode_linear_slots;
+    qwen3_6::OrdinaryDecodeEgress mixed_host_egress;
+    std::int32_t mixed_host_bonus_token = 0;
     // Each peer rank's own pinned ordinary ingress: rank 0's record with every row's
     // `sampling[row].token_counts` nulled. A peer mirrors the ordinary round for its shard of the
     // weights and never samples (the output head is vocabulary-split and sampling belongs to rank

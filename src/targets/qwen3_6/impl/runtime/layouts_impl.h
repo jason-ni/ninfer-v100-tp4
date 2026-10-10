@@ -221,12 +221,19 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
 
     out.round = qwen3_6::begin_round_state_layout(
-        builder, qwen3_6::RoundStateSpec{.hidden         = TextConfig::hidden,
-                                         .output_rows    = TextConfig::output_rows,
-                                         .batch_capacity = plan.max_concurrency,
-                                         .draft_window   = plan.draft_window,
-                                         .enable_mtp     = plan.features.mtp(),
-                                         .enable_dflash  = plan.features.dflash()});
+        builder, qwen3_6::RoundStateSpec{
+                     .hidden         = TextConfig::hidden,
+                     .output_rows    = TextConfig::output_rows,
+                     .batch_capacity = plan.max_concurrency,
+                     .draft_window   = plan.draft_window,
+                     .mixed_token_capacity =
+                         (!plan.features.mtp() && !plan.features.dflash() &&
+                          plan.max_concurrency >= 2)
+                             ? static_cast<std::uint32_t>(effective_prefill_chunk) +
+                                   plan.max_concurrency
+                             : 0U,
+                     .enable_mtp     = plan.features.mtp(),
+                     .enable_dflash  = plan.features.dflash()});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
     qwen3_6::complete_round_state_layout(builder, out.round);
@@ -346,6 +353,70 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width);
         post_mixer_stage(layout, first, last, phase);
     };
+    // The L2 mixed pass runs one flat [hidden, T] stream through every layer, but each mixer runs
+    // its decode half and its prefill half as separate sub-batches whose internal leaf scratch do
+    // not overlap. The generic stage helpers plan ONE profile, and the mixed pass needs both: the
+    // prefill half's wide conv gqa and the decode half's batch-shaped snapshot gqa / snapshot
+    // projection. Each half's scratch is therefore planned in its own nested scope, under the
+    // stage that keeps the flat projections alive, exactly as the execution nests `work_.scope()`.
+    const auto mixed_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
+                                std::int32_t last, std::int32_t decode_rows) {
+        const std::int32_t prefill_cols = last - decode_rows;
+        {
+            auto stage = layout.scope();
+            (void)workspace_recipe::text_attention_projection<TextConfig>(layout, last);
+            scratch(layout, Variant::attention_projection_workspace_capacity_bytes(
+                                plan.weights_profile, qwen3_6::TextPhase::Mixed, first, last));
+            (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
+            {
+                auto half = layout.scope();
+                scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+                                    TextConfig::query_heads, plan.kv_dtype, text_envelope,
+                                    decode_rows, 1, 1));
+            }
+            {
+                auto half = layout.scope();
+                scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+                                    TextConfig::query_heads, plan.kv_dtype, text_envelope, 1, 1,
+                                    prefill_cols));
+            }
+            scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
+                                plan.weights_profile, qwen3_6::TextPhase::Mixed, first, last));
+        }
+        {
+            auto stage = layout.scope();
+            (void)workspace_recipe::gdn_control<TextConfig>(layout, last);
+            scratch(layout, Variant::gdn_norm_control_projection_workspace_capacity_bytes(
+                                plan.weights_profile, first, last));
+            (void)workspace_recipe::gdn_projection<TextConfig>(layout, last);
+            {
+                auto half = layout.scope();
+                scratch(layout, Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
+                                    plan.weights_profile, qwen3_6::TextPhase::Verify, decode_rows,
+                                    1, 1));
+            }
+            {
+                auto half = layout.scope();
+                (void)workspace_recipe::gdn_prefill_conv<TextConfig>(layout, prefill_cols);
+                scratch(layout, Variant::gdn_input_projection_workspace_capacity_bytes(
+                                    plan.weights_profile, qwen3_6::TextPhase::Mixed, first,
+                                    prefill_cols));
+                scratch(layout, ops::gated_delta_net_workspace_capacity_bytes(
+                                    TextConfig::gdn_key_heads, TextConfig::gdn_value_heads, true,
+                                    first, prefill_cols));
+            }
+            (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
+            (void)workspace_recipe::gdn_normalized_output<TextConfig>(layout, last);
+            scratch(layout, Variant::gdn_output_projection_workspace_capacity_bytes(
+                                plan.weights_profile, qwen3_6::TextPhase::Mixed, first, last));
+        }
+        {
+            auto stage = layout.scope();
+            (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, last);
+            scratch(layout, Variant::post_mixer_workspace_capacity_bytes(
+                                plan.weights_profile, qwen3_6::TextPhase::Mixed, first, last));
+        }
+    };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {
             matrix(layout, DType::BF16, Variant::draft_head_rows, columns);
@@ -464,6 +535,23 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(ordinary,
                 ops::sampling_workspace_capacity_bytes(TextConfig::token_domain, batch, batch));
         out.ordinary_round = std::max(out.ordinary_round, finish(ordinary));
+    }
+
+    if (!plan.features.mtp() && !plan.features.dflash() && plan.max_concurrency >= 2) {
+        // L2 mixed unit: one flat stream of T = prefill chunk + B decode rows. The T-dependent
+        // projection/results/control buffers span B + chunk (slightly past the pure-prefill
+        // profile); the mixer scratch is bounded by the prefill half, since the decode half is at
+        // most kMaximumConcurrency single-token rows.
+        const std::int32_t mixed_tokens = chunk + static_cast<std::int32_t>(plan.max_concurrency);
+        WorkspaceLayoutBuilder mixed;
+        text_common_root(mixed, mixed_tokens);
+        tp_call_roots(mixed, mixed_tokens, static_cast<std::int32_t>(plan.max_concurrency));
+        mixed_body(mixed, 1, mixed_tokens, static_cast<std::int32_t>(plan.max_concurrency));
+        scratch(mixed, ops::sampling_workspace_capacity_bytes(
+                           TextConfig::token_domain,
+                           static_cast<std::int32_t>(plan.max_concurrency),
+                           static_cast<std::int32_t>(plan.max_concurrency)));
+        out.mixed_round = finish(mixed);
     }
 
     if (plan.features.mtp()) {
@@ -632,8 +720,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             merged, std::min(merged, kFrontendSegmentLimit));
     }
 
-    out.capacity = std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                             out.dflash_context, out.dflash_round, out.vision_encode});
+    out.capacity = std::max({out.text_prefill, out.ordinary_round, out.mixed_round, out.mtp_prefill,
+                             out.mtp_round, out.dflash_context, out.dflash_round,
+                             out.vision_encode});
     return out;
 }
 

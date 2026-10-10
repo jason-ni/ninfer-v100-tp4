@@ -1,7 +1,20 @@
 # Plan — L2, varlen mixed prefill+decode forward
 
-Status: **proposed, not started.** No code, kernels, or contracts changed yet. This is a
-research + design doc; implementation is phased in §9.
+Status: **M1 delivered, TP2-validated; the path is rank-generic for TP4.** The scheduler unit, mixed
+frame, workspace profile, and `TextPhase::Mixed` traversal are implemented; the two mixer leaves
+dispatch the existing batched-decode op on the decode sub-batch and the existing single-prefill op
+on the owner sub-batch instead of the two new ragged kernels this plan originally proposed
+(decision 3 updated below, §9). That op-reuse pivot removes the numerics-critical varlen work (the
+owner's prefill row runs the exact same prefill ops as an isolated chunk, so the §11.1 conv-parity
+question is designed out) and lands per-request identity end to end. TP4 was not run on the
+development box: only CUDA devices 1 and 2 are free there. The fused
+`gqa_attention_varlen`/`gated_delta_net_varlen` kernels (M1f) are **dropped**: a kernel-time
+profile of the mixed unit (TP2, NVFP4 27B, 12.46 s total GPU time) puts the entire mixer family the
+fused kernels would replace at ~3.4% (GDN recurrence 2.5%, all GQA attention routes ~0.9%), so
+fusing the two sub-batch dispatches into one launch each can only remove launch overhead (<0.5%
+end to end) while reintroducing the §11.1 conv-parity risk — the dominant cost is weight
+dequantization + GEMM + collectives. M2 (prefix/retained-hit), M3 (MTP/DFlash coexistence), and M5
+(Vision) remain unimplemented.
 Scope: the Qwen3.6-family hybrid text path (GQA full-attention + GDN linear-attention) at
 `src/targets/qwen3_6`, targeting the V100X2 acceptance workload. 27B/35B-A3B peer variants share
 the design; only the 27B Q4_K_M artifact is required to land the acceptance claim.
@@ -20,7 +33,13 @@ Decisions:
 3. **Two new ragged mixer ops** (`gqa_attention_varlen`, `gated_delta_net_varlen`) are added to
    `include/ninfer/ops/` as explicit new call signatures; the existing A1/A2/A3 and
    `gated_delta_net`/`_snapshot`/`_replay_record` are **kept** for the pure-decode (graph) and
-   speculative-verify paths, which L2 does not subsume.
+   speculative-verify paths, which L2 does not subsume. *Superseded for M1 correctness:* the
+   delivered M1 pass is a flat `[hidden, B+c]` stream whose linear leaves run once over `T` while
+   each mixer leaf dispatches its two sub-batches to the EXISTING ops (batched-decode snapshot op on
+   columns `[0,B)`, single-prefill op on `[B,T)`). The two varlen kernels were the performance
+   milestone (§9 M1f); they are **dropped** on measured evidence (kernel-time profile, see §9/§11.1),
+   because they would replace the pair of sub-batch dispatches with one ragged launch each for
+   <0.5% end-to-end gain at added numerics risk.
 4. **Decode-only rounds still capture the existing exact-B graph.** Any round containing a
    prefill row (query_len > 1) runs the **eager varlen** pass (vLLM's split). A mixed unit is never
    graph-captured; only the uniform all-`W=1` decode rounds are (and that topology is unchanged).
@@ -273,6 +292,10 @@ hidden is published per decode lane exactly as `decode_impl.h:70` does today.
 ---
 
 ## 6. Per-component design
+
+The varlen op shapes in §6.1/§6.2 are the original M1f design; they are **not built** (M1f dropped,
+§9). They are retained as the ragged substrate M3 would generalize (decision 14). M1 instead
+dispatches the existing ops per sub-batch (§6.5).
 
 ### 6.1 Varlen GQA op
 
@@ -541,37 +564,57 @@ state). Mixing changes **batching, not math**, and the per-request argument is:
 
 ## 9. Phased implementation + effort/risk
 
-Milestones are independently verifiable; the two ragged kernels dominate cost and land in M1.
+Milestones are independently verifiable. M1 is delivered in the op-reuse form described in the
+status header; the ragged kernels that would have been its performance follow-up (M1f) are dropped
+on measured evidence (§9 M1f).
 
-- **M1 — TP1, text-only, ordinary decode + one prefill row (core).**
-  Scope: `gqa_attention_varlen` + `gated_delta_net_varlen` + varlen KV append (per-token
-  seq_id); `TextPhase::Mixed` + `mixed_prefill_decode_batch` + `run_layers` Mixed branch +
-  workspace recipe (`layouts_impl.h` mixed profile); the mixed frame (§6.4); the sampler gather
-  (§6.6); scheduler `run_mixed_unit` + `ProgramImplCore::decode_mixed_batch` (§6.8). Invariants
-  checked: §2.1 / §2.5 / §6.2 (a decode row is never dropped, one owner, reservation→used).
-  **Exit**: mixed GQA/GDN kernels pass the FP64 oracle at mixed ragged shapes **and** the prefill-
-  row GDN conv-parity (decision 10); greedy end-to-end per-request identity vs the L0 control on a
-  2-request (mid-decode + mid-prefill) workload; decode-only graph path byte-identical.
+- **M1 — TP1..TP4, text-only, ordinary decode + one prefill row (core).** *Delivered; TP2
+  validated (the rank-generic path covers TP4, unrun on this box).* Scope:
+  `TextPhase::Mixed` + `run_layers` Mixed branch + `mixed_prefill_decode_batch` (single-device and
+  per-rank forms) + per-sub-batch mixer dispatch (`attn_mix_mixed` / `gdn_mix_mixed` single-device;
+  `attn_mix_parallel` / `gdn_mix_parallel` Mixed branches for TP>1); the mixed frame (§6.4) with one
+  flat host staging uploaded into every rank; the sampler gather (§6.6, decode rows group-0, owner
+  bonus via `logits_parallel` at TP>1); `run_mixed_unit` + `ProgramImplCore::decode_mixed_batch`
+  (§6.8); `mixed_round` workspace profile. At TP>1 every rank reads its own frame slices and the
+  existing column/row-parallel leaves plus their allreduce joins carry the pass, including the
+  rank-0 vocabulary gather. Invariants checked: §2.1 / §2.5 / §6.2 (a decode row is never dropped,
+  one owner, reservation→used).
+  **Exit** (met 2026-10-10, TP2, NVFP4 27B artifact): greedy end-to-end per-request identity for a
+  2-request (mid-decode + mid-prefill) workload vs each request's isolated run; NVTX confirms the
+  unit engages (`mixed.*` ranges over ~10 rounds); the MTP acceptance gate and the ordinary
+  concurrent gates are unchanged; the decode-only graph path is untouched. TP1 was not runnable
+  here because the 27B artifacts exceed one 16 GB V100; TP4 was not run because the development box
+  permits only two of its four V100s (`CUDA_VISIBLE_DEVICES=1,2`).
+- **M1f — fused varlen kernels (performance).** *Dropped on measured evidence.* A `cuda_gpu_kern_sum`
+  profile of the delivered mixed unit (TP2, NVFP4 27B, 46 mixed rounds, 12.46 s total GPU kernel
+  time) attributes ~3.4% to the whole mixer family the fused kernels would replace — GDN recurrence
+  (`recurrent_direct_kernel` 1.9% + `recurrent_snapshot_kernel` 0.3% + prepare 0.1%) and every GQA
+  attention route (`gqa_attention_decode_i8_tiled`, `..._small_t...`, `flash_attn_ext_f16`) ~0.9%.
+  The remaining ~96% is weight dequantization (~25%), cutlass GEMMs (~33%), and all-reduce (~6%).
+  Replacing the two sub-batch dispatches with one ragged launch each removes launch overhead only
+  (<0.5% end to end) while reintroducing the §11.1 conv-parity exposure, so it is not pursued.
 - **M2 — prefix / retained-hit interaction.** Scope: the prefill row resumed from a restored
   block snapshot (`reuse_base = frontier`), KV append extending the owner past the reuse frontier,
   per-column GDN snapshot stride feeding the hybrid prefix-cache taps at a chunk boundary
   (§6.2/§6.3, `docs/maintainer/hybrid-prefix-cache-plan.md`). **Exit**: a returning request with a
-  reused prefix run *mixed* == cold-run control (continuation-identical).
+  reused prefix run *mixed* == cold-run control (continuation-identical). The delivered
+  `decode_mixed_batch` currently rejects vision, MTP bridges, and skips rewrite-checkpoint capture;
+  M2 owns the checkpoint interaction.
 - **M3 — MTP/DFlash coexistence.** Scope: a speculative decode row (`query_len = draft+1`) shares
   the flat stream with the prefill owner; argmax-licensing/replay stays on the Verify path
   (decision 14). **Exit**: MTP/DFlash acceptance + per-request continuation parity vs isolated.
-- **M4 — TP>1.** Scope: eager varlen on every head-split rank, per-rank frame copies, rank-0
-  vocab gather + `ops::sample` (`:71`), NCCL allreduce on the joins (§6.7). **Exit**: tp2/tp4
-  ground-truth parity + decode-only graph/eager regressions green.
 - **M5 — Vision.** Scope: the multimodal prefill row in the mixed batch (3-axis MRoPE ragged,
   vision scatter into the flat residual, sharded VP encode folded into the owner's unit,
   `text_context_impl.h:2121`). **Exit**: vision-grounded parity (the `image_natural.json`
   mailbox-24 case) with a coexisting decode round.
 
+TP>1 (originally M4) is delivered inside M1: per-rank frame slices, `run_layers_parallel(Phase::
+Mixed)`, the existing split leaves, and the rank-0 bonus gather. No separate milestone remains.
+
 | # | Component | Change point (file:line) | Effort | Risk |
 |---|---|---|---|---|
-| 1 | Varlen GQA op/kernel | `gqa_attention.h:119` (new decl) + `src/ops/kernel/gqa_attention_{decode,prefill_bf16}.cuh`, `src/ops/launcher/gqa_attention_*.cu`, `src/ops/wrapper/gqa_attention.cpp` | **L** | High (split-KV vs prefill branch, FP oracle, INT8-KV) |
-| 2 | Varlen GDN op/kernel | `gated_delta_net.h:78` (new decl) + GDN projection wrapper `text_context_impl.h:1011`, GDN recurrence kernel | **L** | High (per-row conv+recurrence, state slots, **prefill conv-parity**) |
+| 1 | Varlen GQA op/kernel (M1f) — **dropped**, §9 | `gqa_attention.h:119` (new decl) + `src/ops/kernel/gqa_attention_{decode,prefill_bf16}.cuh`, `src/ops/launcher/gqa_attention_*.cu`, `src/ops/wrapper/gqa_attention.cpp` | **L** | High (split-KV vs prefill branch, FP oracle, INT8-KV) |
+| 2 | Varlen GDN op/kernel (M1f) — **dropped**, §9 | `gated_delta_net.h:78` (new decl) + GDN projection wrapper `text_context_impl.h:1011`, GDN recurrence kernel | **L** | High (per-row conv+recurrence, state slots, **prefill conv-parity**) |
 | 3 | Varlen KV append | `gqa_attention.h:131` (ragged A2) / folded into #1; per-token `seq_id` | **M** | Medium (paged substrate already OK, decision 8) |
 | 4 | Paged substrate | `src/core/paged_kv_cache.h:42` (unchanged) | **S** | Low |
 | 5 | Mixed frame | `round_state.h:31` (keep) + new `MixedDecodeIngress/Egress` + persistent region | **M** | Medium (decode path must stay pinned/address-stable) |
@@ -580,11 +623,12 @@ Milestones are independently verifiable; the two ragged kernels dominate cost an
 | 8 | Scheduler + Program | `concurrent_executor.h:686/1092/1266-1292` (`run_mixed_unit`), `program_impl.h:3414` (new `decode_mixed_batch`) + `:3124-3139` (folded chunk) | **M–L** | Medium (§2.1/§2.5/§5.6/§6.2 invariant preservation) |
 | 9 | Tensor parallel | `text_context_impl.h:1908/2445` (mixed parallel), rank-0 gather, `peer_host_ingress` (`schedule.h:158-161`) | **M–L** | High (eager TP>1, NCCL in eager varlen) |
 
-**Effort picture**: M1 is the bulk — the two ragged kernels (#1, #2) are each ~1–2 engineer-weeks,
-with #6/#8/#5 a further ~1–2 weeks; **M1 ≈ 4–6 engineer-weeks**. M2 ≈ 1 wk; M3 ≈ 2 wks (Verify
-coexistence is the hard part); M4 ≈ 1–2 wks (eager TP>1 only); M5 ≈ 1–2 wks. **Total ≈ 9–14
-engineer-weeks**, front-loaded in M1. The critical path is the GQA + GDN varlen kernels and the
-prefill-GDN conv-parity proof (the one place L2 can differ numerically from L0).
+**Effort picture**: M1 is delivered in its op-reuse form (#3–#9): per-sub-batch mixer dispatch on a
+single flat `[hidden, B+c]` stream, the mixed frame, phase, workspace, `run_mixed_unit`, and TP>1.
+The two ragged kernels (#1, #2) were the ~1–2 engineer-weeks-each critical path and are **dropped**
+on the measured <0.5% payoff (§9 M1f); the prefill-GDN conv-parity proof they would have required is
+therefore not on any active path. Remaining: M2 ≈ 1 wk; M3 ≈ 2 wks (Verify coexistence is the hard
+part); M5 ≈ 1–2 wks.
 
 ---
 
@@ -608,22 +652,19 @@ prefill-GDN conv-parity proof (the one place L2 can differ numerically from L0).
 
 ## 11. Risks and open questions
 
-1. **Prefill-GDN conv-parity (decisions 6/10)** — the varlen prefill row uses the per-row
-   snapshot conv, not the flat `causal_conv1d_silu`. If the two conv paths differ at the chunk
-   tail/boundary, the prefill row's recurrent state diverges from L0. *Mitigation*: M1 exit
-   requires byte-parity `out`+state vs isolated `Phase::Prefill`; if a true divergence is found,
-   either (a) make the varlen conv exactly reproduce the prefill conv, or (b) accept the per-row
-   conv as the *new* qualified profile and qualify the GDN oracle at the ragged shapes (AGENTS: a
-   fused route need not reproduce the unfused materialization, but the *observable* state must
-   match the oracle). **This is the top open question.**
-2. **GQA varlen kernel on V100 (sm_70)** — unifying the split-KV decode inner loop and the prefill
-   causal tiling in one varlen launcher is new Volta work; the prefill row's long `c` over long
-   `seqused_k` must not regress the split-KV decode bound. *Mitigation*: keep the two inner loops;
-   select per request/CTA; qualify the envelope over the prefill row.
+1. **Prefill-GDN conv-parity (decisions 6/10)** — *Designed out for M1.* The delivered owner half
+   runs the existing single-state prefill ops (`gdn_input_projection` + `causal_conv1d_silu` +
+   `gated_delta_net`) on the `[B,T)` slice with the owner's own conv/recurrent slot, i.e. exactly
+   the arithmetic an isolated `Phase::Prefill` chunk performs. The plan's original per-row snapshot
+   conv is gone. The risk would have returned only if M1f replaced this half with a fused varlen
+   kernel; M1f is dropped (§9), so the risk is off the active path.
+2. **GQA varlen kernel on V100 (sm_70)** — off the active path (M1f dropped, §9). M1 uses the
+   existing decode and prefill routes unchanged, so no new Volta kernel is on the critical path.
 3. **Fixed-shape vs eager for the mixed unit** — `T_total = B + c` is not fixed (c is 128/1024 /
-   residual). Confirmed eager-only (§7). *Open*: whether a small set of *padded* mixed graph
-   shapes (L1-style) is worth capturing for the common `c=128` case; deferred (L1 is the fallback,
-   not the target).
+   residual). Confirmed eager-only (§7). The delivered unit is never graph-captured; decode-only
+   rounds keep their exact-B graphs, and the ordinary frame's ingress/egress regions stay at their
+   previous offsets so those graphs remain address-stable. *Open*: whether a small set of *padded*
+   mixed graph shapes (L1-style) is worth capturing for the common `c=128` case; deferred.
 4. **Scheduler unit growth** — `run_mixed_unit` fuses owner-chunk assembly with decode
    membership; a bug here could drop a decode row (violating §2.1) or double-advance the owner
    (§2.5). *Mitigation*: reuse `build_round_membership` unchanged; the owner path reuses
@@ -631,11 +672,13 @@ prefill-GDN conv-parity proof (the one place L2 can differ numerically from L0).
 5. **Sampling RNG separation** — the r3 bonus (`kSamplePurposePrefill`) and decode
    (`kSamplePurposeDecode`) RNG must not collide when sampled in the same round. *Open*: confirm
    the sampler keys by (purpose, position) so the mixed round's two purposes are disjoint.
-6. **Workspace peak** — the mixed profile's peak must cover a prefill-row GQA/GDN stage at `c`
-   tokens in the *same* call as the B decode columns; verify `WorkspacePlan.capacity` (max over
-   profiles) covers `B + c` (the current `ordinary_round` only covers `B`). *Mitigation*: a new
-   `mixed_round` profile sized at `B + prefill_chunk`, added to the `max` at
-   `layouts_impl.h:635`.
+6. **Workspace peak** — *Resolved.* The mixed profile is now an exact model of the mixed body in
+   `build_workspace_plan` (`mixed_body`): the T-wide projections and the prefill half's conv
+   scratch, plus the decode half's batch-shaped GQA scratch and snapshot-projection scratch, each
+   in its own nested scope exactly as the execution nests `work_.scope()`. The earlier
+   `target_body(Prefill)` profile under-planned both decode-half scratches (this was latent because
+   the 27B does not fit one V100). The TP>1 logits gather columns are planned at
+   `max_concurrency`.
 
 ---
 

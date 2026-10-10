@@ -1089,11 +1089,8 @@ private:
         }
     }
 
-    void run_decode_round(const RoundMembership& membership) {
-        const std::span<const std::uint32_t> lanes = membership.lane_span();
-        const BatchedGeneratedRound round =
-            instance_.program->decode_batch(lanes, membership.budget_span());
-
+    void resolve_decode_batch(std::span<const std::uint32_t> lanes,
+                              const BatchedGeneratedRound& round) {
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             cancelled[row] =
@@ -1210,6 +1207,30 @@ private:
         publish_runtime_stats();
     }
 
+    void run_decode_round(const RoundMembership& membership) {
+        const std::span<const std::uint32_t> lanes = membership.lane_span();
+        const BatchedGeneratedRound round =
+            instance_.program->decode_batch(lanes, membership.budget_span());
+        resolve_decode_batch(lanes, round);
+    }
+
+    // L2 mixed unit: one flat pass over every decode-ready lane plus the staged prefill owner's
+    // next chunk. The decode half resolves exactly like a decode round; the owner half resolves
+    // exactly like a prefill step (so ownership, the admission-turn gate, and the §2.5 one-owner
+    // invariant all keep their existing meaning).
+    void run_mixed_unit(const RoundMembership& membership, std::uint32_t owner_lane) {
+        if (owner_lane >= max_concurrency_ || slots_[owner_lane] == nullptr) {
+            throw std::logic_error("mixed unit owner is not resident");
+        }
+        const std::span<const std::uint32_t> lanes = membership.lane_span();
+        const runtime::MixedBatchResult result =
+            instance_.program->decode_mixed_batch(lanes, membership.budget_span(), owner_lane);
+        resolve_decode_batch(lanes, result.decode);
+        const std::shared_ptr<Request> request = slots_[owner_lane];
+        const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
+        resolve_prefill_step(request, result.owner, cancel_at_boundary);
+    }
+
     void fail_all(std::exception_ptr error) noexcept {
         std::vector<std::shared_ptr<Request>> pending;
         {
@@ -1264,7 +1285,10 @@ private:
                 const RoundMembership membership = build_round_membership();
 
                 if (prefill_lane_) {
-                    if (!membership.empty() && !previous_unit_was_decode) {
+                    if (!membership.empty() && instance_.program->supports_mixed_unit()) {
+                        run_mixed_unit(membership, *prefill_lane_);
+                        previous_unit_was_decode = true;
+                    } else if (!membership.empty() && !previous_unit_was_decode) {
                         run_decode_round(membership);
                         previous_unit_was_decode = true;
                     } else {

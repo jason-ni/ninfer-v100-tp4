@@ -52,6 +52,7 @@ struct PersistentLayout {
 struct WorkspacePlan {
     std::size_t text_prefill   = 0;
     std::size_t ordinary_round = 0;
+    std::size_t mixed_round    = 0;
     std::size_t mtp_prefill    = 0;
     std::size_t mtp_round      = 0;
     std::size_t dflash_context = 0;

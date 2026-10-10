@@ -179,6 +179,19 @@ Program<Variant>::decode_batch(std::span<const std::uint32_t> lanes,
 }
 
 template <>
+runtime::MixedBatchResult
+Program<Variant>::decode_mixed_batch(std::span<const std::uint32_t> lanes,
+                                     std::span<const runtime::RoundBudget> budgets,
+                                     std::uint32_t owner_lane) {
+    return impl_->decode_mixed_batch(lanes, budgets, owner_lane);
+}
+
+template <>
+bool Program<Variant>::supports_mixed_unit() const noexcept {
+    return impl_->supports_mixed_unit();
+}
+
+template <>
 void Program<Variant>::resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                              std::span<const std::uint32_t> accepted_tokens,
                                              std::span<const std::uint8_t> terminal,

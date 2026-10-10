@@ -782,6 +782,82 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
     work_.reset();
 }
 
+void TextContext::mixed_prefill_decode_batch(const Tensor& ids, const Tensor& cache_positions,
+                                             const Tensor& rope_positions,
+                                             const Tensor& decode_kv_table_rows,
+                                             const Tensor& decode_linear_state_slots,
+                                             ops::GqaExecutionEnvelope decode_envelope,
+                                             const Tensor& prefill_kv_table_rows,
+                                             std::int32_t prefill_linear_slot,
+                                             ops::GqaExecutionEnvelope prefill_envelope,
+                                             bool prefill_finalize, Tensor& decode_hidden,
+                                             Tensor& decode_logits, Tensor& prefill_bonus_logits,
+                                             Tensor& prefill_tail_hidden) {
+    if (tensor_parallel()) {
+        mixed_prefill_decode_batch_parallel(ids, cache_positions, rope_positions,
+                                            decode_kv_table_rows, decode_linear_state_slots,
+                                            decode_envelope, prefill_kv_table_rows,
+                                            prefill_linear_slot, prefill_envelope, prefill_finalize,
+                                            decode_hidden, decode_logits, prefill_bonus_logits,
+                                            prefill_tail_hidden);
+        return;
+    }
+    const std::int32_t T = ids.ne[0];
+    const std::int32_t B = decode_kv_table_rows.ne[0];
+    const std::int32_t c = T - B;
+    if (B <= 0 || B > static_cast<std::int32_t>(kMaximumConcurrency) || c <= 0) {
+        throw std::invalid_argument("mixed prefill+decode shape is outside the supported domain");
+    }
+    require_tensor_shape(ids, DType::I32, {T}, "mixed ids");
+    require_tensor_shape(cache_positions, DType::I32, {T}, "mixed cache positions");
+    require_tensor_shape(rope_positions, DType::I32, {T}, "mixed rope positions");
+    require_tensor_shape(decode_kv_table_rows, DType::I32, {B}, "mixed decode KV rows");
+    require_tensor_shape(decode_linear_state_slots, DType::I32, {B}, "mixed decode linear slots");
+    require_tensor_shape(prefill_kv_table_rows, DType::I32, {1}, "mixed prefill KV row");
+    require_tensor_shape(decode_hidden, DType::BF16, {kCfg.hidden, B}, "mixed decode hidden");
+    require_tensor_shape(decode_logits, DType::BF16, {kCfg.vocab, B}, "mixed decode logits");
+    if (prefill_finalize) {
+        require_tensor_shape(prefill_tail_hidden, DType::BF16, {kCfg.hidden, 1},
+                             "mixed prefill tail hidden");
+    }
+
+    cudaStream_t stream = ctx_.stream;
+    work_.reset();
+    {
+        ScopedPositions cache_binding(active_cache_positions_, cache_positions);
+        ScopedPositions rope_binding(active_rope_positions_, rope_positions);
+        ScopedEnvelope envelope_binding(active_gqa_envelope_, decode_envelope);
+        ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &decode_kv_table_rows);
+        ScopedValue<const Tensor*> state_binding(active_linear_state_slots_,
+                                                 &decode_linear_state_slots);
+        ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, B);
+        ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
+        ScopedValue<std::int32_t> slot_binding(linear_state_current_slot_, prefill_linear_slot);
+        MixedOwnerState mixed;
+        mixed.decode_rows         = B;
+        mixed.prefill_len         = c;
+        mixed.prefill_kv_rows[0]  = &prefill_kv_table_rows;
+        mixed.prefill_linear_slot = prefill_linear_slot;
+        mixed.prefill_envelope    = prefill_envelope;
+        mixed.finalize            = prefill_finalize;
+        ScopedValue<const MixedOwnerState*> mixed_binding(active_mixed_, &mixed);
+
+        Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, T});
+        ops::embedding(ids, *embed_, x, stream);
+        NullTap tap;
+        run_layers(x, Phase::Mixed, tap);
+
+        ops::rmsnorm(x.slice(1, 0, B), *final_norm_, kCfg.rms_eps, true, decode_hidden, stream);
+        ops::linear(decode_hidden, *lm_head_, decode_logits, stream);
+        if (prefill_finalize) {
+            ops::rmsnorm(x.slice(1, T - 1, 1), *final_norm_, kCfg.rms_eps, true,
+                         prefill_tail_hidden, stream);
+            ops::linear(prefill_tail_hidden, *lm_head_, prefill_bonus_logits, stream);
+        }
+    }
+    work_.reset();
+}
+
 template <class Tap>
 void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                            const Tensor& rope_positions,
@@ -908,6 +984,10 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
 void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    if (ph == Phase::Mixed) {
+        attn_mix_mixed(w, x, fidx);
+        return;
+    }
     if (active_gqa_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
@@ -969,6 +1049,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    if (ph == Phase::Mixed) {
+        gdn_mix_mixed(w, x, gidx);
+        return;
+    }
 
     const auto control = workspace_recipe::gdn_control<TextConfig>(work_, T);
     Tensor h           = control.hidden;
@@ -1071,6 +1155,161 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
 }
 
+void TextContext::attn_mix_mixed(const FullLayerW& w, Tensor& x, int fidx) {
+    if (active_mixed_ == nullptr) {
+        throw std::logic_error("mixed attention has no owner half state");
+    }
+    cudaStream_t s = ctx_.stream;
+    const int T    = x.ne[1];
+    const std::int32_t B = active_mixed_->decode_rows;
+    const std::int32_t c = T - B;
+    if (B <= 0 || c <= 0) {
+        throw std::logic_error("mixed attention needs decode rows and a prefill row");
+    }
+    if (active_gqa_envelope_ == nullptr) {
+        throw std::logic_error("mixed attention has no decode GQA envelope");
+    }
+    const Tensor& flat_positions = *active_cache_positions_;
+    const Tensor& flat_rope      = *active_rope_positions_;
+    const auto& layer_view       = batch_text_kv_->batch_layer_view(fidx);
+
+    const auto projection = workspace_recipe::text_attention_projection<TextConfig>(work_, T);
+    Tensor h              = projection.hidden;
+    ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
+
+    Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, T});
+    Tensor gate      = projection.gate.view({kCfg.head_dim, kCfg.n_q, T});
+    Tensor k         = projection.key.view({kCfg.head_dim, kCfg.n_kv, T});
+    Tensor v         = projection.value.view({kCfg.head_dim, kCfg.n_kv, T});
+    Tensor q_flat    = q.view({kCfg.q_size, T});
+    Tensor gate_flat = gate.view({kCfg.q_size, T});
+    Tensor k_flat    = k.view({kCfg.kv_size, T});
+    Tensor v_flat    = v.view({kCfg.kv_size, T});
+    Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, Phase::Mixed,
+                                  work_, s);
+
+    const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
+    Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
+    Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
+    ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
+    ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
+    Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
+    ops::rope(flat_rope.view({T}), kCfg.rotary_dim, kCfg.rope_theta, qn, kn, rope_frequency_[0], s);
+
+    {
+        auto scope = work_.scope();
+        Tensor qn_d = qn.slice(2, 0, B).view({kCfg.head_dim, kCfg.n_q, 1, B});
+        Tensor kn_d = kn.slice(2, 0, B).view({kCfg.head_dim, kCfg.n_kv, 1, B});
+        Tensor v_d  = v.slice(2, 0, B).view({kCfg.head_dim, kCfg.n_kv, 1, B});
+        Tensor a_d  = a.slice(2, 0, B).view({kCfg.head_dim, kCfg.n_q, 1, B});
+        Tensor pos_d = flat_positions.slice(0, 0, B).view({1, B});
+        const Tensor& kv_rows = *active_kv_table_rows_;
+        ops::gqa_attention(qn_d, kn_d, v_d, pos_d, Tensor{}, kv_rows, kAttnScale, layer_view,
+                           *active_gqa_envelope_, work_, a_d, s);
+    }
+    {
+        auto scope        = work_.scope();
+        Tensor qn_p = qn.slice(2, B, c).view({kCfg.head_dim, kCfg.n_q, c});
+        Tensor kn_p = kn.slice(2, B, c).view({kCfg.head_dim, kCfg.n_kv, c});
+        Tensor v_p  = v.slice(2, B, c).view({kCfg.head_dim, kCfg.n_kv, c});
+        Tensor a_p  = a.slice(2, B, c).view({kCfg.head_dim, kCfg.n_q, c});
+        Tensor pos_p = flat_positions.slice(0, B, c);
+        if (active_mixed_->prefill_kv_rows[0] == nullptr) {
+            throw std::logic_error("mixed prefill half has no KV-table row");
+        }
+        ops::gqa_attention(qn_p, kn_p, v_p, pos_p, Tensor{}, *active_mixed_->prefill_kv_rows[0],
+                           kAttnScale, layer_view, active_mixed_->prefill_envelope, work_, a_p, s);
+    }
+
+    ops::sigmoid_mul(gate, a, s);
+    Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, Phase::Mixed,
+                                         work_, s);
+}
+
+void TextContext::gdn_mix_mixed(const GdnLayerW& w, Tensor& x, int gidx) {
+    if (active_mixed_ == nullptr) {
+        throw std::logic_error("mixed GDN has no owner half state");
+    }
+    cudaStream_t s = ctx_.stream;
+    const int T    = x.ne[1];
+    const std::int32_t B = active_mixed_->decode_rows;
+    const std::int32_t c = T - B;
+    if (B <= 0 || c <= 0) {
+        throw std::logic_error("mixed GDN needs decode rows and a prefill row");
+    }
+
+    const auto control = workspace_recipe::gdn_control<TextConfig>(work_, T);
+    Tensor h           = control.hidden;
+    Tensor g           = control.g;
+    Tensor beta        = control.beta;
+    Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
+                                         work_, s);
+
+    Tensor& conv_states      = state_.conv.at(static_cast<std::size_t>(gidx));
+    Tensor& recurrent_states = state_.recurrent.at(static_cast<std::size_t>(gidx));
+    const Tensor& decode_slots = *active_linear_state_slots_;
+    const Tensor valid          = Tensor{};
+
+    Tensor z = work_.alloc(DType::BF16, {kCfg.value_dim, T});
+    Tensor o = work_.alloc(DType::BF16, {kCfg.value_dim, T});
+
+    {
+        auto scope = work_.scope();
+        Tensor projection_input = h.slice(1, 0, B).view({kCfg.hidden, 1, B});
+        Tensor qc_d             = work_.alloc(DType::BF16, {kCfg.key_dim, B});
+        Tensor kc_d             = work_.alloc(DType::BF16, {kCfg.key_dim, B});
+        Tensor vc_d             = work_.alloc(DType::BF16, {kCfg.value_dim, B});
+        Tensor query_output     = qc_d.view({kCfg.key_dim, 1, B});
+        Tensor key_output       = kc_d.view({kCfg.key_dim, 1, B});
+        Tensor value_output     = vc_d.view({kCfg.value_dim, 1, B});
+        Tensor gate_output      = z.slice(1, 0, B).view({kCfg.value_dim, 1, B});
+        Variant::gdn_input_projection_snapshot(
+            projection_input, *w.projection, *w.conv1d, conv_states, valid, decode_slots,
+            decode_slots, query_output, key_output, value_output, gate_output, Phase::Mixed, work_, s);
+        Tensor qr_d = qc_d.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, 1, B});
+        Tensor kr_d = kc_d.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, 1, B});
+        Tensor vr_d = vc_d.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1, B});
+        Tensor gr_d = g.slice(1, 0, B).view({kCfg.gdn_v_heads, 1, B});
+        Tensor be_d = beta.slice(1, 0, B).view({kCfg.gdn_v_heads, 1, B});
+        Tensor o_d  = o.slice(1, 0, B).view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1, B});
+        ops::gated_delta_net_snapshot(qr_d, kr_d, vr_d, gr_d, be_d, kGdnScale,
+                                      /*normalize_qk=*/true, recurrent_states, valid, decode_slots,
+                                      decode_slots, o_d, s);
+    }
+    {
+        auto scope = work_.scope();
+        Tensor h_p = h.slice(1, B, c);
+        Tensor qkv = work_.alloc(DType::BF16, {2 * kCfg.key_dim + kCfg.value_dim, c});
+        Tensor z_p = z.slice(1, B, c);
+        Variant::gdn_input_projection(h_p, *w.projection, qkv, z_p, Phase::Mixed, work_, s);
+        Tensor qkv_c = work_.alloc(DType::BF16, {2 * kCfg.key_dim + kCfg.value_dim, c});
+        Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx),
+                                             active_mixed_->prefill_linear_slot);
+        ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
+        Tensor qc_p = work_.alloc(DType::BF16, {kCfg.key_dim, c});
+        Tensor kc_p = work_.alloc(DType::BF16, {kCfg.key_dim, c});
+        Tensor vc_p = work_.alloc(DType::BF16, {kCfg.value_dim, c});
+        ops::extract_bf16_columns(qkv_c, 0, qc_p, s);
+        ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc_p, s);
+        ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc_p, s);
+        Tensor o_p = o.slice(1, B, c).view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, c});
+        Tensor recurrent_state = state_.recurrent_slot(static_cast<std::uint32_t>(gidx),
+                                                       active_mixed_->prefill_linear_slot);
+        ops::gated_delta_net(
+            qc_p.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, c}),
+            kc_p.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, c}),
+            vc_p.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, c}), g.slice(1, B, c), beta.slice(1, B, c),
+            kGdnScale, /*normalize_qk=*/true, work_, recurrent_state, o_p, s);
+    }
+
+    Tensor on = work_.alloc(DType::BF16, {kCfg.value_dim, T});
+    Tensor o_view  = o.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    Tensor z_view  = z.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    Tensor on_view = on.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    ops::gated_rmsnorm(o_view, *w.gdn_norm, z_view, kCfg.rms_eps, on_view, s);
+    Variant::gdn_output_projection(on, *w.out_proj, x, Phase::Mixed, work_, s);
+}
+
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1083,23 +1322,28 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    const bool mixed   = ph == Phase::Mixed;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
             nvtx::ScopedRange layer_range(
-                prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull,
+                mixed ? nvtx::Name::MixedLayerFull
+                      : (prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull),
                 nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
             {
                 nvtx::ScopedRange mixer_range(
-                    prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
+                    mixed ? nvtx::Name::MixedAttention
+                          : (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention),
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
                 attn_mix(full, x, fidx, ph);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
-                    prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
+                    mixed ? nvtx::Name::MixedPostMixer
+                          : (prefill ? nvtx::Name::PrefillPostMixer
+                                     : nvtx::Name::VerifyPostMixer),
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph);
@@ -1108,19 +1352,23 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         } else {
             const int gidx       = ModelConfig::gdn_idx(layer);
             const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
-            nvtx::ScopedRange layer_range(prefill ? nvtx::Name::PrefillLayerGdn
-                                                  : nvtx::Name::VerifyLayerGdn,
-                                          nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
+            nvtx::ScopedRange layer_range(
+                mixed ? nvtx::Name::MixedLayerGdn
+                      : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
+                nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
             {
                 nvtx::ScopedRange mixer_range(
-                    prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn,
-                    static_cast<std::uint64_t>(layer));
+                    mixed ? nvtx::Name::MixedGdn
+                          : (prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn),
+                    nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
                 gdn_mix(gdn, x, gidx, ph);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
-                    prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
+                    mixed ? nvtx::Name::MixedPostMixer
+                          : (prefill ? nvtx::Name::PrefillPostMixer
+                                     : nvtx::Name::VerifyPostMixer),
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
@@ -1666,7 +1914,42 @@ void TextContext::attn_mix_parallel(const std::array<const FullLayerW*, kMaximum
                   rope_frequency_[r], s);
 
         const qwen3_6::PagedKVCache& pages = rank == 0 ? *batch_text_kv_ : *tp_at(rank).batch_kv;
-        if (active_sequence_batch_ != 0) {
+        if (ph == Phase::Mixed) {
+            const MixedOwnerState* mixed = active_mixed_;
+            if (mixed == nullptr) {
+                throw std::logic_error("mixed attention has no owner half state");
+            }
+            const std::int32_t B = mixed->decode_rows;
+            const std::int32_t c = T - B;
+            if (B <= 0 || c <= 0) {
+                throw std::logic_error("mixed attention needs decode rows and a prefill row");
+            }
+            if (mixed->prefill_kv_rows[r] == nullptr) {
+                throw std::logic_error("mixed prefill half has no KV-table row");
+            }
+            {
+                auto half    = ws[r]->scope();
+                Tensor qn_d  = qn[r].slice(2, 0, B).view({kCfg.head_dim, shard_q_heads(), 1, B});
+                Tensor kn_d  = kn[r].slice(2, 0, B).view({kCfg.head_dim, shard_kv_heads(), 1, B});
+                Tensor v_d   = v[r].slice(2, 0, B).view({kCfg.head_dim, shard_kv_heads(), 1, B});
+                Tensor a_d   = a[r].slice(2, 0, B).view({kCfg.head_dim, shard_q_heads(), 1, B});
+                Tensor pos_d = cache.slice(0, 0, B).view({1, B});
+                ops::gqa_attention(qn_d, kn_d, v_d, pos_d, Tensor{}, rank_kv_table_rows(rank),
+                                   kAttnScale, pages.batch_layer_view(fidx), *active_gqa_envelope_,
+                                   *ws[r], a_d, s);
+            }
+            {
+                auto half   = ws[r]->scope();
+                Tensor qn_p = qn[r].slice(2, B, c).view({kCfg.head_dim, shard_q_heads(), c});
+                Tensor kn_p = kn[r].slice(2, B, c).view({kCfg.head_dim, shard_kv_heads(), c});
+                Tensor v_p  = v[r].slice(2, B, c).view({kCfg.head_dim, shard_kv_heads(), c});
+                Tensor a_p  = a[r].slice(2, B, c).view({kCfg.head_dim, shard_q_heads(), c});
+                ops::gqa_attention(qn_p, kn_p, v_p, cache.slice(0, B, c), Tensor{},
+                                   *mixed->prefill_kv_rows[r], kAttnScale,
+                                   pages.batch_layer_view(fidx), mixed->prefill_envelope, *ws[r],
+                                   a_p, s);
+            }
+        } else if (active_sequence_batch_ != 0) {
             const std::int32_t width = active_sequence_width_;
             if (width <= 0 || width * active_sequence_batch_ != T) {
                 throw std::logic_error(
@@ -1741,7 +2024,74 @@ void TextContext::gdn_mix_parallel(const std::array<const GdnLayerW*, kMaximumDe
     });
     Variant::gdn_control_projection(h, projection, g, beta, ws, execution);
 
-    if (ph == Phase::Verify) {
+    if (ph == Phase::Mixed) {
+        const MixedOwnerState* mixed = active_mixed_;
+        if (mixed == nullptr) {
+            throw std::logic_error("mixed GDN has no owner half state");
+        }
+        const std::int32_t B = mixed->decode_rows;
+        const std::int32_t c = T - B;
+        if (B <= 0 || c <= 0) {
+            throw std::logic_error("mixed GDN needs decode rows and a prefill row");
+        }
+        // Decode half: the ordinary snapshot path over the first B columns. The T-wide projection
+        // buffers are sliced, not reallocated: a mid-column block of a column-major tensor keeps
+        // the dense row pitch its [rows, 1, B] geometry needs.
+        std::array<Tensor, kMaximumDevices> decode_input;
+        std::array<Tensor, kMaximumDevices> decode_query;
+        std::array<Tensor, kMaximumDevices> decode_key;
+        std::array<Tensor, kMaximumDevices> decode_value;
+        std::array<Tensor, kMaximumDevices> decode_gate;
+        std::array<Tensor, kMaximumDevices> conv_weight;
+        std::array<Tensor, kMaximumDevices> conv_states;
+        std::array<Tensor, kMaximumDevices> valid;
+        std::array<Tensor, kMaximumDevices> decode_slots;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
+            const int rank  = static_cast<int>(r);
+            decode_input[r] = h[r].slice(1, 0, B).view({kCfg.hidden, 1, B});
+            decode_query[r] = qc[r].slice(1, 0, B).view({shard_key_dim(), 1, B});
+            decode_key[r]   = kc[r].slice(1, 0, B).view({shard_key_dim(), 1, B});
+            decode_value[r] = vc[r].slice(1, 0, B).view({shard_value_dim(), 1, B});
+            decode_gate[r]  = z[r].slice(2, 0, B).view({shard_value_dim(), 1, B});
+            conv_weight[r]  = *w[r]->conv1d;
+            conv_states[r]  = state_for(rank).conv.at(static_cast<std::size_t>(gidx));
+            valid[r]        = Tensor{};
+            decode_slots[r] = rank_linear_state_slots(rank);
+        }
+        Variant::gdn_input_projection_snapshot(decode_input, projection, conv_weight, conv_states,
+                                               valid, decode_slots, decode_slots, decode_query,
+                                               decode_key, decode_value, decode_gate, ph, ws,
+                                               execution);
+        // Prefill half: the single-state conv prefill over [B, T).
+        std::array<Tensor, kMaximumDevices> prefill_input;
+        std::array<Tensor, kMaximumDevices> prefill_qkv;
+        std::array<Tensor, kMaximumDevices> prefill_convolved;
+        std::array<Tensor, kMaximumDevices> prefill_gate;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
+            const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(*ws[r], c,
+                                                                            tp_width());
+            prefill_input[r]     = h[r].slice(1, B, c);
+            prefill_qkv[r]       = conv.projected;
+            prefill_convolved[r] = conv.convolved;
+            prefill_gate[r]      = z[r].slice(2, B, c);
+        }
+        Variant::gdn_input_projection(prefill_input, projection, prefill_qkv, prefill_gate, ph, ws,
+                                      execution);
+        for_each_rank(execution, [&](int rank) {
+            const auto r      = static_cast<std::size_t>(rank);
+            cudaStream_t s    = stream_for(rank);
+            Tensor conv_state = state_for(rank).conv_slot(static_cast<std::uint32_t>(gidx),
+                                                          mixed->prefill_linear_slot);
+            ops::causal_conv1d_silu(prefill_qkv[r], *w[r]->conv1d, conv_state, conv_state,
+                                    prefill_convolved[r], s);
+            Tensor q_p = qc[r].slice(1, B, c);
+            Tensor k_p = kc[r].slice(1, B, c);
+            Tensor v_p = vc[r].slice(1, B, c);
+            ops::extract_bf16_columns(prefill_convolved[r], 0, q_p, s);
+            ops::extract_bf16_columns(prefill_convolved[r], shard_key_dim(), k_p, s);
+            ops::extract_bf16_columns(prefill_convolved[r], 2 * shard_key_dim(), v_p, s);
+        });
+    } else if (ph == Phase::Verify) {
         if (active_sequence_batch_ == 0) {
             throw std::logic_error("Verify GDN requires an explicit sequence batch");
         }
@@ -1835,7 +2185,37 @@ void TextContext::gdn_mix_parallel(const std::array<const GdnLayerW*, kMaximumDe
         Tensor q_recurrent = qc[r].view({kCfg.gdn_k_dim, shard_gdn_k_heads(), T});
         Tensor k_recurrent = kc[r].view({kCfg.gdn_k_dim, shard_gdn_k_heads(), T});
         Tensor vv          = vc[r].view({kCfg.gdn_v_dim, shard_gdn_v_heads(), T});
-        if (ph == Phase::Verify) {
+        if (ph == Phase::Mixed) {
+            const MixedOwnerState* mixed = active_mixed_;
+            const std::int32_t B         = mixed->decode_rows;
+            const std::int32_t c         = T - B;
+            Tensor& recurrent_states = state_for(rank).recurrent.at(static_cast<std::size_t>(gidx));
+            {
+                auto half  = ws[r]->scope();
+                Tensor q_d = qc[r].slice(1, 0, B).view({kCfg.gdn_k_dim, shard_gdn_k_heads(), 1, B});
+                Tensor k_d = kc[r].slice(1, 0, B).view({kCfg.gdn_k_dim, shard_gdn_k_heads(), 1, B});
+                Tensor v_d = vc[r].slice(1, 0, B).view({kCfg.gdn_v_dim, shard_gdn_v_heads(), 1, B});
+                Tensor g_d = g[r].slice(1, 0, B).view({shard_gdn_v_heads(), 1, B});
+                Tensor beta_d = beta[r].slice(1, 0, B).view({shard_gdn_v_heads(), 1, B});
+                Tensor o_d = o[r].slice(2, 0, B).view({kCfg.gdn_v_dim, shard_gdn_v_heads(), 1, B});
+                const Tensor slots = rank_linear_state_slots(rank);
+                ops::gated_delta_net_snapshot(q_d, k_d, v_d, g_d, beta_d, kGdnScale,
+                                              /*normalize_qk=*/true, recurrent_states, Tensor{},
+                                              slots, slots, o_d, s);
+            }
+            {
+                auto half = ws[r]->scope();
+                Tensor q_p = qc[r].slice(1, B, c).view({kCfg.gdn_k_dim, shard_gdn_k_heads(), c});
+                Tensor k_p = kc[r].slice(1, B, c).view({kCfg.gdn_k_dim, shard_gdn_k_heads(), c});
+                Tensor v_p = vc[r].slice(1, B, c).view({kCfg.gdn_v_dim, shard_gdn_v_heads(), c});
+                Tensor o_p = o[r].slice(2, B, c).view({kCfg.gdn_v_dim, shard_gdn_v_heads(), c});
+                Tensor recurrent_state = state_for(rank).recurrent_slot(
+                    static_cast<std::uint32_t>(gidx), mixed->prefill_linear_slot);
+                ops::gated_delta_net(q_p, k_p, v_p, g[r].slice(1, B, c), beta[r].slice(1, B, c),
+                                     kGdnScale, /*normalize_qk=*/true, *ws[r], recurrent_state, o_p,
+                                     s);
+            }
+        } else if (ph == Phase::Verify) {
             Tensor& recurrent_states = state_for(rank).recurrent.at(static_cast<std::size_t>(gidx));
             const std::int32_t width = active_sequence_width_;
             Tensor q_batch =
@@ -1910,6 +2290,7 @@ void TextContext::run_layers_parallel(std::array<Tensor, kMaximumDevices>& x, Ph
                                  DFlashFeatureSink* dflash_sink) {
     if (dflash_sink != nullptr) { dflash_sink->begin(x[0]); }
     const bool prefill = ph == Phase::Prefill;
+    const bool mixed   = ph == Phase::Mixed;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const auto fidx = static_cast<std::size_t>(ModelConfig::full_idx(layer));
@@ -1926,11 +2307,13 @@ void TextContext::run_layers_parallel(std::array<Tensor, kMaximumDevices>& x, Ph
                 mlp[r]       = &w[r]->mlp;
             }
             nvtx::ScopedRange layer_range(
-                prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull,
+                mixed ? nvtx::Name::MixedLayerFull
+                      : (prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull),
                 nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
             {
                 nvtx::ScopedRange mixer_range(
-                    prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
+                    mixed ? nvtx::Name::MixedAttention
+                          : (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention),
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
                 std::array<std::optional<WorkspaceArena::Scope>, kMaximumDevices> scopes;
                 for (int rank = 0; rank < tp_count_; ++rank) {
@@ -1941,7 +2324,9 @@ void TextContext::run_layers_parallel(std::array<Tensor, kMaximumDevices>& x, Ph
             }
             {
                 nvtx::ScopedRange post_mixer_range(
-                    prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
+                    mixed ? nvtx::Name::MixedPostMixer
+                          : (prefill ? nvtx::Name::PrefillPostMixer
+                                     : nvtx::Name::VerifyPostMixer),
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 std::array<std::optional<WorkspaceArena::Scope>, kMaximumDevices> scopes;
                 for (int rank = 0; rank < tp_count_; ++rank) {
@@ -1964,13 +2349,15 @@ void TextContext::run_layers_parallel(std::array<Tensor, kMaximumDevices>& x, Ph
                 post_norm[r] = w[r]->post_attn_norm;
                 mlp[r]       = &w[r]->mlp;
             }
-            nvtx::ScopedRange layer_range(prefill ? nvtx::Name::PrefillLayerGdn
-                                                  : nvtx::Name::VerifyLayerGdn,
-                                          nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
+            nvtx::ScopedRange layer_range(
+                mixed ? nvtx::Name::MixedLayerGdn
+                      : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
+                nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
             {
                 nvtx::ScopedRange mixer_range(
-                    prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn,
-                    static_cast<std::uint64_t>(layer));
+                    mixed ? nvtx::Name::MixedGdn
+                          : (prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn),
+                    nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
                 std::array<std::optional<WorkspaceArena::Scope>, kMaximumDevices> scopes;
                 for (int rank = 0; rank < tp_count_; ++rank) {
                     scopes[rank].emplace(
@@ -1980,7 +2367,9 @@ void TextContext::run_layers_parallel(std::array<Tensor, kMaximumDevices>& x, Ph
             }
             {
                 nvtx::ScopedRange post_mixer_range(
-                    prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
+                    mixed ? nvtx::Name::MixedPostMixer
+                          : (prefill ? nvtx::Name::PrefillPostMixer
+                                     : nvtx::Name::VerifyPostMixer),
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 std::array<std::optional<WorkspaceArena::Scope>, kMaximumDevices> scopes;
                 for (int rank = 0; rank < tp_count_; ++rank) {
@@ -2538,6 +2927,147 @@ void TextContext::ordinary_decode_batch_parallel(const Tensor& ids, const Tensor
         // the decode round produces one column per lane, and RoundState::logits is a single
         // column. Getting this wrong is an out-of-bounds write on device 1 at any batch above 1.
         logits_parallel(flat_hidden, logit_slices);
+    }
+    for (int rank = 0; rank < tp_count_; ++rank) { ws[rank]->reset(); }
+}
+
+void TextContext::mixed_prefill_decode_batch_parallel(
+    const Tensor& ids, const Tensor& cache_positions, const Tensor& rope_positions,
+    const Tensor& decode_kv_table_rows, const Tensor& decode_linear_state_slots,
+    ops::GqaExecutionEnvelope decode_envelope, const Tensor& prefill_kv_table_rows,
+    std::int32_t prefill_linear_slot, ops::GqaExecutionEnvelope prefill_envelope,
+    bool prefill_finalize, Tensor& decode_hidden, Tensor& decode_logits,
+    Tensor& prefill_bonus_logits, Tensor& prefill_tail_hidden) {
+    const ExecutionContext& execution                       = ec();
+    const std::array<WorkspaceArena*, kMaximumDevices> ws   = workspaces();
+    const std::int32_t T                                    = ids.ne[0];
+    const std::int32_t B                                    = decode_kv_table_rows.ne[0];
+    const std::int32_t c                                    = T - B;
+    if (B <= 0 || B > static_cast<std::int32_t>(kMaximumConcurrency) || c <= 0) {
+        throw std::invalid_argument("mixed prefill+decode shape is outside the supported domain");
+    }
+    require_tensor_shape(ids, DType::I32, {T}, "mixed ids");
+    require_tensor_shape(cache_positions, DType::I32, {T}, "mixed cache positions");
+    require_tensor_shape(rope_positions, DType::I32, {T}, "mixed rope positions");
+    require_tensor_shape(decode_kv_table_rows, DType::I32, {B}, "mixed decode KV rows");
+    require_tensor_shape(decode_linear_state_slots, DType::I32, {B}, "mixed decode linear slots");
+    require_tensor_shape(prefill_kv_table_rows, DType::I32, {1}, "mixed prefill KV row");
+    require_tensor_shape(decode_hidden, DType::BF16, {kCfg.hidden, B}, "mixed decode hidden");
+    require_tensor_shape(decode_logits, DType::BF16, {kCfg.vocab, B}, "mixed decode logits");
+    if (prefill_finalize) {
+        require_tensor_shape(prefill_tail_hidden, DType::BF16, {kCfg.hidden, 1},
+                             "mixed prefill tail hidden");
+    }
+    // Every rank reads its OWN frame. The control tensors (tokens/positions/KV rows/slots) hold
+    // rank-invariant values, but a tensor view names a device address, so the peer slices below are
+    // not optional.
+    for (int rank = 1; rank < tp_count_; ++rank) {
+        if (!tp_at(rank).io->ordinary || !tp_at(rank).io->ordinary->mixed) {
+            throw std::logic_error("tensor-parallel mixed unit requires a peer mixed frame");
+        }
+    }
+
+    std::array<Tensor, kMaximumDevices> rank_ids;
+    std::array<Tensor, kMaximumDevices> rank_cache;
+    std::array<Tensor, kMaximumDevices> rank_rope;
+    std::array<Tensor, kMaximumDevices> rank_decode_rows;
+    std::array<Tensor, kMaximumDevices> rank_decode_slots;
+    std::array<Tensor, kMaximumDevices> rank_prefill_rows;
+    std::array<Tensor, kMaximumDevices> flat_hidden;
+    std::array<Tensor, kMaximumDevices> logit_windows;
+    std::array<Tensor, kMaximumDevices> tail_hidden;
+    std::array<Tensor, kMaximumDevices> bonus_windows;
+    rank_ids[0]          = ids;
+    rank_cache[0]        = cache_positions;
+    rank_rope[0]         = rope_positions;
+    rank_decode_rows[0]  = decode_kv_table_rows;
+    rank_decode_slots[0] = decode_linear_state_slots;
+    rank_prefill_rows[0] = prefill_kv_table_rows;
+    flat_hidden[0]       = decode_hidden;
+    logit_windows[0]     = decode_logits;
+    tail_hidden[0]       = prefill_tail_hidden;
+    bonus_windows[0]     = prefill_bonus_logits;
+    for (int rank = 1; rank < tp_count_; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        const qwen3_6::OrdinaryDecodeState& peer_ordinary = *tp_at(rank).io->ordinary;
+        const qwen3_6::OrdinaryDecodeState::MixedState& peer_mixed = *peer_ordinary.mixed;
+        rank_ids[r]          = peer_mixed.tokens.slice(0, 0, T);
+        rank_cache[r]        = peer_mixed.cache_positions.slice(0, 0, T);
+        rank_rope[r]         = peer_mixed.rope_positions.slice(0, 0, T);
+        rank_decode_rows[r]  = peer_mixed.decode_kv_table_rows.slice(0, 0, B);
+        rank_decode_slots[r] = peer_mixed.decode_linear_state_slots.slice(0, 0, B);
+        rank_prefill_rows[r] = peer_mixed.prefill_kv_table_row;
+        flat_hidden[r]       = peer_ordinary.hidden.slice(1, 0, B);
+        logit_windows[r]     = peer_ordinary.logits.slice(1, 0, B);
+        tail_hidden[r]       = peer_mixed.prefill_tail_hidden;
+        bonus_windows[r]     = peer_mixed.bonus_logits;
+    }
+
+    for (int rank = 0; rank < tp_count_; ++rank) { ws[rank]->reset(); }
+    {
+        std::array<std::optional<WorkspaceArena::Scope>, kMaximumDevices> scopes;
+        for (int rank = 0; rank < tp_count_; ++rank) {
+            scopes[rank].emplace(rank == 0 ? work_.scope() : tp_at(rank).work->scope());
+        }
+        ScopedPositions cache_binding(active_cache_positions_, cache_positions);
+        ScopedPositions rope_binding(active_rope_positions_, rope_positions);
+        ScopedEnvelope envelope_binding(active_gqa_envelope_, decode_envelope);
+        ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &decode_kv_table_rows);
+        ScopedValue<const Tensor*> state_binding(active_linear_state_slots_,
+                                                 &decode_linear_state_slots);
+        ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, B);
+        ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
+        ScopedValue<std::int32_t> slot_binding(linear_state_current_slot_, prefill_linear_slot);
+        std::array<std::optional<ScopedValue<const Tensor*>>, kMaximumDevices> peer_cache_binding;
+        std::array<std::optional<ScopedValue<const Tensor*>>, kMaximumDevices> peer_rope_binding;
+        std::array<std::optional<ScopedValue<const Tensor*>>, kMaximumDevices> peer_rows_binding;
+        std::array<std::optional<ScopedValue<const Tensor*>>, kMaximumDevices> peer_slots_binding;
+        for (int rank = 1; rank < tp_count_; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            peer_cache_binding[rank].emplace(peer_cache_positions_[r], &rank_cache[r]);
+            peer_rope_binding[rank].emplace(peer_rope_positions_[r], &rank_rope[r]);
+            peer_rows_binding[rank].emplace(peer_kv_table_rows_[r], &rank_decode_rows[r]);
+            peer_slots_binding[rank].emplace(peer_linear_state_slots_[r], &rank_decode_slots[r]);
+        }
+        MixedOwnerState mixed;
+        mixed.decode_rows  = B;
+        mixed.prefill_len  = c;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
+            mixed.prefill_kv_rows[r] = &rank_prefill_rows[r];
+        }
+        mixed.prefill_linear_slot = prefill_linear_slot;
+        mixed.prefill_envelope    = prefill_envelope;
+        mixed.finalize            = prefill_finalize;
+        ScopedValue<const MixedOwnerState*> mixed_binding(active_mixed_, &mixed);
+
+        std::array<Tensor, kMaximumDevices> x;
+        std::array<Tensor, kMaximumDevices> staging;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
+            x[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, T});
+            staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, T});
+        }
+        for_each_rank(execution, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::embedding(rank_ids[r], rank == 0 ? *embed_ : *embed_peer_[r], x[r],
+                           stream_for(rank));
+        });
+        run_layers_parallel(x, Phase::Mixed, staging);
+
+        for_each_rank(execution, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::rmsnorm(x[r].slice(1, 0, B), rank == 0 ? *final_norm_ : *final_norm_peer_[r],
+                         kCfg.rms_eps, true, flat_hidden[r], stream_for(rank));
+        });
+        logits_parallel(flat_hidden, logit_windows);
+        if (prefill_finalize) {
+            for_each_rank(execution, [&](int rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                ops::rmsnorm(x[r].slice(1, T - 1, 1),
+                             rank == 0 ? *final_norm_ : *final_norm_peer_[r], kCfg.rms_eps, true,
+                             tail_hidden[r], stream_for(rank));
+            });
+            logits_parallel(tail_hidden, bonus_windows);
+        }
     }
     for (int rank = 0; rank < tp_count_; ++rank) { ws[rank]->reset(); }
 }

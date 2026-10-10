@@ -192,6 +192,14 @@ ninfer_add_test(ninfer_qwen3_8_27b_v100x2_concurrent_prefix_real_test
 target_link_libraries(ninfer_qwen3_8_27b_v100x2_concurrent_prefix_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_8_27b_v100x2_concurrent_prefix_real_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# L2 mixed prefill+decode unit: a decode-ready request and a prefilling owner share one flat forward;
+# each request's greedy continuation must equal its isolated run.
+ninfer_add_test(ninfer_qwen3_8_27b_v100x2_mixed_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_v100x2_mixed_real.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_8_27b_v100x2_mixed_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_8_27b_v100x2_mixed_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # `--rope yarn` past the native 262144-position window, on real weights, at both tp widths.
 # Artifact-gated; the tp2 leg additionally needs two devices.
 ninfer_add_test(ninfer_qwen3_8_27b_yarn_real_test

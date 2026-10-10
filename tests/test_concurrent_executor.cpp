@@ -265,6 +265,12 @@ public:
         if (finished) { clear(lane); }
     }
 
+    bool supports_mixed_unit() const noexcept { return false; }
+    rt::MixedBatchResult decode_mixed_batch(std::span<const std::uint32_t>,
+                                            std::span<const rt::RoundBudget>, std::uint32_t) {
+        throw std::logic_error("scripted program has no mixed unit");
+    }
+
     rt::BatchedGeneratedRound decode_batch(std::span<const std::uint32_t> lanes,
                                            std::span<const rt::RoundBudget>) {
         batch_.clear();

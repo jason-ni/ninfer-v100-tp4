@@ -22,6 +22,7 @@ struct RoundStateSpec {
     std::int32_t output_rows     = 0;
     std::uint32_t batch_capacity = 1;
     std::uint32_t draft_window   = 0;
+    std::uint32_t mixed_token_capacity = 0; // 0 disables the L2 mixed frame
     bool enable_mtp              = false;
     bool enable_dflash           = false;
 };
@@ -39,6 +40,40 @@ struct OrdinaryDecodeIngress {
 
 struct OrdinaryDecodeEgress {
     std::array<TokenId, kMaximumConcurrency> sampled_tokens{};
+};
+
+// Host control block for one L2 mixed unit (ordinary backend, M1): the decode membership (B rows,
+// each one token) plus the single prefill owner folded into the same flat stream. The flat [T]
+// token/position/rope stream itself lives in the mixed state tensors, not in this block, because T
+// = B + prefill chunk is a runtime bound. The decode rows reuse this ordinary frame's
+// hidden/logits/sampled_tokens; only the owner carries extra outputs (bonus logits/token).
+struct MixedDecodeControl {
+    std::int32_t decode_rows          = 0;
+    std::int32_t prefill_len          = 0;
+    std::int32_t prefill_linear_slot  = 0;
+    std::int32_t prefill_finalize     = 0;
+    std::int32_t prefill_sampling_valid = 0;
+    std::int32_t prefill_bonus_position = 0;
+    std::uint32_t decode_min_visible  = 0;
+    std::uint32_t decode_max_visible  = 0;
+    std::uint32_t prefill_min_visible = 0;
+    std::uint32_t prefill_max_visible = 0;
+    std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    ops::SamplingConfig prefill_sampling{};
+};
+
+struct MixedDecodeStateLayout {
+    LayoutRegion control;
+    TensorRegion tokens;
+    TensorRegion cache_positions;
+    TensorRegion rope_positions;
+    TensorRegion decode_kv_table_rows;
+    TensorRegion decode_linear_state_slots;
+    TensorRegion prefill_kv_table_row;
+    TensorRegion prefill_tail_hidden;
+    TensorRegion bonus_logits;
+    TensorRegion bonus_token;
 };
 
 // Stable pinned/device transfer formats for concurrent MTP decode. The arrays use the maximum
@@ -92,6 +127,8 @@ struct OrdinaryDecodeStateLayout {
     LayoutRegion egress;
     TensorRegion logits;
     TensorRegion hidden;
+    // Present iff spec.mixed_token_capacity > 0: the L2 mixed unit's flat stream and owner bits.
+    std::optional<MixedDecodeStateLayout> mixed;
 };
 
 struct MtpPrefillStateLayout {
@@ -170,9 +207,31 @@ struct OrdinaryDecodeState {
     Tensor logits;
     Tensor hidden;
 
+    struct MixedState {
+        DeviceSpan control;
+        Tensor tokens;
+        Tensor cache_positions;
+        Tensor rope_positions;
+        Tensor decode_kv_table_rows;
+        Tensor decode_linear_state_slots;
+        Tensor prefill_kv_table_row;
+        Tensor prefill_tail_hidden;
+        const ops::SamplingConfig* sampling         = nullptr;
+        const ops::SamplingConfig* prefill_sampling = nullptr;
+        Tensor lanes;
+        Tensor bonus_position;
+        Tensor bonus_logits;
+        Tensor bonus_token;
+
+        MixedState() = default;
+        MixedState(DeviceSpan backing, const MixedDecodeStateLayout& layout,
+                   std::uint32_t token_capacity, std::uint32_t batch_capacity);
+    };
+    std::optional<MixedState> mixed;
+
     OrdinaryDecodeState() = default;
     OrdinaryDecodeState(DeviceSpan backing, const OrdinaryDecodeStateLayout& layout,
-                        std::uint32_t batch_capacity);
+                        std::uint32_t batch_capacity, std::uint32_t mixed_token_capacity);
 };
 
 // The two planning calls expose one deliberate exact-target extension seam after scalar logits.

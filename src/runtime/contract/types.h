@@ -83,6 +83,14 @@ struct PrefillStepResult {
     bool complete                         = false;
 };
 
+// One L2 mixed unit's result: the B decode rows' committed tokens plus the folded prefill owner's
+// step. The decode half carries the same shape as an ordinary decode round; the owner half carries
+// the same shape as one prefill chunk step.
+struct MixedBatchResult {
+    BatchedGeneratedRound decode;
+    PrefillStepResult owner;
+};
+
 struct RoundBudget {
     std::uint32_t generated_tokens_remaining = 0;
 };

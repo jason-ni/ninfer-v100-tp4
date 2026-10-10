@@ -161,6 +161,28 @@ struct OrdinaryBatchContext {
     std::array<qwen3_6::OrdinaryDecodeIngress*, kMaximumDevices> peer_host_ingress{};
 };
 
+struct MixedBatchContext {
+    ExecutionCore execution;
+    const qwen3_6::PagedKVCache& text_cache;
+    qwen3_6::OrdinaryDecodeState& frame;
+    const qwen3_6::MixedDecodeControl& host_control;
+    qwen3_6::OrdinaryDecodeEgress& host_egress;
+    std::int32_t* host_bonus_token;
+    Tensor& continuation_hidden_store;
+    // The flat [T] token stream and every parallel control tensor, in one host copy each. All of
+    // them are rank-invariant logical values (positions, table-row indices, linear-state slots), so
+    // unlike the ordinary ingress there is no per-rank host mirror: the schedule uploads this one
+    // copy into EVERY rank's own mixed frame. `host_tokens`/`host_cache_positions`/
+    // `host_rope_positions` are sized T; the rest are sized B (decode rows).
+    std::span<const std::int32_t> host_tokens;
+    std::span<const std::int32_t> host_cache_positions;
+    std::span<const std::int32_t> host_rope_positions;
+    std::span<const std::int32_t> host_decode_kv_rows;
+    std::span<const std::int32_t> host_decode_linear_slots;
+    // The owner's own text KV-table row, identical on every rank.
+    std::int32_t prefill_kv_row = -1;
+};
+
 struct MtpBatchContext {
     ExecutionCore execution;
     const qwen3_6::PagedKVCache& text_cache;
@@ -242,6 +264,10 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
     std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end);
+
+// L2 mixed unit: one eager flat pass over T = B decode rows + the owner's prefill chunk. Fills the
+// ordinary frame's decode hidden/logits/sampled (+ the mixed bonus token on finalize).
+void mixed_prefill_decode_batch(MixedBatchContext& state);
 
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
