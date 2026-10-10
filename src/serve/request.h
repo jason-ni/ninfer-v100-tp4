@@ -118,48 +118,31 @@ struct SamplingParams {
     int n = 1;
 };
 
-// Protocol-level effort vocabulary. Each wire adapter accepts the values from
-// its external contract; translation then resolves them against the capabilities
-// advertised by the chat template embedded in the loaded artifact.
+// The registered templates expose low, medium, and xhigh. A requested effort folds onto that
+// vocabulary instead of rejecting the request: none, minimal, empty, and unrecognized values fall
+// back to low; high maps to medium; max maps to xhigh.
 enum class RequestedReasoningEffort : std::uint8_t {
-    None,
-    Minimal,
     Low,
     Medium,
-    High,
     XHigh,
-    Max,
 };
 
-[[nodiscard]] constexpr std::optional<RequestedReasoningEffort>
-parse_requested_reasoning_effort(std::string_view value) noexcept {
-    if (value == "none") { return RequestedReasoningEffort::None; }
-    if (value == "minimal") { return RequestedReasoningEffort::Minimal; }
-    if (value == "low") { return RequestedReasoningEffort::Low; }
-    if (value == "medium") { return RequestedReasoningEffort::Medium; }
-    if (value == "high") { return RequestedReasoningEffort::High; }
-    if (value == "xhigh") { return RequestedReasoningEffort::XHigh; }
-    if (value == "max") { return RequestedReasoningEffort::Max; }
-    return std::nullopt;
+[[nodiscard]] constexpr RequestedReasoningEffort
+fallback_requested_reasoning_effort(std::string_view value) noexcept {
+    if (value == "medium" || value == "high") { return RequestedReasoningEffort::Medium; }
+    if (value == "xhigh" || value == "max") { return RequestedReasoningEffort::XHigh; }
+    return RequestedReasoningEffort::Low;
 }
 
 [[nodiscard]] constexpr std::string_view
 requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
     switch (effort) {
-    case RequestedReasoningEffort::None:
-        return "none";
-    case RequestedReasoningEffort::Minimal:
-        return "minimal";
     case RequestedReasoningEffort::Low:
         return "low";
     case RequestedReasoningEffort::Medium:
         return "medium";
-    case RequestedReasoningEffort::High:
-        return "high";
     case RequestedReasoningEffort::XHigh:
         return "xhigh";
-    case RequestedReasoningEffort::Max:
-        return "max";
     }
     return {};
 }

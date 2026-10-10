@@ -154,18 +154,18 @@ int test_reasoning_effort() {
 
     for (const auto& [wire, expected] :
          std::array<std::pair<const char*, RequestedReasoningEffort>, 7>{
-             {{"none", RequestedReasoningEffort::None},
-              {"minimal", RequestedReasoningEffort::Minimal},
+             {{"none", RequestedReasoningEffort::Low},
+              {"minimal", RequestedReasoningEffort::Low},
               {"low", RequestedReasoningEffort::Low},
               {"medium", RequestedReasoningEffort::Medium},
-              {"high", RequestedReasoningEffort::High},
+              {"high", RequestedReasoningEffort::Medium},
               {"xhigh", RequestedReasoningEffort::XHigh},
-              {"max", RequestedReasoningEffort::Max}}}) {
+              {"max", RequestedReasoningEffort::XHigh}}}) {
         Json body         = base;
         body["reasoning"] = Json{{"effort", wire}};
         failures +=
             check(parse_responses_request(body, limits()).generation.reasoning_effort == expected,
-                  std::string("Responses did not accept protocol effort ") + wire);
+                  std::string("Responses did not fold effort ") + wire);
     }
 
     Json low                            = base;
@@ -181,22 +181,33 @@ int test_reasoning_effort() {
     none["reasoning"]                            = Json{{"effort", "none"}};
     const ResolvedPromptSemantics none_semantics = resolve_prompt_semantics(
         parse_responses_request(none, limits()).generation, ServeOptions{}, effort_capabilities());
-    failures += check(!none_semantics.enable_thinking && !none_semantics.reasoning_effort,
-                      "Responses none effort did not disable thinking");
+    failures += check(none_semantics.enable_thinking &&
+                          none_semantics.reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "Responses none effort did not fold to low");
+
+    Json conflict_kwargs                    = low;
+    conflict_kwargs["reasoning"]            = Json{{"effort", "low"}};
+    conflict_kwargs["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    const ResolvedPromptSemantics conflict_semantics = resolve_prompt_semantics(
+        parse_responses_request(conflict_kwargs, limits()).generation, ServeOptions{},
+        effort_capabilities());
+    failures += check(!conflict_semantics.enable_thinking && !conflict_semantics.reasoning_effort,
+                      "Responses enable_thinking=false did not keep thinking off");
 
     Json high                            = base;
     high["reasoning"]                    = Json{{"effort", "high"}};
     const GenerationRequest high_request = parse_responses_request(high, limits()).generation;
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, ServeOptions{},
-                                                         effort_capabilities());
-                      }) == "reasoning_effort_not_supported",
-                      "Responses high effort bypassed template capability validation");
+    const ResolvedPromptSemantics high_semantics =
+        resolve_prompt_semantics(high_request, ServeOptions{}, effort_capabilities());
+    failures += check(high_semantics.enable_thinking &&
+                          high_semantics.reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "Responses high effort did not fold to medium");
 
     Json invalid         = base;
     invalid["reasoning"] = Json{{"effort", "ultra"}};
-    failures += check(throws_api([&] { (void)parse_responses_request(invalid, limits()); }),
-                      "unknown Responses reasoning effort was accepted");
+    failures += check(parse_responses_request(invalid, limits()).generation.reasoning_effort ==
+                          RequestedReasoningEffort::Low,
+                      "unknown Responses reasoning effort did not fall back to low");
     invalid["reasoning"] = Json{{"effort", 1}};
     failures += check(throws_api([&] { (void)parse_responses_request(invalid, limits()); }),
                       "non-string Responses reasoning effort was accepted");

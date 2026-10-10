@@ -153,13 +153,8 @@ void apply_chat_template_kwargs(const std::string& text, ServeOptions& options,
                 throw std::invalid_argument(
                     "--chat-template-kwargs.reasoning_effort must be a string");
             }
-            const auto effort = parse_requested_reasoning_effort(it.value().get<std::string>());
-            if (!effort) {
-                throw std::invalid_argument(
-                    "--chat-template-kwargs.reasoning_effort must be one of none, minimal, low, "
-                    "medium, high, xhigh, or max");
-            }
-            options.reasoning_effort_default = *effort;
+            options.reasoning_effort_default =
+                fallback_requested_reasoning_effort(it.value().get<std::string>());
         } else {
             throw std::invalid_argument("--chat-template-kwargs." + key + " is not supported");
         }
@@ -440,9 +435,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         apply_chat_template_kwargs(chat_template_kwargs, options, preserve_thinking_explicit,
                                    enable_thinking_explicit);
     }
-    if (options.reasoning_effort_default &&
-        *options.reasoning_effort_default != RequestedReasoningEffort::None &&
-        !options.enable_thinking) {
+    if (options.reasoning_effort_default && !options.enable_thinking) {
         throw std::invalid_argument(
             "--chat-template-kwargs reasoning_effort cannot be combined with disabled thinking "
             "(--no-thinking / enable_thinking=false)");

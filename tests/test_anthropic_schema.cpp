@@ -540,14 +540,14 @@ int test_reasoning_effort() {
          std::array<std::pair<const char*, RequestedReasoningEffort>, 5>{
              {{"low", RequestedReasoningEffort::Low},
               {"medium", RequestedReasoningEffort::Medium},
-              {"high", RequestedReasoningEffort::High},
+              {"high", RequestedReasoningEffort::Medium},
               {"xhigh", RequestedReasoningEffort::XHigh},
-              {"max", RequestedReasoningEffort::Max}}}) {
+              {"max", RequestedReasoningEffort::XHigh}}}) {
         Json body                       = base;
         body["output_config"]           = Json{{"effort", wire}};
         const GenerationRequest request = parse_messages_request(body, default_limits());
         failures += check(request.reasoning_effort == expected,
-                          std::string("Anthropic did not accept protocol effort ") + wire);
+                          std::string("Anthropic did not fold effort ") + wire);
     }
 
     Json low                             = base;
@@ -561,26 +561,25 @@ int test_reasoning_effort() {
     Json high                            = base;
     high["output_config"]                = Json{{"effort", "high"}};
     const GenerationRequest high_request = parse_messages_request(high, default_limits());
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, default_server(),
-                                                         effort_capabilities());
-                      }) == "reasoning_effort_not_supported",
-                      "Anthropic high effort bypassed template capability validation");
+    const ResolvedPromptSemantics high_semantics =
+        resolve_prompt_semantics(high_request, default_server(), effort_capabilities());
+    failures += check(high_semantics.enable_thinking &&
+                          high_semantics.reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "Anthropic high effort did not fold to medium");
 
     Json conflict        = low;
     conflict["thinking"] = Json{{"type", "disabled"}};
-    const GenerationRequest conflicting_request =
-        parse_messages_request(conflict, default_limits());
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(conflicting_request, default_server(),
-                                                         effort_capabilities());
-                      }) == "conflicting_template_option",
-                      "Anthropic disabled thinking and effort were accepted together");
+    const ninfer::PromptInput conflict_prompt =
+        translate(parse_messages_request(conflict, default_limits()));
+    failures += check(!conflict_prompt.options.enable_thinking &&
+                          !conflict_prompt.options.reasoning_effort,
+                      "Anthropic disabled thinking and effort did not fall back to thinking");
 
     Json invalid             = base;
     invalid["output_config"] = Json{{"effort", "minimal"}};
-    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
-                      "Anthropic accepted an effort outside its protocol vocabulary");
+    failures += check(parse_messages_request(invalid, default_limits()).reasoning_effort ==
+                          RequestedReasoningEffort::Low,
+                      "unrecognized Anthropic effort did not fall back to low");
     invalid["output_config"] = Json{{"effort", 1}};
     failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
                       "Anthropic accepted non-string output_config.effort");

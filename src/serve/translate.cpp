@@ -115,23 +115,10 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         request.reasoning_effort ? request.reasoning_effort : server.reasoning_effort_default;
     if (!effective) { return result; }
 
-    const RequestedReasoningEffort requested = *effective;
-    const bool enables_thinking              = requested != RequestedReasoningEffort::None;
-    if (request.enable_thinking && *request.enable_thinking != enables_thinking) {
-        invalid_prompt_option("reasoning effort conflicts with enable_thinking",
-                              request.reasoning_effort_param, "conflicting_template_option");
-    }
-    result.enable_thinking = enables_thinking;
+    if (request.enable_thinking && !*request.enable_thinking) { return result; }
+    result.enable_thinking = true;
 
-    if (requested == RequestedReasoningEffort::None) {
-        if (!capabilities.enable_thinking) {
-            invalid_prompt_option("the loaded chat template cannot disable thinking",
-                                  request.reasoning_effort_param, "reasoning_effort_not_supported");
-        }
-        return result;
-    }
-
-    switch (requested) {
+    switch (*effective) {
     case RequestedReasoningEffort::Low:
         result.reasoning_effort = ninfer::ReasoningEffort::Low;
         break;
@@ -141,20 +128,11 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     case RequestedReasoningEffort::XHigh:
         result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
         break;
-    case RequestedReasoningEffort::Minimal:
-    case RequestedReasoningEffort::High:
-    case RequestedReasoningEffort::Max:
-        invalid_prompt_option("reasoning effort '" +
-                                  std::string(requested_reasoning_effort_name(requested)) +
-                                  "' is not supported by the loaded chat template",
-                              request.reasoning_effort_param, "reasoning_effort_not_supported");
-    case RequestedReasoningEffort::None:
-        break;
     }
 
     if (!capabilities.reasoning_effort.supports(*result.reasoning_effort)) {
         invalid_prompt_option("reasoning effort '" +
-                                  std::string(requested_reasoning_effort_name(requested)) +
+                                  std::string(requested_reasoning_effort_name(*effective)) +
                                   "' is not supported by the loaded chat template",
                               request.reasoning_effort_param, "reasoning_effort_not_supported");
     }

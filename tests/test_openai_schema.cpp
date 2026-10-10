@@ -240,10 +240,9 @@ int test_chat_template_kwargs_options() {
 
     Json bad_effort                    = base;
     bad_effort["chat_template_kwargs"] = Json{{"reasoning_effort", "ultra"}};
-    failures += check(throws_api([&] {
-                          (void)parse_chat_completion_request(bad_effort, default_limits());
-                      }),
-                      "invalid kwargs reasoning_effort accepted");
+    failures += check(parse_chat_completion_request(bad_effort, default_limits())
+                              .reasoning_effort == RequestedReasoningEffort::Low,
+                      "unknown kwargs reasoning_effort did not fall back to low");
     return failures;
 }
 
@@ -268,32 +267,32 @@ int test_reasoning_effort() {
     none["reasoning_effort"] = "none";
     const ninfer::PromptInput none_prompt =
         translate(parse_chat_completion_request(none, default_limits()));
-    failures += check(!none_prompt.options.enable_thinking && !none_prompt.options.reasoning_effort,
-                      "Chat Completions none effort did not disable thinking");
+    failures += check(none_prompt.options.enable_thinking &&
+                          none_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "Chat Completions none effort did not fold to low");
 
     for (const auto& [wire, expected] :
          std::array<std::pair<const char*, RequestedReasoningEffort>, 6>{
-             {{"minimal", RequestedReasoningEffort::Minimal},
+             {{"minimal", RequestedReasoningEffort::Low},
               {"medium", RequestedReasoningEffort::Medium},
-              {"high", RequestedReasoningEffort::High},
+              {"high", RequestedReasoningEffort::Medium},
               {"xhigh", RequestedReasoningEffort::XHigh},
-              {"max", RequestedReasoningEffort::Max},
-              {"none", RequestedReasoningEffort::None}}}) {
+              {"max", RequestedReasoningEffort::XHigh},
+              {"none", RequestedReasoningEffort::Low}}}) {
         Json body                = base;
         body["reasoning_effort"] = wire;
         failures += check(parse_chat_completion_request(body, default_limits()).reasoning_effort ==
                               expected,
-                          std::string("Chat Completions did not accept protocol effort ") + wire);
+                          std::string("Chat Completions did not fold effort ") + wire);
     }
 
-    Json high                            = base;
-    high["reasoning_effort"]             = "high";
-    const GenerationRequest high_request = parse_chat_completion_request(high, default_limits());
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, default_server(),
-                                                         effort_capabilities());
-                      }) == "reasoning_effort_not_supported",
-                      "protocol-valid high effort was not rejected by template capability");
+    Json high                             = base;
+    high["reasoning_effort"]              = "high";
+    const ninfer::PromptInput high_prompt =
+        translate(parse_chat_completion_request(high, default_limits()));
+    failures += check(high_prompt.options.enable_thinking &&
+                          high_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "high effort did not fold to medium");
 
     ninfer::PromptCapabilities toggle_capabilities;
     toggle_capabilities.enable_thinking = true;
@@ -305,19 +304,26 @@ int test_reasoning_effort() {
 
     Json conflict               = low;
     conflict["enable_thinking"] = false;
-    const GenerationRequest conflicting_request =
-        parse_chat_completion_request(conflict, default_limits());
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(conflicting_request, default_server(),
-                                                         effort_capabilities());
-                      }) == "conflicting_template_option",
-                      "conflicting enable_thinking and reasoning_effort were accepted");
+    const ninfer::PromptInput conflict_prompt =
+        translate(parse_chat_completion_request(conflict, default_limits()));
+    failures += check(!conflict_prompt.options.enable_thinking &&
+                          !conflict_prompt.options.reasoning_effort,
+                      "enable_thinking=false did not keep thinking off and drop the effort");
+
+    Json reverse_conflict               = none;
+    reverse_conflict["enable_thinking"] = true;
+    const ninfer::PromptInput reverse_conflict_prompt =
+        translate(parse_chat_completion_request(reverse_conflict, default_limits()));
+    failures +=
+        check(reverse_conflict_prompt.options.enable_thinking &&
+                  reverse_conflict_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
+              "reasoning_effort=none with enable_thinking=true did not follow the folded effort");
 
     Json invalid                = base;
     invalid["reasoning_effort"] = "ultra";
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(invalid, default_limits()); }),
-              "unknown Chat Completions reasoning effort was accepted");
+    failures += check(parse_chat_completion_request(invalid, default_limits()).reasoning_effort ==
+                          RequestedReasoningEffort::Low,
+                      "unknown Chat Completions reasoning effort did not fall back to low");
     invalid["reasoning_effort"] = 1;
     failures +=
         check(throws_api([&] { (void)parse_chat_completion_request(invalid, default_limits()); }),

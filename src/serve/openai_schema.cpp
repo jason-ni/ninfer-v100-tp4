@@ -490,18 +490,11 @@ std::optional<bool> openai_template_bool(const Json& body, const char* key) {
     return body.at(key).get<bool>();
 }
 
-std::optional<RequestedReasoningEffort> openai_template_effort(const Json& value, const char* param) {
+RequestedReasoningEffort openai_template_effort(const Json& value, const char* param) {
     if (!value.is_string()) {
         bad_request(std::string(param) + " must be a string or null", param);
     }
-    const std::optional<RequestedReasoningEffort> effort =
-        parse_requested_reasoning_effort(value.get<std::string>());
-    if (!effort) {
-        bad_request(std::string(param) +
-                        " must be one of none, minimal, low, medium, high, xhigh, or max",
-                    param);
-    }
-    return effort;
+    return fallback_requested_reasoning_effort(value.get<std::string>());
 }
 
 } // namespace

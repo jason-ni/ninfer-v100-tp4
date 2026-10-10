@@ -478,14 +478,8 @@ void parse_output_config(const Json& body, GenerationRequest& out) {
     if (!config.at("effort").is_string()) {
         bad_request("output_config.effort must be a string", "output_config.effort");
     }
-    const std::string value                              = config.at("effort").get<std::string>();
-    const std::optional<RequestedReasoningEffort> effort = parse_requested_reasoning_effort(value);
-    if (!effort || *effort == RequestedReasoningEffort::None ||
-        *effort == RequestedReasoningEffort::Minimal) {
-        bad_request("output_config.effort must be one of low, medium, high, xhigh, or max",
-                    "output_config.effort");
-    }
-    out.reasoning_effort       = *effort;
+    out.reasoning_effort =
+        fallback_requested_reasoning_effort(config.at("effort").get<std::string>());
     out.reasoning_effort_param = "output_config.effort";
 }
 

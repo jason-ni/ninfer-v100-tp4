@@ -155,15 +155,17 @@ artifact template's existing tool/reasoning-instruction composition.
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
 resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
 the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,
-`medium`, and `xhigh`; omitting effort uses that template's declared default. An explicit effort
-not exposed by the loaded template returns HTTP 400 with code
-`reasoning_effort_not_supported` before prompt preparation.
+`medium`, and `xhigh`; omitting effort uses that template's declared default.
 
-For Chat Completions, `reasoning_effort: "none"` disables thinking. `low`, `medium`, and `xhigh`
-select the corresponding template effort when available. The other OpenAI protocol values
-`minimal`, `high`, and `max` are parsed but rejected when the loaded template does not expose them.
-`enable_thinking` controls the same new-turn thinking switch; a contradictory combination with
-`reasoning_effort` returns `conflicting_template_option`.
+A requested reasoning effort always folds onto that vocabulary instead of rejecting the request:
+`low` keeps `low`, `medium` and `high` select `medium`, `xhigh` and `max` select `xhigh`, and
+`none`, `minimal`, an empty value, or an unrecognized value fall back to `low`. This applies to the
+Chat Completions top-level `reasoning_effort`, `chat_template_kwargs.reasoning_effort`, the
+Responses `reasoning.effort`, and Anthropic `output_config.effort`. The folded effort selects the
+corresponding template effort; an effort the loaded template does not expose still returns HTTP 400
+with code `reasoning_effort_not_supported` before prompt preparation.
+`enable_thinking` controls the new-turn thinking switch independently: when it is explicitly
+`false`, thinking stays off and the folded effort falls back to the loaded template's default.
 
 `preserve_thinking` controls whether reasoning from closed assistant turns remains in later
 prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. The
@@ -279,8 +281,8 @@ wire response contains typed `output` Items.
 | `temperature` | finite number in `[0,2]` |
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
-| `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
-| `chat_template_kwargs` | object accepting `preserve_thinking` (bool), `enable_thinking` (bool), and `reasoning_effort` (`none`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`); a `reasoning_effort` here only applies when `reasoning.effort` is absent; any other non-null key returns `chat_template_option_not_supported` |
+| `reasoning.effort` | folds onto the loaded template's effort vocabulary (`none`/`minimal`/`low`/empty/unrecognized -> `low`, `high`/`medium` -> `medium`, `max`/`xhigh` -> `xhigh`); an effort the loaded template does not expose returns `reasoning_effort_not_supported` |
+| `chat_template_kwargs` | object accepting `preserve_thinking` (bool), `enable_thinking` (bool), and `reasoning_effort` (`none`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`, folded like `reasoning.effort`); a `reasoning_effort` here only applies when `reasoning.effort` is absent; any other non-null key returns `chat_template_option_not_supported` |
 | `preserve_thinking` | top-level alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
 | `tools` | flat Responses function definitions; see below |
@@ -485,9 +487,10 @@ The independent top-level `preserve_thinking` boolean controls closed-turn histo
 uses the server default.
 
 Anthropic `output_config.effort` accepts the protocol values `low`, `medium`, `high`, `xhigh`, and
-`max`. The value is then checked against the loaded chat template in the same way as the OpenAI
-endpoints; the registered effort-capable template exposes `low`, `medium`, and `xhigh`. Combining
-an effort with `thinking.type: "disabled"` is rejected as contradictory.
+`max` and folds them onto the loaded template's vocabulary like the OpenAI endpoints
+(`high` -> `medium`, `max` -> `xhigh`, anything else -> `low`); the registered effort-capable
+template exposes `low`, `medium`, and `xhigh`. An explicit `thinking.type: "disabled"` keeps
+thinking off and drops the effort.
 
 Anthropic's `model` field is treated as a response label and does not select the loaded artifact.
 
@@ -555,7 +558,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--host-cache-mib N` | pinned host RAM for the prefix-cache pool; only used with `--prefix-cache`; `0` is device-only | `0` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
-| `--chat-template-kwargs JSON` | default chat-template options as a JSON object; supported keys are `preserve_thinking` (bool), `enable_thinking` (bool), and `reasoning_effort` (`none`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`); it overrides `--no-thinking`/`--preserve-thinking` for the keys it names, and requests can still override each field | unset |
+| `--chat-template-kwargs JSON` | default chat-template options as a JSON object; supported keys are `preserve_thinking` (bool), `enable_thinking` (bool), and `reasoning_effort` (`none`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`, folded onto `low`\|`medium`\|`xhigh` like the request field); it overrides `--no-thinking`/`--preserve-thinking` for the keys it names, and requests can still override each field; a default effort combined with disabled thinking is a startup error | unset |
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |

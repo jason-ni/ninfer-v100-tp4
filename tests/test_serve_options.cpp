@@ -202,8 +202,14 @@ int main() {
     const ServeOptions template_none = parse(
         {"ninfer-serve", "model.ninfer",
          "--chat-template-kwargs", R"({"reasoning_effort": "none"})"});
-    failures += check(template_none.reasoning_effort_default == RequestedReasoningEffort::None,
-                      "--chat-template-kwargs reasoning_effort=none did not resolve to None");
+    failures += check(template_none.reasoning_effort_default == RequestedReasoningEffort::Low,
+                      "--chat-template-kwargs reasoning_effort=none did not fold to low");
+
+    const ServeOptions template_high = parse(
+        {"ninfer-serve", "model.ninfer",
+         "--chat-template-kwargs", R"({"reasoning_effort": "high"})"});
+    failures += check(template_high.reasoning_effort_default == RequestedReasoningEffort::Medium,
+                      "--chat-template-kwargs reasoning_effort=high did not fold to medium");
 
     bool unknown_key_rejected = false;
     try {
