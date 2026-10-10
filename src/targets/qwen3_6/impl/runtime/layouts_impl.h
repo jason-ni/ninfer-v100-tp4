@@ -127,6 +127,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
         checked_i32(static_cast<std::uint64_t>(physical_pages) + mtp_extra_pages,
                     "MTP Paged KV physical pages exceed int32"));
+    // The L2/M3 mixed unit's flat stream capacity. Ordinary mixed rows are one token wide; the M3
+    // MTP mixed unit's speculative rows are a uniform verify slab of `draft_window + 1` columns.
+    // DFlash is a separate (not yet wired) slab form and keeps the frame off.
+    std::uint32_t mixed_token_capacity = 0U;
+    if (plan.max_concurrency >= 2 && !plan.features.dflash()) {
+        const std::uint32_t width = plan.features.mtp() ? plan.draft_window + 1U : 1U;
+        mixed_token_capacity =
+            static_cast<std::uint32_t>(effective_prefill_chunk) + plan.max_concurrency * width;
+    }
     LayoutBuilder builder;
     PersistentLayout out;
     out.decoder = qwen3_6::plan_decoder_state(
@@ -226,12 +235,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .output_rows    = TextConfig::output_rows,
                      .batch_capacity = plan.max_concurrency,
                      .draft_window   = plan.draft_window,
-                     .mixed_token_capacity =
-                         (!plan.features.mtp() && !plan.features.dflash() &&
-                          plan.max_concurrency >= 2)
-                             ? static_cast<std::uint32_t>(effective_prefill_chunk) +
-                                   plan.max_concurrency
-                             : 0U,
+                     .mixed_token_capacity = mixed_token_capacity,
                      .enable_mtp     = plan.features.mtp(),
                      .enable_dflash  = plan.features.dflash()});
     out.prefill_hidden = add_tensor(
@@ -360,8 +364,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     // projection. Each half's scratch is therefore planned in its own nested scope, under the
     // stage that keeps the flat projections alive, exactly as the execution nests `work_.scope()`.
     const auto mixed_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
-                                std::int32_t last, std::int32_t decode_rows) {
-        const std::int32_t prefill_cols = last - decode_rows;
+                                std::int32_t last, std::int32_t decode_rows,
+                                std::int32_t decode_width, GdnWorkspacePath path) {
+        const std::int32_t decode_cols  = decode_rows * decode_width;
+        const std::int32_t prefill_cols = last - decode_cols;
         {
             auto stage = layout.scope();
             (void)workspace_recipe::text_attention_projection<TextConfig>(layout, last);
@@ -372,7 +378,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 auto half = layout.scope();
                 scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                                     TextConfig::query_heads, plan.kv_dtype, text_envelope,
-                                    decode_rows, 1, 1));
+                                    decode_rows, decode_width, decode_width));
             }
             {
                 auto half = layout.scope();
@@ -391,9 +397,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             (void)workspace_recipe::gdn_projection<TextConfig>(layout, last);
             {
                 auto half = layout.scope();
-                scratch(layout, Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
-                                    plan.weights_profile, qwen3_6::TextPhase::Verify, decode_rows,
-                                    1, 1));
+                if (path == GdnWorkspacePath::ReplayRecord) {
+                    scratch(layout,
+                            Variant::gdn_input_projection_record_workspace_capacity_bytes(
+                                plan.weights_profile, qwen3_6::TextPhase::Verify, decode_rows,
+                                decode_width, decode_width));
+                } else {
+                    scratch(layout,
+                            Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
+                                plan.weights_profile, qwen3_6::TextPhase::Verify, decode_rows, 1,
+                                1));
+                }
             }
             {
                 auto half = layout.scope();
@@ -546,7 +560,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         WorkspaceLayoutBuilder mixed;
         text_common_root(mixed, mixed_tokens);
         tp_call_roots(mixed, mixed_tokens, static_cast<std::int32_t>(plan.max_concurrency));
-        mixed_body(mixed, 1, mixed_tokens, static_cast<std::int32_t>(plan.max_concurrency));
+        mixed_body(mixed, 1, mixed_tokens, static_cast<std::int32_t>(plan.max_concurrency), 1,
+                   GdnWorkspacePath::Snapshot);
         scratch(mixed, ops::sampling_workspace_capacity_bytes(
                            TextConfig::token_domain,
                            static_cast<std::int32_t>(plan.max_concurrency),
@@ -628,6 +643,28 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     TextConfig::token_domain, drafts, drafts, batch, batch);
             out.mtp_round = std::max({out.mtp_round, finish(target), finish(alignment), finish(ar),
                                       finish(proposal), batch_accept});
+        }
+
+        if (plan.max_concurrency >= 2) {
+            // M3 mixed MTP unit: one flat stream of T = B*verify + prefill chunk columns, where the
+            // B speculative rows form a uniform verify slab at the batched ops' own qualified width
+            // and the owner contributes the chunk. The T-dependent projection/results/control
+            // buffers span the whole stream; the slab half plans the verify record scratch and the
+            // owner half the prefill conv scratch, each in its own nested scope.
+            const std::int32_t mtp_mixed_tokens =
+                chunk + static_cast<std::int32_t>(plan.max_concurrency) * verify;
+            WorkspaceLayoutBuilder mtp_mixed;
+            text_common_root(mtp_mixed, mtp_mixed_tokens);
+            tp_call_roots(mtp_mixed, mtp_mixed_tokens,
+                          static_cast<std::int32_t>(plan.max_concurrency) * verify);
+            mixed_body(mtp_mixed, 1, mtp_mixed_tokens,
+                       static_cast<std::int32_t>(plan.max_concurrency), verify,
+                       GdnWorkspacePath::ReplayRecord);
+            scratch(mtp_mixed, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                                   TextConfig::token_domain, drafts, drafts,
+                                   static_cast<std::int32_t>(plan.max_concurrency),
+                                   static_cast<std::int32_t>(plan.max_concurrency)));
+            out.mtp_mixed_round = finish(mtp_mixed);
         }
     }
 
@@ -721,8 +758,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     out.capacity = std::max({out.text_prefill, out.ordinary_round, out.mixed_round, out.mtp_prefill,
-                             out.mtp_round, out.dflash_context, out.dflash_round,
-                             out.vision_encode});
+                             out.mtp_round, out.mtp_mixed_round, out.dflash_context,
+                             out.dflash_round, out.vision_encode});
     return out;
 }
 

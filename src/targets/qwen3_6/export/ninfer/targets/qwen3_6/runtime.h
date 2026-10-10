@@ -174,6 +174,11 @@ public:
     decode_mixed_batch(std::span<const std::uint32_t> lanes,
                        std::span<const runtime::RoundBudget> budgets, std::uint32_t owner_lane);
     [[nodiscard]] bool supports_mixed_unit() const noexcept;
+    // Whether the staged prefill owner's NEXT chunk may be folded into a mixed unit. The M3 mixed
+    // MTP unit handles only strictly non-tail chunks: the owner's final chunk (and any chunk that
+    // still owes an MTP bridge) runs the standalone prefill step so the MTP draft seeding is not
+    // skipped. Always true for the ordinary backend.
+    [[nodiscard]] bool mixed_owner_eligible(std::uint32_t lane) const noexcept;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,

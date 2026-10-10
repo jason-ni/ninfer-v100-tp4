@@ -6,6 +6,66 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
+// The acceptance half of a speculative target verify. The target forward has already produced
+// `frame.target_hidden` / `target_logits` / `target_tokens` -- either through the dedicated verify
+// traversal (`target_verify_accept`, below) or through the L2 mixed shared pass (M3), which runs
+// the target verify slab in the same flat pass as a prefill owner. This settles the drafts into
+// licensed tokens and publishes the accepted hidden; it performs no forward.
+void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
+                   TargetVerifyFrameView frame, bool greedy_target) {
+    if (greedy_target) {
+        ops::speculative_accept_greedy_tokens(
+            frame.target_tokens, frame.drafts, frame.current_extents, frame.frontiers,
+            frame.anchors, frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
+            TextConfig::token_domain, frame.sampling, execution.device.stream);
+    } else {
+        ops::speculative_accept_greedy_drafts(
+            frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
+            frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
+            frame.accepted_drafts, TextConfig::token_domain, frame.sampling, execution.work,
+            execution.device.stream);
+    }
+    ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
+                                            frame.selected_hidden, execution.device.stream);
+    ops::scatter(frame.selected_hidden, frame.lanes, continuation_hidden_store,
+                 execution.device.stream);
+}
+
+// tp >= 2 form. The acceptance arithmetic is replicated on every rank rather than transferred,
+// because every one of its inputs is either the shared ingress or the gathered logits, which are
+// bit-identical on every rank. The continuation-hidden scatter stays on rank 0 alone.
+void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
+                   TargetVerifyFrameView frame,
+                   std::array<TargetVerifyFrameView, kMaximumDevices> peer, bool greedy_target) {
+    const ExecutionContext& ec = *execution.peers[1]->execution;
+    std::array<WorkspaceArena*, kMaximumDevices> work{};
+    std::array<TargetVerifyFrameView*, kMaximumDevices> views{};
+    for (int rank = 0; rank < execution.tp; ++rank) {
+        work[rank]  = rank == 0 ? &execution.work : execution.peers[rank]->work;
+        views[rank] = rank == 0 ? &frame : &peer[rank];
+    }
+    for_each_rank(ec, [&](int rank) {
+        const auto r              = static_cast<std::size_t>(rank);
+        TargetVerifyFrameView& v  = *views[r];
+        cudaStream_t stream       = ec.dev[rank]->stream;
+        if (greedy_target) {
+            ops::speculative_accept_greedy_tokens(
+                v.target_tokens, v.drafts, v.current_extents, v.frontiers, v.anchors,
+                v.licensed_tokens, v.licensed_counts, v.accepted_drafts, TextConfig::token_domain,
+                v.sampling, stream);
+        } else {
+            ops::speculative_accept_greedy_drafts(
+                v.target_tokens, v.target_logits, v.drafts, v.current_extents, v.frontiers,
+                v.anchors, v.licensed_tokens, v.licensed_counts, v.accepted_drafts,
+                TextConfig::token_domain, v.sampling, *work[r], stream);
+        }
+        ops::speculative_select_accepted_hidden(v.target_hidden, v.accepted_drafts,
+                                                v.selected_hidden, stream);
+    });
+    ops::scatter(frame.selected_hidden, frame.lanes, continuation_hidden_store,
+                 execution.device.stream);
+}
+
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::GqaExecutionEnvelope envelope, bool greedy_target) {
@@ -24,22 +84,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  frame.target_hidden, frame.target_logits, frame.target_tokens,
                                  greedy_target);
     }
-    if (greedy_target) {
-        ops::speculative_accept_greedy_tokens(
-            frame.target_tokens, frame.drafts, frame.current_extents, frame.frontiers,
-            frame.anchors, frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
-            TextConfig::token_domain, frame.sampling, execution.device.stream);
-    } else {
-        ops::speculative_accept_greedy_drafts(
-            frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
-            frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
-            frame.accepted_drafts, TextConfig::token_domain, frame.sampling, execution.work,
-            execution.device.stream);
-    }
-    ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
-                                            frame.selected_hidden, execution.device.stream);
-    ops::scatter(frame.selected_hidden, frame.lanes, continuation_hidden_store,
-                 execution.device.stream);
+    target_accept(execution, continuation_hidden_store, frame, greedy_target);
 }
 
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
@@ -93,33 +138,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  greedy_target);
     }
 
-    const ExecutionContext& ec = *execution.peers[1]->execution;
-    std::array<WorkspaceArena*, kMaximumDevices> work{};
-    std::array<TargetVerifyFrameView*, kMaximumDevices> views{};
-    for (int rank = 0; rank < execution.tp; ++rank) {
-        work[rank]  = rank == 0 ? &execution.work : execution.peers[rank]->work;
-        views[rank] = rank == 0 ? &frame : &peer[rank];
-    }
-    for_each_rank(ec, [&](int rank) {
-        const auto r              = static_cast<std::size_t>(rank);
-        TargetVerifyFrameView& v  = *views[r];
-        cudaStream_t stream       = ec.dev[rank]->stream;
-        if (greedy_target) {
-            ops::speculative_accept_greedy_tokens(
-                v.target_tokens, v.drafts, v.current_extents, v.frontiers, v.anchors,
-                v.licensed_tokens, v.licensed_counts, v.accepted_drafts, TextConfig::token_domain,
-                v.sampling, stream);
-        } else {
-            ops::speculative_accept_greedy_drafts(
-                v.target_tokens, v.target_logits, v.drafts, v.current_extents, v.frontiers,
-                v.anchors, v.licensed_tokens, v.licensed_counts, v.accepted_drafts,
-                TextConfig::token_domain, v.sampling, *work[r], stream);
-        }
-        ops::speculative_select_accepted_hidden(v.target_hidden, v.accepted_drafts,
-                                                v.selected_hidden, stream);
-    });
-    ops::scatter(frame.selected_hidden, frame.lanes, continuation_hidden_store,
-                 execution.device.stream);
+    target_accept(execution, continuation_hidden_store, frame, peer, greedy_target);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

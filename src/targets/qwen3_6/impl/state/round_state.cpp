@@ -233,6 +233,26 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                                               "MTP decode autoregressive rope positions");
         decode.ar_valid_columns  = add_tensor(builder, DType::I32, {batch, ar_steps},
                                               "MTP decode autoregressive valid columns");
+        if (layout.spec.mixed_token_capacity > 0) {
+            MtpMixedStateLayout& mx = decode.mixed.emplace();
+            mx.control = builder.add(sizeof(MtpMixedControl), kArenaAlign, "MTP mixed control");
+            const auto tokens = checked_i32(layout.spec.mixed_token_capacity,
+                                            "MTP mixed token capacity exceeds int32");
+            mx.ids = add_tensor(builder, DType::I32, {tokens}, "MTP mixed ids");
+            mx.cache_positions =
+                add_tensor(builder, DType::I32, {tokens}, "MTP mixed cache positions");
+            mx.rope_positions =
+                add_tensor(builder, DType::I32, {tokens}, "MTP mixed rope positions");
+            mx.owner_kv_table_row =
+                add_tensor(builder, DType::I32, {1}, "MTP mixed owner KV row");
+            mx.owner_tail_hidden = add_tensor(builder, DType::BF16, {layout.spec.hidden, 1},
+                                              "MTP mixed owner tail hidden");
+            mx.owner_bonus_logits =
+                add_tensor(builder, DType::BF16, {layout.spec.output_rows, 1},
+                           "MTP mixed owner bonus logits");
+            mx.owner_bonus_token =
+                add_tensor(builder, DType::I32, {1}, "MTP mixed owner bonus token");
+        }
     }
     if (layout.spec.enable_dflash) {
         layout.dflash_prefill.emplace().produced_count = i32(1, "DFlash prefill produced count");
@@ -277,7 +297,8 @@ DFlashPrefillState::DFlashPrefillState(DeviceSpan backing, const DFlashPrefillSt
     : produced_count(layout.produced_count.bind(backing)) {}
 
 MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
-                               std::uint32_t batch_capacity, std::uint32_t draft_window) {
+                               std::uint32_t batch_capacity, std::uint32_t draft_window,
+                               std::uint32_t mixed_token_capacity) {
     if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency || draft_window == 0 ||
         draft_window > kMtpDecodeMaximumDrafts) {
         throw std::invalid_argument("MTP decode state dimensions are outside the supported domain");
@@ -345,6 +366,37 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     ar_valid_columns           = layout.ar_valid_columns.bind(backing);
     if (ar_positions.ne[0] != batch || ar_positions.ne[1] != steps) {
         throw std::logic_error("MTP decode AR layout does not match its configured dimensions");
+    }
+    if (layout.mixed) {
+        if (mixed_token_capacity == 0) {
+            throw std::logic_error("MTP decode mixed layout requires a token capacity");
+        }
+        mixed.emplace(backing, *layout.mixed, mixed_token_capacity);
+    }
+}
+
+MtpDecodeState::MixedState::MixedState(DeviceSpan backing, const MtpMixedStateLayout& layout,
+                                       std::uint32_t token_capacity) {
+    if (token_capacity == 0) {
+        throw std::invalid_argument("MTP mixed state requires a token capacity");
+    }
+    static_assert(std::is_standard_layout_v<MtpMixedControl>);
+    control          = layout.control.bind(backing);
+    ids              = layout.ids.bind(backing);
+    positions        = layout.cache_positions.bind(backing);
+    rope_positions   = layout.rope_positions.bind(backing);
+    owner_kv_table_row = layout.owner_kv_table_row.bind(backing);
+    owner_tail_hidden  = layout.owner_tail_hidden.bind(backing);
+    owner_bonus_logits = layout.owner_bonus_logits.bind(backing);
+    owner_bonus_token  = layout.owner_bonus_token.bind(backing);
+    owner_sampling     = reinterpret_cast<const ops::SamplingConfig*>(
+        static_cast<const unsigned char*>(control.data) +
+        offsetof(MtpMixedControl, prefill_sampling));
+    bonus_position = Tensor(static_cast<unsigned char*>(control.data) +
+                                offsetof(MtpMixedControl, prefill_bonus_position),
+                            DType::I32, {1});
+    if (ids.ne[0] != static_cast<std::int32_t>(token_capacity)) {
+        throw std::logic_error("MTP mixed layout does not match its configured dimensions");
     }
 }
 
@@ -421,7 +473,7 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (layout.dflash_prefill) { dflash_prefill.emplace(backing, *layout.dflash_prefill); }
     if (layout.mtp_decode) {
         mtp_decode.emplace(backing, *layout.mtp_decode, layout.spec.batch_capacity,
-                           layout.spec.draft_window);
+                           layout.spec.draft_window, layout.spec.mixed_token_capacity);
     }
     if (layout.dflash_decode) {
         dflash_decode.emplace(backing, *layout.dflash_decode, layout.spec.batch_capacity,

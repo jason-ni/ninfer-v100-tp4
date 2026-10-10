@@ -767,20 +767,31 @@ Scheduler 只提交三类 GPU work：
 ```text
 PrefillChunk(request)
 DecodeRound(all decode-ready requests)
-MixedUnit(all decode-ready requests + one prefill owner chunk)   // ordinary backend, C >= 2
+MixedUnit(all decode-ready requests + one prefill owner chunk)   // ordinary or MTP backend, C >= 2
 ```
 
 完整 request 不是 scheduling unit。所有 GPU work 在一条 execution lane 上串行执行。
 
-MixedUnit 是 L2 mixed forward 的调度形态（`docs/maintainer/l2-varlen-mixed-forward-plan.md`）：
-当一个 prefill owner 存在、decode membership 非空、且该 Program 规划了 mixed frame（ordinary
-backend 且 `max_concurrency >= 2`）时，boundary 用一个 MixedUnit 取代一轮
-`DecodeRound -> PrefillChunk`。它在一个 flat `[hidden, B + c]` eager pass 上同时执行 B 个 decode
-rows 和 owner 的下一个 chunk（`TextPhase::Mixed`，逐 mixer 子批分派）；decode half 按
-DecodeRound 语义 resolve，owner half 按 PrefillChunk 语义 resolve，§2.5 的 one-owner 不变式
-（一个 MixedUnit 最多携带一个 owner，其 chunk 仍受 §6.2 entitlement 约束，且仍是 latency-bounded
-unit）不变。MixedUnit 从不 graph-capture；纯 decode rounds 仍使用其 exact-B graphs。MTP/DFlash
-backend 与 Vision prefill 暂不进入 mixed frame。
+MixedUnit 是 L2/M3 mixed forward 的调度形态（`docs/maintainer/l2-varlen-mixed-forward-plan.md`）：
+当一个 prefill owner 存在、decode membership 非空、且该 Program 规划了 mixed frame
+（ordinary 或 MTP backend 且 `max_concurrency >= 2`）时，boundary 用一个 MixedUnit 取代一轮
+`DecodeRound -> PrefillChunk`。它在一个 eager flat pass 上同时执行 decode half 和 owner 的下一个
+chunk（`TextPhase::Mixed`，逐 mixer 子批分派）；decode half 按 DecodeRound 语义 resolve，owner half
+按 PrefillChunk 语义 resolve，§2.5 的 one-owner 不变式（一个 MixedUnit 最多携带一个 owner，其 chunk
+仍受 §6.2 entitlement 约束，且仍是 latency-bounded unit）不变。MixedUnit 从不 graph-capture；纯
+decode rounds 仍使用其 exact-B graphs。
+
+MixedUnit 有两个 backend 形态：
+
+- **ordinary**（M1）：decode half 是 B 个单 token rows，owner 是下一个 chunk；flat stream 为
+  `[hidden, B + c]`。
+- **MTP**（M3）：decode half 是 speculative verify slab（B 行 × `draft_width` 列的 uniform 窗口，
+  逐行 `valid_columns`，与 isolated `Phase::Verify` 完全相同的 op 调用），owner 是下一个 chunk；
+  flat stream 为 `[hidden, B·width + c]`。shared pass 后按 MTP 语义运行 accept/alignment/proposal
+  结算；owner chunk 收尾时在 unit 内采样 bonus token 并运行 owner MTP alignment（draft seeding）。仅
+  复用后缀的 `BeforeSuffix` bridge（后缀首个 chunk）仍走 standalone prefill step。
+
+DFlash backend 与 Vision prefill 暂不进入 mixed frame。
 
 Model Runtime 拥有一份地址稳定的 shared workspace，由串行的 GPU units 复用，不按 request
 复制。Prefill owner 可在 Vision/Text phases 及多个 chunks 之间持有一份 request-transient lease；
@@ -822,11 +833,11 @@ else:
     remain idle
 ```
 
-因此 decode 和 prefill 同时持续 runnable 时（ordinary backend、`C >= 2`）：
+因此 decode 和 prefill 同时持续 runnable 时（ordinary 或 MTP backend、`C >= 2`）：
 
 ```text
-MixedUnit -> MixedUnit -> ...           # mixed frame planned
-DecodeRound -> PrefillChunk -> ...      # no mixed frame (MTP/DFlash backend or C == 1)
+MixedUnit -> MixedUnit -> ...           # mixed frame planned (ordinary, or MTP with a bridge-free owner chunk)
+DecodeRound -> PrefillChunk -> ...      # no mixed frame (DFlash backend, C == 1, or MTP reused-suffix bridge chunk)
 ```
 
 没有 decode-ready request 时，prefill chunks 连续执行；没有 prefill owner 时，decode rounds 连续执行。

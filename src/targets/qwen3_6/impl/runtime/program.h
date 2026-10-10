@@ -306,10 +306,14 @@ public:
     [[nodiscard]] runtime::MixedBatchResult
     decode_mixed_batch(std::span<const std::uint32_t> lanes,
                        std::span<const runtime::RoundBudget> budgets, std::uint32_t owner_lane);
-    // True iff this Program planned the L2 mixed frame (ordinary backend, concurrency >= 2).
+    // True iff this Program planned the L2 mixed frame (ordinary backend, concurrency >= 2) or the
+    // M3 mixed MTP frame (MTP backend, concurrency >= 2).
     [[nodiscard]] bool supports_mixed_unit() const noexcept {
-        return io.ordinary.has_value() && io.ordinary->mixed.has_value();
+        if (io.ordinary) { return io.ordinary->mixed.has_value(); }
+        if (io.mtp_decode) { return io.mtp_decode->mixed.has_value(); }
+        return false;
     }
+    [[nodiscard]] bool mixed_owner_eligible(std::uint32_t lane) const noexcept;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,
@@ -459,6 +463,14 @@ public:
     std::vector<std::int32_t> mixed_host_decode_linear_slots;
     qwen3_6::OrdinaryDecodeEgress mixed_host_egress;
     std::int32_t mixed_host_bonus_token = 0;
+    // M3 mixed MTP unit host staging. The speculative slab's in/out records reuse the MTP ingress/
+    // egress; only the prefill owner carries extra staging here (its control block, its flat chunk
+    // tokens/positions/rope, and the sampled bonus token).
+    qwen3_6::MtpMixedControl mtp_mixed_host_control;
+    std::vector<std::int32_t> mtp_mixed_host_owner_tokens;
+    std::vector<std::int32_t> mtp_mixed_host_owner_positions;
+    std::vector<std::int32_t> mtp_mixed_host_owner_rope_positions;
+    std::int32_t mtp_mixed_host_owner_bonus_token = 0;
     // Each peer rank's own pinned ordinary ingress: rank 0's record with every row's
     // `sampling[row].token_counts` nulled. A peer mirrors the ordinary round for its shard of the
     // weights and never samples (the output head is vocabulary-split and sampling belongs to rank
@@ -611,6 +623,12 @@ private:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets);
+    // M3: the speculative decode lanes run as one uniform verify slab in the same flat pass as the
+    // staged prefill owner's next chunk.
+    [[nodiscard]] runtime::MixedBatchResult
+    decode_mixed_mtp_batch(std::span<const std::uint32_t> lanes,
+                           std::span<const runtime::RoundBudget> budgets,
+                           std::uint32_t owner_lane);
     void reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
                              std::uint32_t backend_pages);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,

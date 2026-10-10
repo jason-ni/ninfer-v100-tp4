@@ -14,12 +14,26 @@ fused kernels would replace at ~3.4% (GDN recurrence 2.5%, all GQA attention rou
 fusing the two sub-batch dispatches into one launch each can only remove launch overhead (<0.5%
 end to end) while reintroducing the §11.1 conv-parity risk — the dominant cost is weight
 dequantization + GEMM + collectives. M2 (prefix/retained-hit) is delivered (see §9). **L2 is closed
-here:** M3 (MTP/DFlash coexistence) and M5 (Vision) are deliberately not pursued. M3 reduces to a
-`MixedMtpUnit` that runs the MTP verify batch and the owner prefill as two separate passes (the
-append-only MTP verify domain is `T ≤ 16`, so it cannot share the flat stream with a prefill chunk
-without the dropped varlen kernels), sharing no linears and so interleaving only; it is a ~2-week
-architectural addition that does not touch the single-request acceptance (which never mixes). M5 is
-a similar-scale capability for the NVFP4/groupwise identities only.
+here:** M3 (MTP/DFlash coexistence) and M5 (Vision) are deliberately not pursued inside L2. M3 is a
+`MixedMtpUnit` that places the speculative verify slab (uniform width `W_max` at or below the batched
+ops' qualified bound, per-row `valid_columns`) and the owner's prefill slab in the same flat stream
+as ONE shared forward: the linear leaves (weight dequantization + GEMM) run once over
+`W·B + c`, and the mixers dispatch per slab to the existing ops — the MTP slab is the exact batched
+verify / replay-record invocation of an isolated MTP round, the prefill slab the exact prefill ops
+of an isolated chunk. The dropped varlen kernels are only the mechanism for a general per-row-
+arbitrary-length stream; the uniform-slab form needs no new kernel. The previously recorded
+"two separate passes, sharing no linears" stopgap is superseded by this: it keeps two full weight
+dequantization/read passes over the mixed unit and therefore forfeits the sharing payoff. M3's
+remaining work is frame/transaction wiring plus the M1/M2-style identity gate, ~2 weeks; it does not
+touch the single-request acceptance (which never mixes) and only pays while ≥2 requests are active
+with overlapping prefill/decode phases. M5 is a similar-scale capability for the NVFP4/groupwise
+identities only. **M3 is delivered** (2026-10-11): the mixed MTP unit folds the speculative verify
+slab and the owner's next chunk into one shared flat pass, dispatches the mixers per slab, and runs
+the MTP accept/alignment/proposal pipeline over the slab afterward; when the owner chunk finalizes,
+the unit also samples the owner's bonus token and runs the owner's MTP alignment (draft seeding)
+inside the unit. Only the reused-suffix `BeforeSuffix` bridge still requires the standalone step.
+Gate: `ninfer_qwen3_8_27b_v100x2_mtp_mixed_real_test` (TP2, NVFP4) — a single-chunk (finalize-only)
+owner and a multi-chunk owner each match their isolated MTP run.
 Scope: the Qwen3.6-family hybrid text path (GQA full-attention + GDN linear-attention) at
 `src/targets/qwen3_6`, targeting the V100X2 acceptance workload. 27B/35B-A3B peer variants share
 the design; only the 27B Q4_K_M artifact is required to land the acceptance claim.
@@ -55,8 +69,8 @@ Decisions:
    isolated prefill/decode result to the same per-request FP32/FP64/GQA/GDN oracle; mixing changes
    batching, not math. The prefill row's GDN conv+recurrence over `c` tokens is verified byte-
    parity against the isolated `Phase::Prefill` GDN, not only the oracle (decision 12).
-7. **Backend is fixed at startup** (ordinary / MTP / DFlash). M1 lands ordinary; M3 reuses the
-   same varlen substrate to coexist the one prefill row with speculative decode rows (decision 14).
+7. **Backend is fixed at startup** (ordinary / MTP / DFlash). M1 lands ordinary; M3 coexists the one
+   prefill row with speculative decode rows in the same flat stream (decision 14).
 8. **The paged KV substrate is not reworked.** Per-sequence non-contiguous blocks + per-row
    block-table selection already exist (`src/core/paged_kv_cache.h:42`, `PagedKVBatchLayerView.
    block_tables`); L2 only adds a per-token `seq_id` and per-row write-address plumbing at the
@@ -238,10 +252,14 @@ indices are device data published per round; no host per-row kernel loop; one wh
     decode-only graph path: the decode-only round never reads the varlen frame, so the frame
     backing can be a separate region and the graph's `OrdinaryDecodeIngress`/`Egress` layout is
     byte-identical to today (no decode regression).
-14. M3 generalizes the *same* varlen substrate so a speculative (MTP/DFlash) decode row has
-    `query_len = draft+1` in the same flat stream; L2's `Mixed` phase is the general ragged
-    batch, and `Phase::Verify` for speculative verify *coexists* (reused where the prefill row's
-    `query_len>1` path and decode rows' `query_len=1` path overlap the prefill/decode kernels).
+14. M3 places the speculative (MTP/DFlash) decode rows in the same flat stream as the prefill owner,
+    as a **uniform verify slab**: every row has `query_len = draft+1 ≤ W_max`, masked by per-row
+    `valid_columns` exactly as `Phase::Verify` runs today, so the slab sits inside the existing
+    batched ops' qualified domain and the mixers dispatch per slab, as M1 does — no new kernel. The
+    dropped varlen kernels are the mechanism for the general per-row-arbitrary-length stream only.
+    `Phase::Verify`'s argmax licensing / replay-record machinery is unchanged and runs
+    **after** the shared pass (its inputs — the slab's target logits — come out of that pass),
+    settling only the speculative rows' state.
 
 ---
 
@@ -299,8 +317,10 @@ hidden is published per decode lane exactly as `decode_impl.h:70` does today.
 ## 6. Per-component design
 
 The varlen op shapes in §6.1/§6.2 are the original M1f design; they are **not built** (M1f dropped,
-§9). They are retained as the ragged substrate M3 would generalize (decision 14). M1 instead
-dispatches the existing ops per sub-batch (§6.5).
+§9). M1 instead dispatches the existing ops per sub-batch (§6.5). M3 (decision 14) follows the same
+pattern with the speculative rows as a uniform verify slab and likewise needs no new kernel; the
+varlen kernels remain the only (unbuilt) mechanism for a general flat stream whose per-row query
+lengths are arbitrary.
 
 ### 6.1 Varlen GQA op
 
@@ -436,13 +456,13 @@ with no decode regression.
   3139` `final_candidate`). Non-final chunks produce no bonus and the owner keeps ownership for
   its next chunk.
 - **Relation to `Phase::Verify` (MTP/DFlash)**: L2 does **not** subsume speculative verify.
-  `Phase::Verify` (MTP/DFlash target verify, `target_verify_batch_impl` `:785`, uniform-W +
-  `valid_columns` + argmax licensing over the draft window + replay records,
-  `gated_delta_net_replay_record`) is a distinct math (draft acceptance, not autoregressive
-  decode). The two **coexist**: a mixed round has B speculative rows (`query_len = draft+1`,
-  M3) + one prefill row; the varlen `Mixed` substrate generalizes the decode half of Verify, but
-  the argmax-licensing/replay machinery stays on the Verify path. M1/M2 (ordinary) never touch
-  Verify.
+  `Phase::Verify` (MTP/DFlash target verify, uniform-W + `valid_columns` + argmax licensing over the
+  draft window + replay records, `gated_delta_net_replay_record`) is a distinct math (draft
+  acceptance, not autoregressive decode). The two **coexist**: the M3 mixed round carries the
+  speculative rows as one uniform verify slab (`query_len = draft+1`, width `W_max`, per-row
+  `valid_columns`) plus one prefill row in ONE shared flat pass — linears run once over
+  `W·B + c`, mixers dispatch per slab (decision 14); the argmax-licensing / replay-record machinery
+  is unchanged and settles the speculative rows after the pass. M1/M2 (ordinary) never touch Verify.
 
 ### 6.6 Sampling
 
@@ -614,11 +634,30 @@ on measured evidence (§9 M1f).
   single-lane reused control exactly (24/24); the same test fails when the base double-count is
   restored. Along the way the delivered `prefix_tap_slots.reserve()` (no clear) stale-slot bug in
   the hybrid prefix cache was fixed — a retained lane kept a consumed `kInvalidSlot` at index 0.
-- **M3 — MTP/DFlash coexistence.** *Not pursued* (see the status header): a `MixedMtpUnit` that runs
-  the MTP verify batch plus the owner prefill as two passes, sharing no linears, for a ~2-week cost
-  and no effect on the single-request acceptance. Original scope was a speculative decode row
-  (`query_len = draft+1`) sharing the flat stream with the prefill owner, argmax-licensing/replay
-  staying on the Verify path (decision 14).
+- **M3 — MTP/DFlash coexistence.** *Delivered* (2026-10-11, TP2). A `MixedMtpUnit` sharing the
+  flat pass: the speculative rows as one uniform verify slab (`query_len = draft+1`, `W_max` at or
+  below the batched ops' qualified bound, per-row `valid_columns`, the exact same op invocation as
+  an isolated verify) plus the owner's prefill slab, with the linear leaves (weight dequantization +
+  GEMM) running once over `W·B + c`; the argmax-licensing / replay-record machinery stays on the
+  Verify semantics after the pass (decision 14). **No new kernel** — the previously recorded "two
+  separate passes, sharing no linears" stopgap (interleaving only) is superseded by the shared-slab
+  form, because the stopgap keeps two full weight dequantization/read passes over the mixed unit and
+  forfeits the sharing payoff. Delivered as: the `MtpDecodeState` mixed frame (flat stream + owner
+  regions + control), the `mixed_mtp_batch` traversal (`TextPhase::Mixed`, slab half using the
+  verify op path with `RecordForReplay` GDN, owner half the prefill path), the shared
+  `mtp_propose_round` accept/alignment/proposal pipeline, `ProgramImplCore::decode_mixed_mtp_batch`
+  with the speculative settlement, `run_mixed_unit` reused unchanged, and the scheduler's
+  `mixed_owner_eligible` predicate. **Scope:** the unit folds every bridge-free owner chunk, the
+  tail included. The owner's tail additionally runs the owner MTP alignment
+  (`TextContext::owner_mtp_align`, via `mtp_prefill_chunk(_parallel)` + the AR proposal loop) inside
+  the unit and settles `mtp_kv_valid`/`mtp_draft_count`/`mtp_drafts` in the Program; only a
+  reused-suffix `BeforeSuffix` bridge (the suffix's first chunk) still takes the standalone step.
+  M3 only pays while ≥2 requests are active with overlapping prefill/decode phases; it does not touch
+  the single-request acceptance. Gate: `ninfer_qwen3_8_27b_v100x2_mtp_mixed_real_test` (TP2, NVFP4) —
+  a single-chunk (finalize-only) owner and a multi-chunk owner each match their isolated MTP run —
+  with the M1/M2 replay gate, the isolated MTP teacher-forced oracle
+  (`ninfer_qwen3_8_27b_v100x2_real_test`), and the concurrent-prefix gate unchanged. DFlash follows
+  the same slab form (its verify width is at the same qualified bound); not yet wired.
 - **M5 — Vision.** *Not pursued* (see the status header): the multimodal prefill row in the mixed
   batch (3-axis MRoPE ragged, vision scatter into the flat residual, sharded VP encode folded into
   the owner's unit) — a similar-scale capability for the NVFP4/groupwise identities only.
@@ -640,10 +679,12 @@ Mixed)`, the existing split leaves, and the rank-0 bonus gather. No separate mil
 
 **Effort picture**: M1 is delivered in its op-reuse form (#3–#9): per-sub-batch mixer dispatch on a
 single flat `[hidden, B+c]` stream, the mixed frame, phase, workspace, `run_mixed_unit`, and TP>1.
-The two ragged kernels (#1, #2) were the ~1–2 engineer-weeks-each critical path and are **dropped**
-on the measured <0.5% payoff (§9 M1f); the prefill-GDN conv-parity proof they would have required is
-therefore not on any active path. Remaining: M2 ≈ 1 wk; M3 ≈ 2 wks (Verify coexistence is the hard
-part); M5 ≈ 1–2 wks.
+M2 is delivered (the retained-prefix owner folded through the mixed owner, §9). The two ragged
+kernels (#1, #2) were the ~1–2 engineer-weeks-each critical path and are **dropped** on the measured
+<0.5% end-to-end payoff (§9 M1f); the prefill-GDN conv-parity proof they would have required is
+therefore not on any active path. **M3 is delivered** (shared verify-slab pass, non-tail owner
+chunks; decision 14 + §9). Remaining, outside L2: M5 ≈ 1–2 wks (Vision); DFlash may adopt the same
+M3 slab form (not yet wired).
 
 ---
 

@@ -139,6 +139,33 @@ struct MtpPrefillStateLayout {
     TensorRegion target_positions;
 };
 
+// Host control block for one L2 mixed MTP unit (M3): the speculative verify slab (B rows x
+// `decode_width` columns) plus the single prefill owner folded into the same flat stream. The slab
+// inputs/outputs live in MtpDecodeState; this block carries only the owner's geometry and the slab
+// width. The flat [T] token/position/rope stream is a runtime bound (T = B*width + prefill chunk),
+// so it lives in the mixed state tensors, not here.
+struct MtpMixedControl {
+    std::int32_t decode_rows            = 0;
+    std::int32_t decode_width           = 0;
+    std::int32_t prefill_len            = 0;
+    std::int32_t prefill_linear_slot    = 0;
+    std::int32_t prefill_finalize       = 0;
+    std::int32_t prefill_sampling_valid = 0;
+    std::int32_t prefill_bonus_position = 0;
+    ops::SamplingConfig prefill_sampling{};
+};
+
+struct MtpMixedStateLayout {
+    LayoutRegion control;
+    TensorRegion ids;
+    TensorRegion cache_positions;
+    TensorRegion rope_positions;
+    TensorRegion owner_kv_table_row;
+    TensorRegion owner_tail_hidden;
+    TensorRegion owner_bonus_logits;
+    TensorRegion owner_bonus_token;
+};
+
 struct DFlashPrefillStateLayout {
     TensorRegion produced_count;
 };
@@ -160,6 +187,8 @@ struct MtpDecodeStateLayout {
     TensorRegion ar_positions;
     TensorRegion ar_rope_positions;
     TensorRegion ar_valid_columns;
+    // Present iff spec.mixed_token_capacity > 0: the M3 mixed MTP unit's flat stream and owner bits.
+    std::optional<MtpMixedStateLayout> mixed;
 };
 
 struct DFlashDecodeStateLayout {
@@ -294,9 +323,28 @@ struct MtpDecodeState {
     Tensor ar_rope_positions;
     Tensor ar_valid_columns;
 
+    struct MixedState {
+        DeviceSpan control;
+        Tensor ids;
+        Tensor positions;
+        Tensor rope_positions;
+        Tensor owner_kv_table_row;
+        Tensor owner_tail_hidden;
+        Tensor owner_bonus_logits;
+        Tensor owner_bonus_token;
+        const ops::SamplingConfig* owner_sampling = nullptr;
+        Tensor bonus_position;
+
+        MixedState() = default;
+        MixedState(DeviceSpan backing, const MtpMixedStateLayout& layout,
+                   std::uint32_t token_capacity);
+    };
+    std::optional<MixedState> mixed;
+
     MtpDecodeState() = default;
     MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
-                   std::uint32_t batch_capacity, std::uint32_t draft_window);
+                   std::uint32_t batch_capacity, std::uint32_t draft_window,
+                   std::uint32_t mixed_token_capacity = 0);
 };
 
 struct DFlashDecodeState {

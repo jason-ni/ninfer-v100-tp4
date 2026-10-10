@@ -127,6 +127,22 @@ tp_execution(const ExecutionCore& execution) {
     return out;
 }
 
+// Same as above, but also installs each rank's OWN per-sequence MTP KV window, from the array the
+// caller built. Only the M3 mixed MTP unit needs this: its owner-finalize path runs the MTP
+// alignment through `mtp_prefill_chunk_parallel`, which addresses each rank's per-sequence MTP
+// pages. The shared verify-slab path never touches it.
+[[nodiscard]] inline std::array<std::optional<TpExecution>, kMaximumDevices>
+tp_execution(const ExecutionCore& execution,
+             const std::array<qwen3_6::PagedKVCacheView, kMaximumDevices>& mtp_kv_peer) {
+    std::array<std::optional<TpExecution>, kMaximumDevices> out = tp_execution(execution);
+    for (int rank = 1; rank < execution.tp; ++rank) {
+        if (out[static_cast<std::size_t>(rank)]) {
+            out[static_cast<std::size_t>(rank)]->mtp_kv = mtp_kv_peer[static_cast<std::size_t>(rank)];
+        }
+    }
+    return out;
+}
+
 struct PrefillContext {
     ExecutionCore execution;
     qwen3_6::PagedKVCacheView text_kv;
@@ -199,6 +215,37 @@ struct MtpBatchContext {
     Tensor& continuation_hidden_store;
 };
 
+// L2/M3 mixed MTP unit: the speculative verify slab (already staged in MtpDecodeState) plus one
+// prefill owner chunk, run as ONE shared flat pass. The slab's target hidden/logits/argmax and the
+// owner's bonus token are produced by the shared pass; the acceptance/alignment/proposal pipeline
+// then runs exactly as in an isolated MTP round.
+struct MtpMixedBatchContext {
+    ExecutionCore execution;
+    const qwen3_6::PagedKVCache& text_cache;
+    const qwen3_6::PagedKVCache& mtp_cache;
+    qwen3_6::MtpDecodeState& frame;
+    const qwen3_6::MtpDecodeIngress& host_ingress;
+    qwen3_6::MtpDecodeEgress& host_egress;
+    qwen3_6::MtpMixedControl& host_control;
+    std::int32_t* host_owner_bonus_token = nullptr;
+    Tensor& continuation_hidden_store;
+    // Owner flat chunk staging, sized `prefill_len` by rank 0 and uploaded into every rank.
+    std::span<const std::int32_t> host_owner_tokens;
+    std::span<const std::int32_t> host_owner_positions;
+    std::span<const std::int32_t> host_owner_rope_positions;
+    std::int32_t owner_kv_row = -1;
+    // Owner MTP alignment (finalize only): the owner sequence's per-sequence MTP KV window (rank 0
+    // + per-rank peers), the configured proposal extent, and the absolute position of the owner
+    // chunk's end (the prompt frontier) that keys the MTP alignment + AR proposal.
+    qwen3_6::PagedKVCacheView mtp_kv;
+    std::array<qwen3_6::PagedKVCacheView, kMaximumDevices> mtp_kv_peer{};
+    std::uint32_t mtp_proposal_extent = 0;
+    std::int32_t owner_position       = 0;
+    Tensor* rewrite_checkpoint_hidden          = nullptr;
+    std::int32_t rewrite_checkpoint_column     = -1;
+    std::int32_t rewrite_checkpoint_state_slot = -1;
+};
+
 struct DFlashBatchContext {
     ExecutionCore execution;
     const qwen3_6::PagedKVCache& text_cache;
@@ -267,6 +314,16 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                           std::array<TargetVerifyFrameView, kMaximumDevices> peer,
                           ops::GqaExecutionEnvelope envelope, bool greedy_target = false);
 
+// The acceptance half of a target verify, for callers that produced the target hidden/logits/
+// argmax themselves (the L2/M3 mixed MTP unit runs the verify slab inside the shared pass). The
+// caller must have set the ReplayForRecord GDN action before the forward that produced the frame.
+void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
+                   TargetVerifyFrameView frame, bool greedy_target = false);
+void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
+                   TargetVerifyFrameView frame,
+                   std::array<TargetVerifyFrameView, kMaximumDevices> peer,
+                   bool greedy_target = false);
+
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
     std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end);
@@ -316,6 +373,9 @@ void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, s
                               MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition);
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                       MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable);
+// The M3 mixed MTP unit. Eager only (T = B*width + c is not a fixed shape, so it is never captured).
+void mixed_mtp_batch(MtpMixedBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                     MtpGqaEnvelopes envelopes);
 
 [[nodiscard]] DFlashFeatureSink
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});

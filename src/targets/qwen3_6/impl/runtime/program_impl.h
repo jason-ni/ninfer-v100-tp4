@@ -469,6 +469,13 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
             *dflash_peer_host_ingress[slot] = {};
         }
     }
+    if (io.mtp_decode && io.mtp_decode->mixed) {
+        const qwen3_6::MtpDecodeState::MixedState& mixed = *io.mtp_decode->mixed;
+        mtp_mixed_host_owner_tokens.assign(static_cast<std::size_t>(prefill_chunk), 0);
+        mtp_mixed_host_owner_positions.assign(static_cast<std::size_t>(prefill_chunk), 0);
+        mtp_mixed_host_owner_rope_positions.assign(static_cast<std::size_t>(prefill_chunk), 0);
+        (void)mixed;
+    }
     if (io.dflash_prefill) {
         CUDA_CHECK(cudaMemsetAsync(io.dflash_prefill->produced_count.data, 0,
                                    io.dflash_prefill->produced_count.bytes(), device.stream));
@@ -3537,8 +3544,11 @@ runtime::MixedBatchResult
 ProgramImplCore::decode_mixed_batch(std::span<const std::uint32_t> lanes,
                                     std::span<const runtime::RoundBudget> budgets,
                                     std::uint32_t owner_lane) {
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        return decode_mixed_mtp_batch(lanes, budgets, owner_lane);
+    }
     if (speculative_backend != SpeculativeBackend::None) {
-        throw std::logic_error("mixed unit requires the ordinary backend");
+        throw std::logic_error("mixed unit requires the ordinary or MTP backend");
     }
     if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size() ||
         owner_lane >= max_concurrency) {
@@ -3938,6 +3948,313 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
         }
+        throw;
+    }
+}
+
+bool ProgramImplCore::mixed_owner_eligible(std::uint32_t lane) const noexcept {
+    if (speculative_backend != SpeculativeBackend::Mtp) { return true; }
+    if (lane >= max_concurrency || !requests[lane].prefill) { return false; }
+    const RequestControl::Prefill& staged = *requests[lane].prefill;
+    if (staged.vision || staged.mtp_bridge != MtpBridgeMode::None) { return false; }
+    if (staged.cursor >= staged.prompt_tokens) { return false; }
+    // Any non-vision, bridge-free chunk is foldable, including the owner's tail: the mixed MTP unit
+    // runs the owner's MTP alignment (draft seeding) after the shared pass. A pending BeforeSuffix
+    // bridge (reused suffix's first chunk) still takes the standalone step.
+    return true;
+}
+
+runtime::MixedBatchResult
+ProgramImplCore::decode_mixed_mtp_batch(std::span<const std::uint32_t> lanes,
+                                        std::span<const runtime::RoundBudget> budgets,
+                                        std::uint32_t owner_lane) {
+    if (speculative_backend != SpeculativeBackend::Mtp || !io.mtp_decode ||
+        !io.mtp_decode->mixed || decoder->mtp_cache() == nullptr) {
+        throw std::logic_error("mixed MTP batch execution requires the MTP backend");
+    }
+    if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size() ||
+        owner_lane >= max_concurrency) {
+        throw std::invalid_argument("mixed MTP membership is invalid");
+    }
+    const std::uint32_t width      = draft_window + 1;
+    std::uint32_t maximum_frontier = 0;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::uint32_t lane = lanes[row];
+        if (lane >= max_concurrency || lane == owner_lane ||
+            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
+                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
+            throw std::invalid_argument("mixed MTP contains an invalid or duplicate lane");
+        }
+        const SequenceState& sequence = sequences[lane];
+        const RequestControl& request = requests[lane];
+        if (request.lifecycle != Lifecycle::Active ||
+            budgets[row].generated_tokens_remaining == 0 || !sequence.kv || !sequence.kv->backend ||
+            sequence.kv->text.bound_row() < 0 || sequence.kv->backend->bound_row() < 0 ||
+            sequence.execution_frontier >= capacity ||
+            sequence.mtp_kv_valid != sequence.execution_frontier ||
+            sequence.ledger_frontier != sequence.execution_frontier + 1 ||
+            sequence.ledger.size() != sequence.ledger_frontier ||
+            sequence.prefix_identity.size() != sequence.ledger_frontier ||
+            sequence.mtp_draft_count > draft_window) {
+            throw std::logic_error("mixed MTP row is not decode-ready");
+        }
+        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+    }
+
+    SequenceState& owner_sequence = sequences[owner_lane];
+    RequestControl& owner_request = requests[owner_lane];
+    if (owner_request.lifecycle != Lifecycle::Prefilling || !owner_request.prefill ||
+        !owner_sequence.kv || owner_sequence.kv->text.bound_row() < 0) {
+        throw std::logic_error("mixed MTP owner is not an active prefill");
+    }
+    RequestControl::Prefill& staged = *owner_request.prefill;
+    if (staged.vision || staged.mtp_bridge != MtpBridgeMode::None ||
+        staged.cursor > staged.prompt_tokens) {
+        throw std::logic_error("mixed MTP does not support this prefill mode");
+    }
+    const std::uint32_t remaining = staged.prompt_tokens - staged.cursor;
+    if (remaining == 0) { throw std::logic_error("mixed MTP owner has no prompt left"); }
+    std::uint32_t nominal = std::min(prefill_chunk, remaining);
+    nominal = cap_final_chunk_for_taps(owner_sequence, staged.cursor, staged.prompt_tokens, nominal);
+    const RewriteCheckpointSpec* rewrite_checkpoint_capture =
+        staged.rewrite_checkpoint_capture ? &*staged.rewrite_checkpoint_capture : nullptr;
+    const bool finalize                = staged.cursor + nominal == staged.prompt_tokens;
+    const std::uint32_t owner_frontier = staged.cursor + nominal;
+    if (owner_frontier > capacity) {
+        throw std::logic_error("mixed MTP owner frontier exceeds capacity");
+    }
+    const std::int32_t B           = static_cast<std::int32_t>(lanes.size());
+    const std::int32_t c           = static_cast<std::int32_t>(nominal);
+    const std::int32_t decode_cols = B * static_cast<std::int32_t>(width);
+    const std::int32_t T           = decode_cols + c;
+    qwen3_6::MtpDecodeState& frame = *io.mtp_decode;
+    if (T > frame.mixed->ids.ne[0]) {
+        throw std::logic_error("mixed MTP exceeds its configured frame");
+    }
+    const bool captures_checkpoint = rewrite_checkpoint_capture != nullptr &&
+                                     rewrite_checkpoint_capture->frontier > staged.cursor &&
+                                     rewrite_checkpoint_capture->frontier == owner_frontier;
+    const std::int32_t rewrite_checkpoint_column     = captures_checkpoint ? T - 1 : -1;
+    const std::int32_t rewrite_checkpoint_state_slot =
+        captures_checkpoint
+            ? LinearStateSlots::rewrite_checkpoint_state_slot(owner_lane, max_concurrency)
+            : -1;
+
+    qwen3_6::MtpMixedControl& control = mtp_mixed_host_control;
+    control                           = qwen3_6::MtpMixedControl{};
+    control.decode_rows               = B;
+    control.decode_width              = static_cast<std::int32_t>(width);
+    control.prefill_len               = c;
+    control.prefill_linear_slot =
+        LinearStateSlots::current_state_slot(owner_lane, max_concurrency);
+    control.prefill_finalize       = finalize ? 1 : 0;
+    control.prefill_sampling_valid = sampling_config.data != nullptr ? 1 : 0;
+    control.prefill_bonus_position = checked_i32(owner_frontier, "mixed MTP bonus position");
+    control.prefill_sampling       = owner_request.sampling_host;
+
+    const auto started = Clock::now();
+    try {
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            SequenceState& sequence       = sequences[lanes[row]];
+            const RequestControl& request = requests[lanes[row]];
+            const std::uint32_t frontier  = sequence.execution_frontier;
+            const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
+                                                    ? budgets[row].generated_tokens_remaining - 1
+                                                    : 0;
+            const std::uint32_t extent =
+                std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
+                          capacity - sequence.execution_frontier - 1});
+            mtp_host_ingress->anchors[row]        = sequence.ledger.back();
+            mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "mixed MTP frontier");
+            mtp_host_ingress->remaining_budgets[row] =
+                checked_i32(budgets[row].generated_tokens_remaining, "mixed MTP remaining budget");
+            mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
+            mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
+            for (std::uint32_t j = 0; j < draft_window; ++j) {
+                mtp_host_ingress->current_drafts[row * draft_window + j] =
+                    j < extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
+            }
+            for (std::uint32_t j = 0; j < width; ++j) {
+                const std::uint32_t position = frontier + std::min(j, extent);
+                mtp_host_ingress->target_rope_positions[row * width + j] =
+                    checked_i32(position, "mixed MTP RoPE position") + sequence.rope_delta;
+            }
+            mtp_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
+            mtp_host_ingress->mtp_kv_table_rows[row]  = sequence.kv->backend->bound_row();
+            mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(sequence.lane);
+            mtp_host_ingress->rope_deltas[row]        = sequence.rope_delta;
+            mtp_host_ingress->sampling[row]           = request.sampling_host;
+            materialize_sequence_kv(sequence, frontier + extent + 1,
+                                    std::min(capacity, frontier + extent + draft_window));
+        }
+        publish_peer_mtp_ingress(lanes);
+        for (std::int32_t t = 0; t < c; ++t) {
+            const std::uint32_t prompt_index = staged.cursor + static_cast<std::uint32_t>(t);
+            mtp_mixed_host_owner_tokens[t]         = staged.prompt.token_ids[prompt_index];
+            mtp_mixed_host_owner_positions[t] =
+                checked_i32(prompt_index, "mixed MTP owner position");
+            mtp_mixed_host_owner_rope_positions[t] =
+                prompt_rope_position(staged.prompt, prompt_index)[0];
+        }
+        const std::int32_t owner_kv_row = owner_sequence.kv->text.bound_row();
+        materialize_sequence_kv(owner_sequence, owner_frontier, 0);
+
+        schedule::MtpMixedBatchContext schedule_state{
+            {device, model, work, decoder->linear_attention,
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+             proposal_head, rope_frequency, peer_ptrs(), tp},
+            decoder->text_kv,
+            *decoder->mtp_cache(),
+            frame,
+            *mtp_host_ingress,
+            *mtp_host_egress,
+            control,
+            &mtp_mixed_host_owner_bonus_token,
+            tail_hidden_store,
+            std::span<const std::int32_t>(mtp_mixed_host_owner_tokens.data(),
+                                          static_cast<std::size_t>(c)),
+            std::span<const std::int32_t>(mtp_mixed_host_owner_positions.data(),
+                                          static_cast<std::size_t>(c)),
+            std::span<const std::int32_t>(mtp_mixed_host_owner_rope_positions.data(),
+                                          static_cast<std::size_t>(c)),
+            owner_kv_row,
+            mtp_kv_view(owner_sequence),
+            mtp_kv_view_peer(owner_sequence),
+            staged.initial_mtp_extent,
+            checked_i32(staged.prompt_tokens, "mixed MTP owner position"),
+            &owner_sequence.rewrite_checkpoint_hidden,
+            rewrite_checkpoint_column,
+            rewrite_checkpoint_state_slot};
+        mark_workspace_usage(workspace_plan.mtp_mixed_round);
+        schedule::mixed_mtp_batch(schedule_state, B, draft_window,
+                                  mtp_gqa_envelopes(maximum_frontier, draft_window, capacity));
+        synchronize_peers();
+        device.synchronize();
+
+        const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            SequenceState& sequence       = sequences[lanes[row]];
+            RequestControl& request       = requests[lanes[row]];
+            const std::uint32_t base_E    = sequence.execution_frontier;
+            const std::uint32_t base_S    = sequence.ledger_frontier;
+            const std::int32_t count_i    = mtp_host_egress->licensed_counts[row];
+            const std::int32_t accepted_i = mtp_host_egress->accepted_drafts[row];
+            const std::int32_t next_i     = mtp_host_egress->next_extents[row];
+            if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
+                accepted_i + 1 != count_i || next_i < 0 ||
+                next_i > static_cast<std::int32_t>(draft_window) ||
+                static_cast<std::uint32_t>(count_i) > budgets[row].generated_tokens_remaining ||
+                static_cast<std::uint64_t>(base_E) + static_cast<std::uint32_t>(count_i) >
+                    capacity) {
+                throw std::runtime_error("mixed MTP returned invalid row metadata");
+            }
+            const std::span<const TokenId> row_tokens(
+                mtp_host_egress->licensed_tokens.data() + row * width,
+                static_cast<std::size_t>(count_i));
+            validate_licensed_tokens(row_tokens);
+            const std::uint32_t pcur =
+                static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
+            if (pcur == 0) {
+                request.speculative_stats.fallback_steps += 1;
+            } else {
+                request.speculative_stats.rounds += 1;
+                request.speculative_stats.drafted_tokens += pcur;
+                request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
+                for (std::int32_t i = 0; i < accepted_i; ++i) {
+                    request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
+                        1;
+                }
+            }
+            request.pending = PendingCandidate{
+                .kind          = PendingKind::Speculative,
+                .base_E        = base_E,
+                .base_S        = base_S,
+                .prompt_tokens = 0,
+                .produced      = static_cast<std::uint32_t>(count_i),
+            };
+            request.lifecycle = Lifecycle::Pending;
+            request.timings.decode_seconds += seconds;
+        }
+
+        const std::uint32_t prompt_tokens = staged.prompt_tokens;
+        runtime::PrefillStepResult owner_result;
+        owner_result.summary = runtime::BeginSummary{
+            .prompt_tokens        = prompt_tokens,
+            .reused_prompt_tokens = staged.base,
+            .prefix_reuse_path    = staged.reuse,
+            .prefix_reuse_reason  = staged.reuse_reason,
+            .prefix_divergence    = staged.reuse_divergence};
+        owner_result.processed_prompt_tokens = nominal;
+        staged.cursor += nominal;
+        owner_sequence.text_kv_valid = owner_frontier;
+        // Mirror the standalone prefill chunk's MTP-KV prefix claim (program_impl's staged prefill
+        // advances `mtp_kv_valid` to the chunk end for every prepared-MTP chunk).
+        owner_sequence.mtp_kv_valid = owner_frontier;
+        capture_prefix_after_chunk(owner_sequence);
+        if (captures_checkpoint) {
+            owner_sequence.rewrite_checkpoint = RewriteCheckpoint{
+                .valid    = true,
+                .kind     = rewrite_checkpoint_capture->kind,
+                .frontier = owner_frontier};
+        }
+        if (finalize) {
+            const TokenId bonus = static_cast<TokenId>(mtp_mixed_host_owner_bonus_token);
+            validate_licensed_tokens(std::span<const TokenId>(&bonus, 1));
+            if (staged.cursor != staged.prompt_tokens) {
+                throw std::logic_error("mixed MTP owner sampled before the prompt frontier");
+            }
+            copy_tail(owner_sequence, frame.mixed->owner_tail_hidden);
+            // The owner's bonus token was sampled on rank 0 alone, so rank 1's penalty counters have
+            // not advanced with it; bring them level before any decode round reads them.
+            publish_peer_token_counts(owner_sequence);
+            // Seed the owner's MTP draft window from the alignment the schedule just ran.
+            std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> initial_drafts{};
+            if (staged.initial_mtp_extent != 0) {
+                if (staged.initial_mtp_extent > qwen3_6::kMtpDecodeMaximumDrafts) {
+                    throw std::logic_error("mixed MTP initial extent exceeds the draft window");
+                }
+                CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp->draft_tokens.data,
+                                           staged.initial_mtp_extent * sizeof(TokenId),
+                                           cudaMemcpyDeviceToHost, device.stream));
+                device.synchronize();
+            }
+            owner_sequence.ledger.push_back(bonus);
+            owner_sequence.prefix_identity.append_generated(1, owner_sequence.rope_delta);
+            owner_sequence.tail_hidden_valid = true;
+            owner_sequence.mtp_draft_count  = staged.initial_mtp_extent;
+            for (std::uint32_t step = 0; step < staged.initial_mtp_extent; ++step) {
+                owner_sequence.mtp_drafts[step] = initial_drafts[step];
+            }
+            staged.prompt.release_all_media_payloads();
+            owner_request.prefill.reset();
+            owner_request.pending =
+                PendingCandidate{.kind          = PendingKind::Begin,
+                                 .base_E        = 0,
+                                 .base_S        = 0,
+                                 .prompt_tokens = prompt_tokens,
+                                 .produced      = 1};
+            owner_request.lifecycle = Lifecycle::Pending;
+            owner_result.round = runtime::GeneratedRound{
+                .tokens = std::span<const TokenId>(&mtp_mixed_host_owner_bonus_token, 1)};
+            owner_result.complete = true;
+        }
+        return runtime::MixedBatchResult{
+            .decode = runtime::BatchedGeneratedRound{
+                .tokens     = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
+                                                       lanes.size() * width),
+                .row_counts = std::span<const std::int32_t>(mtp_host_egress->licensed_counts.data(),
+                                                            lanes.size()),
+                .row_stride = width},
+            .owner = owner_result};
+    } catch (...) {
+        try {
+            synchronize_peers();
+            device.synchronize();
+        } catch (...) {}
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
+        clear_lane(owner_sequence, owner_request);
         throw;
     }
 }

@@ -18,6 +18,8 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <memory>
@@ -1222,6 +1224,10 @@ private:
         if (owner_lane >= max_concurrency_ || slots_[owner_lane] == nullptr) {
             throw std::logic_error("mixed unit owner is not resident");
         }
+        if (std::getenv("NINFER_V100X2_DEBUG_MIXED") != nullptr) {
+            std::fprintf(stderr, "[mixed] owner_lane=%u decode_rows=%zu\n", owner_lane,
+                         membership.size);
+        }
         const std::span<const std::uint32_t> lanes = membership.lane_span();
         const runtime::MixedBatchResult result =
             instance_.program->decode_mixed_batch(lanes, membership.budget_span(), owner_lane);
@@ -1285,7 +1291,8 @@ private:
                 const RoundMembership membership = build_round_membership();
 
                 if (prefill_lane_) {
-                    if (!membership.empty() && instance_.program->supports_mixed_unit()) {
+                    if (!membership.empty() && instance_.program->supports_mixed_unit() &&
+                        instance_.program->mixed_owner_eligible(*prefill_lane_)) {
                         run_mixed_unit(membership, *prefill_lane_);
                         previous_unit_was_decode = true;
                     } else if (!membership.empty() && !previous_unit_was_decode) {

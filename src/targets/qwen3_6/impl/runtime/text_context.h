@@ -299,6 +299,27 @@ public:
                                     Tensor* rewrite_checkpoint_hidden    = nullptr,
                                     std::int32_t rewrite_checkpoint_column     = -1,
                                     std::int32_t rewrite_checkpoint_state_slot = -1);
+    // M3 mixed MTP unit: one flat pass over a speculative verify slab (B rows x `decode_width`
+    // columns, `[decode_width, B]` order) plus one prefill owner chunk. The linear leaves run once
+    // over the whole stream; the mixer leaves dispatch the slab to the exact `Phase::Verify` ops and
+    // the owner to the exact `Phase::Prefill` ops. The caller sets
+    // `set_gdn_state_action(RecordForReplay, records)` before this call so the slab records its
+    // recurrent transitions instead of committing them. Produces the slab's target hidden/logits/
+    // argmax and, on finalize, the owner's tail hidden and bonus logits. `decode_valid_columns` and
+    // `decode_kv_table_rows`/`decode_linear_state_slots` are device [B].
+    void mixed_mtp_batch(const Tensor& ids, const Tensor& cache_positions,
+                         const Tensor& rope_positions, const Tensor& decode_kv_table_rows,
+                         const Tensor& decode_linear_state_slots,
+                         const Tensor& decode_valid_columns,
+                         ops::GqaExecutionEnvelope decode_envelope,
+                         const Tensor& prefill_kv_table_rows, std::int32_t prefill_linear_slot,
+                         ops::GqaExecutionEnvelope prefill_envelope, bool prefill_finalize,
+                         std::int32_t decode_width, Tensor& target_hidden, Tensor& target_logits,
+                         Tensor& target_tokens, Tensor& prefill_bonus_logits,
+                         Tensor& prefill_tail_hidden,
+                         Tensor* rewrite_checkpoint_hidden          = nullptr,
+                         std::int32_t rewrite_checkpoint_column     = -1,
+                         std::int32_t rewrite_checkpoint_state_slot = -1);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
@@ -315,6 +336,17 @@ public:
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
                                   ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden);
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
+    // M3 owner-tail finalize. Runs the MTP alignment over the owner's final chunk (`mtp_prefill_chunk`
+    // + the autoregressive proposal loop) and leaves the draft window in `io_.mtp->draft_tokens`.
+    // `ids` is the alignment-shifted chunk id vector (`[c]`, last column the sampled bonus token);
+    // `hidden[rank]` is that rank's target post-final-norm hidden (`[hidden, c]`); `positions`/
+    // `rope_positions` are the owner's absolute positions; `chunk_end_position` is the prompt
+    // frontier. The caller must have built this TextContext with the owner sequence's per-sequence
+    // MTP KV window (see tp_execution's mtp_kv overload).
+    void owner_mtp_align(const Tensor& ids, const std::array<Tensor, kMaximumDevices>& hidden,
+                         const std::array<Tensor, kMaximumDevices>& positions,
+                         const std::array<Tensor, kMaximumDevices>& rope_positions,
+                         ops::GqaExecutionEnvelope envelope, std::int32_t chunk_end_position);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
@@ -480,7 +512,26 @@ private:
         Tensor& prefill_bonus_logits, Tensor& prefill_tail_hidden,
         Tensor* rewrite_checkpoint_hidden = nullptr, std::int32_t rewrite_checkpoint_column = -1,
         std::int32_t rewrite_checkpoint_state_slot = -1);
-    // --- tp == 2 MTP -----------------------------------------------------------------------
+    // The tp>1 form of the M3 mixed MTP pass. Every per-rank slab tensor is passed explicitly (the
+    // ids/positions/rope slabs are derived from each rank's own MtpDecodeState by the schedule).
+    void mixed_mtp_batch(const std::array<Tensor, kMaximumDevices>& ids,
+                         const std::array<Tensor, kMaximumDevices>& cache_positions,
+                         const std::array<Tensor, kMaximumDevices>& rope_positions,
+                         const std::array<Tensor, kMaximumDevices>& decode_kv_table_rows,
+                         const std::array<Tensor, kMaximumDevices>& decode_linear_state_slots,
+                         const std::array<Tensor, kMaximumDevices>& decode_valid_columns,
+                         ops::GqaExecutionEnvelope decode_envelope,
+                         const std::array<Tensor, kMaximumDevices>& prefill_kv_table_rows,
+                         std::int32_t prefill_linear_slot,
+                         ops::GqaExecutionEnvelope prefill_envelope, bool prefill_finalize,
+                         std::int32_t decode_width, const std::array<Tensor, kMaximumDevices>& target_hidden,
+                         const std::array<Tensor, kMaximumDevices>& target_logits,
+                         const std::array<Tensor, kMaximumDevices>& target_tokens,
+                         const std::array<Tensor, kMaximumDevices>& prefill_bonus_logits,
+                         const std::array<Tensor, kMaximumDevices>& prefill_tail_hidden,
+                         Tensor* rewrite_checkpoint_hidden = nullptr,
+                         std::int32_t rewrite_checkpoint_column = -1,
+                         std::int32_t rewrite_checkpoint_state_slot = -1);
     // The MTP head is one layer, so its split schedule is the text layer's split schedule with a
     // single instance of each stage: a ROW-parallel stem (no pack -- each rank's K-slice already
     // IS one of the two normalized halves), a COLUMN-parallel packed attention projection with
@@ -599,6 +650,10 @@ private:
     // and envelope). `active_mixed_` is null outside a `Phase::Mixed` run.
     struct MixedOwnerState {
         std::int32_t decode_rows        = 0;
+        // Column width of each decode row. 1 for the ordinary M1 mixed unit (one token per row);
+        // the MTP verify slab's window width (draft+1) for M3. Decode half columns = rows*width,
+        // laid out [width, row].
+        std::int32_t decode_width       = 1;
         std::int32_t prefill_len        = 0;
         // Indexed by rank. The row index is logically identical on every rank, but each rank reads
         // ITS OWN frame's copy: a tensor view is a device address, so rank 1 cannot read rank 0's.

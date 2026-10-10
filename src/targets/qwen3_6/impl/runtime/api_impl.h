@@ -192,6 +192,11 @@ bool Program<Variant>::supports_mixed_unit() const noexcept {
 }
 
 template <>
+bool Program<Variant>::mixed_owner_eligible(std::uint32_t lane) const noexcept {
+    return impl_->mixed_owner_eligible(lane);
+}
+
+template <>
 void Program<Variant>::resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                              std::span<const std::uint32_t> accepted_tokens,
                                              std::span<const std::uint8_t> terminal,
