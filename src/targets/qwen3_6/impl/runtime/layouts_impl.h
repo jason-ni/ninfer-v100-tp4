@@ -753,8 +753,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         constexpr std::uint32_t kFrontendMergedLimit  = 32768;
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
         const std::uint32_t merged = std::min(plan.capacity, kFrontendMergedLimit);
-        out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(
-            merged, std::min(merged, kFrontendSegmentLimit));
+        // Size for THIS rank's shard of the widest admissible item, exactly as the runtime session
+        // queries it. Sizing at tp == 1 would reserve the full-width tower layout on every rank,
+        // which over-books device memory at tp > 1 (the sharded encode needs less).
+        out.vision_encode = schedule::VisionContext::workspace_capacity_bytes(
+            merged, std::min(merged, kFrontendSegmentLimit), static_cast<std::size_t>(plan.tp));
     }
 
     out.capacity = std::max({out.text_prefill, out.ordinary_round, out.mixed_round, out.mtp_prefill,
@@ -882,8 +885,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     if (impl->features.vision) {
         constexpr std::uint32_t kFrontendMergedLimit = 32768;
         const std::uint32_t merged = std::min(impl->capacity, kFrontendMergedLimit);
+        // Rank 0 writes its replicated Vision embeddings into the per-request transient region;
+        // every peer rank owns a private persistent destination of the same extent (see
+        // PeerRuntime::vision_embed). Both are output_transient_bytes(merged_limit).
         impl->request_transient_capacity_bytes =
             schedule::VisionContext::output_transient_bytes(merged);
+        impl->vision_peer_embed_bytes = impl->request_transient_capacity_bytes;
     }
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for

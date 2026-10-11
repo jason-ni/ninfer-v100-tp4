@@ -229,10 +229,16 @@ void VisionContext::bind_rank(int rank, const LoadedModelData& weights) {
     out.merger.fc2_bias    = &vision.merger_fc2_bias;
 }
 
-std::size_t VisionContext::workspace_bytes(const qwen3_6::VisionItemControl& item) {
-    return build_workspace_layout(item.patch_count, item.merged_count,
-                                  static_cast<std::size_t>(item.segment_count))
-        .bytes;
+std::size_t VisionContext::workspace_bytes(const qwen3_6::VisionItemControl& item,
+                                           std::size_t tp) {
+    std::size_t bytes = 0;
+    for (std::size_t rank = 0; rank < tp; ++rank) {
+        bytes = std::max(
+            bytes, build_workspace_layout(item.patch_count, item.merged_count,
+                                          static_cast<std::size_t>(item.segment_count), tp, rank)
+                       .bytes);
+    }
+    return bytes;
 }
 
 std::size_t VisionContext::output_transient_bytes(std::size_t merged_tokens) {
@@ -629,8 +635,9 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
                 "tensor-parallel Vision session requires a multi-device context");
         }
         tp_count_ = tp->ec->tp;
-        // Size each rank's private arena to the widest item in this plan (the mod-8 split is uneven
-        // at tp == 4, so capacity is the max over ranks).
+        // The Program owns every rank's scratch arena and peer embedding destination; the session
+        // only checks them against the widest item in this plan (the mod-8 split is uneven at
+        // tp == 4, so the required capacity is the max over ranks) and never allocates.
         std::uint32_t max_merged   = 0;
         std::uint32_t max_segments = 0;
         for (const auto& item : plan_.control->items) {
@@ -642,21 +649,25 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
         }
         const std::size_t capacity =
             VisionContext::workspace_capacity_bytes(max_merged, max_segments, tp_count_);
-        // Private peer-rank embedding buffers (rank 0 uses the caller's transient). Sized to the
-        // widest item so any per-chunk [H, merged_count] view fits without reallocation.
         const std::size_t embed_bytes = checked_mul(
             checked_mul(static_cast<std::size_t>(VisionScheduleConfig::out_hidden), max_merged,
                         "peer embedding elements"),
             dtype_size(DType::BF16), "peer embedding bytes");
-        int previous = 0;
-        CUDA_CHECK(cudaGetDevice(&previous));
         for (int r = 0; r < tp_count_; ++r) {
             const auto slot = static_cast<std::size_t>(r);
-            CUDA_CHECK(cudaSetDevice(tp->ec->dev[slot]->device));
-            tp_work[slot].emplace(capacity);
-            if (r > 0) { tp_embed_storage[slot].emplace(embed_bytes); }
+            WorkspaceArena* arena = tp->workspaces[slot];
+            if (arena == nullptr || arena->capacity() < capacity) {
+                throw std::invalid_argument("Vision rank workspace capacity is too small");
+            }
+            tp_workspaces_[slot] = arena;
+            if (r > 0) {
+                const DeviceSpan& span = tp->embed_destinations[slot];
+                if (span.data == nullptr || span.bytes < embed_bytes) {
+                    throw std::invalid_argument("Vision peer embedding destination is too small");
+                }
+                tp_embed_spans_[slot] = span;
+            }
         }
-        CUDA_CHECK(cudaSetDevice(previous));
         context_.emplace(device, model, *tp->ec, *tp->events, tp->peer_models);
     } else {
         context_.emplace(device, model);
@@ -734,11 +745,11 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
             const int merged = static_cast<int>(control.merged_count);
             for (int r = 0; r < tp_count_; ++r) {
                 const auto slot = static_cast<std::size_t>(r);
-                work[slot] = &*tp_work[slot];
+                work[slot] = tp_workspaces_[slot];
                 if (r == 0) {
                     out[slot] = output;
                 } else {
-                    out[slot] = Tensor(tp_embed_storage[slot]->p, DType::BF16,
+                    out[slot] = Tensor(tp_embed_spans_[slot].data, DType::BF16,
                                        {VisionScheduleConfig::out_hidden, merged});
                 }
             }
@@ -748,13 +759,7 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
             context_->encode(VisionItemView{payload->span(), &control}, output, workspace_);
         }
         timers_.back().record_stop();
-        if (tensor_parallel()) {
-            for (int r = 0; r < tp_count_; ++r) {
-                tp_work[static_cast<std::size_t>(r)]->reset();
-            }
-        } else {
-            workspace_.reset();
-        }
+        if (!tensor_parallel()) { workspace_.reset(); }
         active_item_ = active->item_index;
         encoded_payloads_pending_release_.push_back(active->item_index);
     }

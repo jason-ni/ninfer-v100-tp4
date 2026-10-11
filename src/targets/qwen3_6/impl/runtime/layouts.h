@@ -122,7 +122,11 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t request_transient_capacity_bytes = 0;
-    std::size_t graph_allowance_bytes            = 0;
+    // Per-rank destination size for the replicated Vision embeddings a sharded encode produces for
+    // a PEER rank (rank 0 writes the request transient instead). Equal to the request-transient
+    // reservation: it is the same [out_hidden, merged_limit] BF16 copy.
+    std::size_t vision_peer_embed_bytes = 0;
+    std::size_t graph_allowance_bytes   = 0;
     std::size_t device_reservation_bytes         = 0;
 };
 

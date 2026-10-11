@@ -56,7 +56,10 @@ public:
                   const std::array<const LoadedModelData*, kMaximumDevices>& peer_weights);
 
     [[nodiscard]] static std::size_t output_transient_bytes(std::size_t merged_tokens);
-    [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::VisionItemControl& item);
+    // Per-rank scratch the item needs. `tp` selects the shard width the encode will run at; the
+    // default is the single-device value.
+    [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::VisionItemControl& item,
+                                                     std::size_t tp = 1);
     // Per-rank scratch capacity for the widest supported vision item. `tp` sizes for a sharded
     // encode (max over ranks, since tp == 4's mod-8 split is uneven); tp == 1 is the single-device
     // value and is unchanged from before this parameter existed.
@@ -140,6 +143,14 @@ struct VisionTpSetup {
     const ExecutionContext* ec = nullptr;
     const ops::CollectiveComms* events = nullptr;
     std::array<const LoadedModelData*, kMaximumDevices> peer_models{};
+    // Per-rank preallocated scratch arena (rank 0 is the caller's `workspace`; peers are their
+    // Program's own text workspace). The sharded encode suballocates from these instead of owning a
+    // per-request device allocation, so a native vision request never touches cudaMalloc.
+    std::array<WorkspaceArena*, kMaximumDevices> workspaces{};
+    // Per-rank PEER destination for the replicated final [out_hidden, merged] embeddings (index 0
+    // unused: rank 0 writes the caller's transient). Persists across chunks for the MTP bridge, so
+    // it must outlive every workspace reset.
+    std::array<DeviceSpan, kMaximumDevices> embed_destinations{};
 };
 
 class VisionPrefillSession {
@@ -174,13 +185,12 @@ private:
     std::optional<std::uint32_t> active_item_;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;
     std::vector<CudaEventTimer> timers_;
-    // Tensor-parallel state (empty for tp == 1). Each rank owns a private vision scratch arena so
-    // the sharded encode never aliases the text workspaces; sized to the widest item in the plan.
+    // Tensor-parallel state (empty for tp == 1). The scratch arenas and peer embedding
+    // destinations are preallocated by the Program and handed in through VisionTpSetup; the session
+    // only suballocates from them, so a vision request performs no cudaMalloc of its own.
     int tp_count_ = 1;
-    std::array<std::optional<WorkspaceArena>, kMaximumDevices> tp_work{};
-    // Private per-rank destinations for the replicated final embeddings (peers only; rank 0 uses the
-    // caller's transient). Sized to the widest item so a per-chunk [H, merged_count] view fits.
-    std::array<std::optional<DeviceBuffer>, kMaximumDevices> tp_embed_storage{};
+    std::array<WorkspaceArena*, kMaximumDevices> tp_workspaces_{};
+    std::array<DeviceSpan, kMaximumDevices> tp_embed_spans_{};
     std::array<Tensor, kMaximumDevices> tp_embeddings_{};
 };
 

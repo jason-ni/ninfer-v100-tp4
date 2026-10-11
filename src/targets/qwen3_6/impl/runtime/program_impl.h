@@ -258,6 +258,10 @@ PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer
     io             = qwen3_6::RoundState(backing, plan.persistent.round);
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
     token_counts   = plan.persistent.token_counts.bind(backing);
+    // Allocated once, on this peer's device (current at construction), for the life of the Program.
+    if (plan.features.vision && plan.vision_peer_embed_bytes != 0) {
+        vision_embed.emplace(plan.vision_peer_embed_bytes);
+    }
 }
 
 ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaximumDevices>& models,
@@ -1269,11 +1273,17 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 // owns a private scratch arena and its sharded weights, and the row-parallel
                 // projections reduce over the shared collective.
                 schedule::VisionTpSetup vtp;
-                vtp.ec     = &execution;
-                vtp.events = &*collective_comms;
+                vtp.ec             = &execution;
+                vtp.events         = &*collective_comms;
+                vtp.workspaces[0]  = &work;
                 for (int r = 1; r < tp; ++r) {
-                    vtp.peer_models[static_cast<std::size_t>(r)] =
-                        &peer[static_cast<std::size_t>(r)]->model;
+                    const auto slot = static_cast<std::size_t>(r);
+                    vtp.peer_models[slot] = &peer[slot]->model;
+                    vtp.workspaces[slot]  = &peer[slot]->work;
+                    if (peer[slot]->vision_embed) {
+                        vtp.embed_destinations[slot] =
+                            DeviceSpan{peer[slot]->vision_embed->p, peer[slot]->vision_embed->bytes};
+                    }
                 }
                 staged.vision = std::make_unique<schedule::VisionPrefillSession>(
                     device, model, work, staged.prompt, *staged.vision_plan, staged.transient, &vtp);

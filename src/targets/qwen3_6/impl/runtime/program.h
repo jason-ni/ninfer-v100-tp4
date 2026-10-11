@@ -265,6 +265,11 @@ struct PeerRuntime {
     std::optional<GdnReplayRecords> replay_records;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
+    // Peer rank's private destination for the replicated Vision embeddings a sharded encode
+    // produces ([out_hidden, merged_limit] BF16, rank 1..tp-1 only). Owned for the life of the
+    // Program -- not per request -- so a native vision request never cudaMallocs, and it outlives
+    // every workspace reset (the MTP bridge reads the last encoded item after prefill).
+    std::optional<DeviceBuffer> vision_embed;
     // Rank 1's OWN penalty counters. `ops::SamplingConfig::token_counts` is a raw device pointer,
     // and the MTP round's acceptance runs on both devices (see the replicated-accept note in
     // mtp_impl.h), so rank 1 must never be handed rank 0's. It is not a cache: rank 0 remains the
