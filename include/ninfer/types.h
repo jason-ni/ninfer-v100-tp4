@@ -587,6 +587,56 @@ struct RuntimeStats {
     std::uint32_t waiting_requests      = 0;
 };
 
+// Current memory on one tensor-parallel rank's device, from cudaMemGetInfo. `used_bytes` is
+// `total_bytes - free_bytes`.
+struct DeviceMemoryMetrics {
+    int device                = -1;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t free_bytes  = 0;
+    std::uint64_t used_bytes  = 0;
+};
+
+// Occupancy of one paged KV pool. `capacity_pages` is the physical page-group count; `mapped_pages`
+// belong to live sequences, `cached_pages` to the prefix cache, `free_pages` to neither. `page_bytes`
+// is the byte size of one physical page across all storage planes.
+struct KvPoolMetrics {
+    std::uint32_t capacity_pages = 0;
+    std::uint32_t mapped_pages   = 0;
+    std::uint32_t cached_pages   = 0;
+    std::uint32_t free_pages     = 0;
+    std::uint64_t page_bytes     = 0;
+};
+
+// Pinned host-RAM KV tier. `pinned_bytes` is the allocation the tier took; `used_bytes` of it is
+// occupied by block and snapshot slab data. `enabled` is false when the tier is off or its
+// allocation failed.
+struct HostCacheMetrics {
+    bool enabled                      = false;
+    std::uint64_t pinned_bytes        = 0;
+    std::uint64_t used_bytes          = 0;
+    std::uint32_t block_slab_count    = 0;
+    std::uint32_t snapshot_slab_count = 0;
+};
+
+// Hybrid prefix cache residency. Device snapshot slots are the on-device state images; the host
+// tier carries demoted blocks and state images.
+struct PrefixCacheMetrics {
+    bool enabled                             = false;
+    std::uint32_t device_snapshot_slots      = 0;
+    std::uint32_t device_snapshot_slots_used = 0;
+    HostCacheMetrics host;
+};
+
+// Live resource metrics for the serving /metrics endpoint: a boundary-consistent snapshot. This is
+// not a performance ledger; throughput is derived by consumers from RuntimeStats as usual.
+struct MetricsSnapshot {
+    RuntimeStats scheduler;
+    std::vector<DeviceMemoryMetrics> devices;
+    KvPoolMetrics main_kv;    // text KV pool (always present)
+    KvPoolMetrics backend_kv; // MTP/DFlash KV pool; zero when the backend has none
+    PrefixCacheMetrics prefix_cache;
+};
+
 struct LoadSummary {
     int tp = 1;
     std::array<DeviceMemoryReport, 4> devices{};

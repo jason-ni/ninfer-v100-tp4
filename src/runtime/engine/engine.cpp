@@ -400,6 +400,20 @@ RuntimeStats Engine::runtime_stats() const {
         impl_->executor);
 }
 
+MetricsSnapshot Engine::metrics() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& executor) -> MetricsSnapshot {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->metrics();
+            }
+        },
+        impl_->executor);
+}
+
 std::vector<std::uint16_t> Engine::debug_last_round_logits_bf16() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

@@ -4523,6 +4523,67 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     return out;
 }
 
+MetricsSnapshot ProgramImplCore::metrics() const noexcept {
+    MetricsSnapshot out;
+    out.devices.reserve(static_cast<std::size_t>(tp));
+
+    // Live device memory per rank. cudaMemGetInfo reads the current device, so each rank is made
+    // current for its own query; a failed query leaves that rank's row at zero rather than throw.
+    const auto capture_device = [&out](int ordinal) {
+        DeviceMemoryMetrics m;
+        m.device          = ordinal;
+        std::size_t free  = 0;
+        std::size_t total = 0;
+        if (cudaMemGetInfo(&free, &total) == cudaSuccess) {
+            m.free_bytes  = free;
+            m.total_bytes = total;
+            m.used_bytes  = total - free;
+        }
+        out.devices.push_back(m);
+    };
+    {
+        const ScopedDevice scope(device.device);
+        capture_device(device.device);
+    }
+    for (int rank = 1; rank < tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        const ScopedDevice scope(peer[slot]->device.device);
+        capture_device(peer[slot]->device.device);
+    }
+
+    const auto fill_kv = [](const PagedKVPool& pool) {
+        KvPoolMetrics m;
+        m.capacity_pages = pool.page_group_count();
+        m.mapped_pages   = pool.mapped_pages();
+        m.cached_pages   = pool.cached_pages();
+        m.free_pages     = pool.free_pages();
+        m.page_bytes     = pool.per_page_bytes();
+        return m;
+    };
+    out.main_kv = fill_kv(decoder->text_kv.pool());
+    if (const qwen3_6::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
+        out.backend_kv = fill_kv(backend->pool());
+    }
+
+    if (prefix_index != nullptr) {
+        out.prefix_cache.enabled               = true;
+        out.prefix_cache.device_snapshot_slots = prefix_index->device_snapshot_slots();
+        out.prefix_cache.device_snapshot_slots_used =
+            prefix_index->device_snapshot_slots() - prefix_index->device_snapshot_slots_free();
+    }
+    if (prefix_host_pool != nullptr) {
+        HostCacheMetrics& host = out.prefix_cache.host;
+        host.enabled           = prefix_host_pool->enabled();
+        host.pinned_bytes      = prefix_host_pool->pinned_bytes();
+        host.used_bytes        = prefix_host_pool->used_bytes();
+        host.block_slab_count =
+            static_cast<std::uint32_t>(prefix_host_pool->block_slab_count());
+        host.snapshot_slab_count =
+            static_cast<std::uint32_t>(prefix_host_pool->snapshot_slab_count());
+    }
+    return out;
+}
+
 void ProgramImplCore::reset_memory_peaks() noexcept {
     model.weights_arena->reset_peak();
     persistent.reset_peak();

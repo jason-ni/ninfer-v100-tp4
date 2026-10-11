@@ -94,6 +94,8 @@ public:
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    [[nodiscard]] ninfer::MetricsSnapshot metrics() const { return engine_->metrics(); }
+
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }

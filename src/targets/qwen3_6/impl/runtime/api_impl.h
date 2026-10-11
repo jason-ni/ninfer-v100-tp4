@@ -240,6 +240,11 @@ MemorySummary Program<Variant>::memory_summary() const noexcept {
 }
 
 template <>
+MetricsSnapshot Program<Variant>::metrics() const noexcept {
+    return impl_->metrics();
+}
+
+template <>
 void Program<Variant>::reset_memory_peaks() noexcept {
     impl_->reset_memory_peaks();
 }

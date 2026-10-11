@@ -237,6 +237,12 @@ public:
     [[nodiscard]] const Snapshot* snapshot(SnapshotId id) const noexcept;
     [[nodiscard]] std::size_t live_node_count() const noexcept { return live_nodes_; }
     [[nodiscard]] std::size_t live_snapshot_count() const noexcept { return live_snapshots_; }
+    [[nodiscard]] std::uint32_t device_snapshot_slots() const noexcept {
+        return static_cast<std::uint32_t>(slot_owner_.size());
+    }
+    [[nodiscard]] std::uint32_t device_snapshot_slots_free() const noexcept {
+        return static_cast<std::uint32_t>(free_slots_.size());
+    }
     [[nodiscard]] std::uint64_t tick() const noexcept { return tick_; }
 
     // --- lookup ---

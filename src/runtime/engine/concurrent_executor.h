@@ -59,6 +59,8 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
+        // Seed the published snapshot so /metrics is meaningful before the worker's first boundary.
+        published_metrics_ = instance.program->metrics();
         // Every GPU launch of this executor is issued from worker_, so the thread must be
         // bound to the Engine's DeviceContext device. Without this the worker runs with the
         // CUDA default device (ordinal 0) current while the streams, allocations and
@@ -201,6 +203,17 @@ public:
         return published_stats_;
     }
 
+    // Live resource snapshot, read without the execution lock. The gauges are captured at execution
+    // boundaries by the worker (capture_resource_metrics) into published_metrics_, and the scheduler
+    // counters come from the same boundary publication. A scrape therefore never waits behind a
+    // prefill/decode unit; the gauges lag the newest unit by at most one boundary.
+    [[nodiscard]] MetricsSnapshot metrics() const {
+        std::lock_guard lock(stats_mutex_);
+        MetricsSnapshot out = published_metrics_;
+        out.scheduler       = published_stats_;
+        return out;
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);
@@ -242,6 +255,15 @@ public:
     }
 
 private:
+    // Capture the resource gauges (device VRAM, KV pools, prefix cache) into published_metrics_.
+    // Must be called with the execution lock held and no unit in flight, which the worker does at
+    // the top of every loop iteration; it is what keeps a /metrics scrape off the execution lock.
+    void capture_resource_metrics() {
+        MetricsSnapshot snapshot = instance_.program->metrics();
+        std::lock_guard lock(stats_mutex_);
+        published_metrics_ = std::move(snapshot);
+    }
+
     void publish_runtime_stats() {
         RuntimeStats snapshot = cumulative_stats_;
         {
@@ -1264,6 +1286,12 @@ private:
     void worker_loop() noexcept {
         bool previous_unit_was_decode = false;
         for (;;) {
+            // Boundary resource snapshot for /metrics (see metrics()): taken here, with no unit in
+            // flight and after the previous unit's state transitions have settled.
+            {
+                std::scoped_lock lock(execution_mutex_);
+                capture_resource_metrics();
+            }
             {
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty()) {
@@ -1358,6 +1386,9 @@ private:
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    // Boundary resource snapshot for /metrics; guarded by stats_mutex_. Written by the worker's
+    // capture_resource_metrics(), read (copied) by metrics().
+    MetricsSnapshot published_metrics_;
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

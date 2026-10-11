@@ -2,6 +2,7 @@
 
 #include "serve/anthropic_schema.h"
 #include "serve/console_log.h"
+#include "serve/metrics_format.h"
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
 #include "serve/translate.h"
@@ -225,7 +226,8 @@ void HttpServer::register_routes() {
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        if (options_.api_key.empty() || req.path == "/health" || req.path == "/metrics" ||
+            req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -268,6 +270,9 @@ void HttpServer::register_routes() {
 
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
+    });
+    server_.Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_metrics(req, res);
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
@@ -331,6 +336,21 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         return;
     }
     res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
+}
+
+void HttpServer::handle_metrics(const httplib::Request& req, httplib::Response& res) {
+    const ninfer::MetricsSnapshot metrics = service_->metrics();
+    // `?format=json` wins; otherwise the Accept header selects. The default is the Prometheus text
+    // exposition format that a scraper sends no Accept for.
+    const bool want_json =
+        req.has_param("format")
+            ? req.get_param_value("format") == "json"
+            : req.get_header_value("Accept").find("application/json") != std::string::npos;
+    if (want_json) {
+        res.set_content(metrics_to_json(metrics).dump(), "application/json");
+    } else {
+        res.set_content(metrics_to_prometheus(metrics), "text/plain; version=0.0.4");
+    }
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {

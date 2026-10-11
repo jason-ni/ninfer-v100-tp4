@@ -102,6 +102,7 @@ INT8 KV). `--kv-dtype int8` is mandatory at that window.
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | process health |
+| `GET /metrics` | live device, KV-tier, host-cache, and scheduler metrics |
 | `GET /v1/models` | configured OpenAI model alias |
 | `GET /v1/models/{id}` | lookup of the configured alias |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -112,6 +113,41 @@ INT8 KV). `--kv-dtype int8` is mandatory at that window.
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+
+## Metrics
+
+`GET /metrics` exposes a live, boundary-consistent resource snapshot. It is unauthenticated, like
+`/health`, so a scraper needs no key. The snapshot is published by the execution worker at round
+boundaries, so a scrape never waits on an in-flight prefill/decode unit; gauges lag the newest unit
+by at most one boundary. The default response is the Prometheus text exposition format; send
+`Accept: application/json` or `?format=json` for the JSON object.
+
+Groups:
+
+- `devices` — per tensor-parallel rank, `cudaMemGetInfo` `total`/`used`/`free` bytes.
+- `main_kv` / `backend_kv` — paged KV page groups: physical `capacity`, sequence-`mapped`,
+  prefix-cache-`cached`, and `free` groups, plus `page_bytes` per group. `backend_kv` is zero when
+  the backend has no second pool.
+- `prefix_cache` — device snapshot-slot `total`/`used`, and the host tier's `pinned`/`used` bytes
+  and slab counts (`enabled` is 0 when the tier is off or its allocation failed).
+- `scheduler` — running/prefilling/decode-ready/waiting requests and the monotonic prefill/decode
+  counters used to derive throughput.
+
+Prometheus clients compute rates by differencing the `*_total` counters between scrapes; the
+gauge groups are point-in-time.
+
+```bash
+curl http://127.0.0.1:8080/metrics                  # Prometheus text
+curl -H 'Accept: application/json' http://127.0.0.1:8080/metrics
+```
+
+A stdlib-only pretty viewer ships alongside the V100X2 launchers:
+
+```bash
+./tools/v100/ninfer-metrics.py                # formatted snapshot
+./tools/v100/ninfer-metrics.py --watch 1      # live refresh with token rates
+./tools/v100/ninfer-metrics.py --json         # raw JSON / --prometheus for raw text
+```
 
 ## OpenAI Chat Completions
 
@@ -509,7 +545,7 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
-`x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated.
+`x-api-key` header. `GET /health`, `GET /metrics`, and CORS preflight requests remain unauthenticated.
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \

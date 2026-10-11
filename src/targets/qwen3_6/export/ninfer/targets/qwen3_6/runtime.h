@@ -191,6 +191,7 @@ public:
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] MetricsSnapshot metrics() const noexcept;
     void reset_memory_peaks() noexcept;
 
     // Debug-only, OFF by default: capture of the full-vocabulary logits behind the most recently

@@ -311,6 +311,9 @@ ninfer_add_test(ninfer_tool_call_parser_test
 ninfer_add_test(ninfer_serve_options_test
   SOURCES test_serve_options.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_metrics_format_test
+  SOURCES test_metrics_format.cpp
+  LIBRARIES ninfer_serve)
 # Host-only: no artifact, no device. `--rope native|yarn` parsing on BOTH product front ends plus
 # the effective-context-ceiling resolution and its accept/reject matrix. The CLI parser is
 # compiled in directly because apps/ninfer is an executable, not a library.
