@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -587,6 +588,11 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
             const std::size_t snap_count  = snapshot_slab_bytes > 0 ? (snap_budget / snapshot_slab_bytes) : 0;
             if (block_count == 0 || snap_count == 0) {
                 // Budget too small for at least one slab of each kind; skip host tier.
+                std::fprintf(stderr,
+                             "[host-cache] requested %u MiB is too small for one block slab "
+                             "(%zu MiB) plus one snapshot slab (%zu MiB); host tier disabled\n",
+                             plan.prefix_cache.host_cache_mib, block_slab_bytes >> 20U,
+                             snapshot_slab_bytes >> 20U);
             } else {
                 prefix_host_pool = std::make_unique<ninfer::prefix_cache::HostSlabPool>(
                     ninfer::prefix_cache::HostSlabPoolOptions{
@@ -596,6 +602,13 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
                         .block_slab_count    = block_count,
                         .snapshot_slab_count = snap_count,
                     });
+                std::fprintf(stderr,
+                             "[host-cache] pinned %zu MiB (requested %u MiB): %zu block + %zu "
+                             "snapshot slabs\n",
+                             prefix_host_pool->pinned_bytes() >> 20U,
+                             plan.prefix_cache.host_cache_mib,
+                             prefix_host_pool->block_slab_count(),
+                             prefix_host_pool->snapshot_slab_count());
                 prefix_index->set_host_pool(prefix_host_pool.get());
                 // M2: dedicated cache transfer stream per rank for D2H/H2D copies. Each rank's
                 // stream and events must be created with THAT rank's device current, because they

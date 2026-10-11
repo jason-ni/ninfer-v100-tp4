@@ -31,8 +31,7 @@ struct TestSink : pc::PrefixPageSink {
 };
 
 pc::HostSlabPool make_test_pool() {
-    // 4 MiB budget; slab sizes chosen so count * slab_bytes fits (the pool self-disables when the
-    // carved slabs exceed total_bytes). 4 x 512 KiB blocks + 2 x 128 KiB snapshots = 2.25 MiB.
+    // 4 MiB budget; the slab data (4 x 512 KiB blocks + 2 x 128 KiB snapshots = 2.25 MiB) fits.
     return pc::HostSlabPool({.total_bytes = 4 * 1024 * 1024,
                              .block_slab_bytes = 512 * 1024,
                              .snapshot_slab_bytes = 128 * 1024,

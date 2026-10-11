@@ -72,12 +72,15 @@ public:
     HostSlabPool(const HostSlabPool&) = delete;
     HostSlabPool& operator=(const HostSlabPool&) = delete;
 
-    [[nodiscard]] bool enabled() const noexcept { return block_slabs_ != nullptr; }
+    [[nodiscard]] bool enabled() const noexcept { return host_memory_ != nullptr; }
+    // Requested budget from the caller; may exceed the bytes actually pinned.
     [[nodiscard]] std::size_t total_bytes() const noexcept { return options_.total_bytes; }
+    // Bytes actually pinned for slab data (excludes the heap-side HostSlab metadata).
+    [[nodiscard]] std::size_t pinned_bytes() const noexcept { return pinned_bytes_; }
     [[nodiscard]] std::size_t used_bytes() const noexcept;
     [[nodiscard]] std::size_t free_bytes() const noexcept;
-    [[nodiscard]] std::size_t block_slab_count() const noexcept { return block_slab_count_; }
-    [[nodiscard]] std::size_t snapshot_slab_count() const noexcept { return snapshot_slab_count_; }
+    [[nodiscard]] std::size_t block_slab_count() const noexcept { return block_slabs_.size(); }
+    [[nodiscard]] std::size_t snapshot_slab_count() const noexcept { return snapshot_slabs_.size(); }
 
     // Allocate a block slab, evicting another BLOCK slab if the pool is full. Returns
     // kInvalidHostPage when no block slab can be obtained (all pinned).
@@ -124,10 +127,11 @@ private:
     void reset_slab(HostSlab& slab) noexcept;
 
     HostSlabPoolOptions options_;
-    HostSlab* block_slabs_ = nullptr;
-    HostSlab* snapshot_slabs_ = nullptr;
-    std::size_t block_slab_count_ = 0;
-    std::size_t snapshot_slab_count_ = 0;
+    // Slab metadata is heap-side; only slab DATA lives in the pinned allocation.
+    std::vector<HostSlab> block_slabs_;
+    std::vector<HostSlab> snapshot_slabs_;
+    void* host_memory_ = nullptr;
+    std::size_t pinned_bytes_ = 0;
     std::uint64_t tick_ = 0;
 };
 

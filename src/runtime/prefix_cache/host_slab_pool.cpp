@@ -1,7 +1,7 @@
 #include "runtime/prefix_cache/host_slab_pool.h"
 
 #include <algorithm>
-#include <cstring>
+#include <cstdio>
 #include <cuda_runtime.h>
 
 namespace ninfer::prefix_cache {
@@ -12,73 +12,67 @@ std::size_t slab_offset(std::size_t block_count) noexcept { return block_count; 
 
 } // namespace
 
-HostSlabPool::HostSlabPool(HostSlabPoolOptions options)
-    : options_(options), block_slab_count_(options.block_slab_count),
-      snapshot_slab_count_(options.snapshot_slab_count) {
+HostSlabPool::HostSlabPool(HostSlabPoolOptions options) : options_(options) {
     if (options.total_bytes == 0 || options.block_slab_count == 0 ||
         options.snapshot_slab_count == 0 || options.block_slab_bytes == 0 ||
         options.snapshot_slab_bytes == 0) {
-        return; // disabled
+        return; // disabled by configuration
     }
 
+    // Pin exactly the slab data. The HostSlab metadata lives in heap vectors, so it never eats
+    // into -- or invalidates -- the pinned budget (the previous in-pool header carve-out could
+    // push the layout past total_bytes and silently free the whole pool).
+    const std::size_t data_bytes = options.block_slab_count * options.block_slab_bytes +
+                                   options.snapshot_slab_count * options.snapshot_slab_bytes;
     void* memory = nullptr;
-    cudaError_t err = cudaHostAlloc(&memory, options.total_bytes, cudaHostAllocDefault);
+    cudaError_t err = cudaHostAlloc(&memory, data_bytes, cudaHostAllocDefault);
     if (err != cudaSuccess || memory == nullptr) {
-        return; // allocation failed, pool disabled
+        std::fprintf(stderr,
+                     "[host-cache] cudaHostAlloc(%zu MiB) failed: %s; host tier disabled\n",
+                     data_bytes >> 20U, cudaGetErrorString(err));
+        return;
     }
 
-    block_slabs_ = static_cast<HostSlab*>(memory);
-    char* cursor = static_cast<char*>(memory) + (options.block_slab_count + options.snapshot_slab_count) * sizeof(HostSlab);
-    std::size_t offset = (options.block_slab_count + options.snapshot_slab_count) * sizeof(HostSlab);
-
-    for (std::size_t i = 0; i < options.block_slab_count; ++i) {
-        block_slabs_[i].data = cursor;
-        block_slabs_[i].bytes = options.block_slab_bytes;
+    block_slabs_.resize(options.block_slab_count);
+    snapshot_slabs_.resize(options.snapshot_slab_count);
+    char* cursor = static_cast<char*>(memory);
+    for (HostSlab& slab : block_slabs_) {
+        slab.data  = cursor;
+        slab.bytes = options.block_slab_bytes;
         cursor += options.block_slab_bytes;
-        offset += options.block_slab_bytes;
     }
-
-    snapshot_slabs_ = block_slabs_ + options.block_slab_count;
-    for (std::size_t i = 0; i < options.snapshot_slab_count; ++i) {
-        snapshot_slabs_[i].data = cursor;
-        snapshot_slabs_[i].bytes = options.snapshot_slab_bytes;
+    for (HostSlab& slab : snapshot_slabs_) {
+        slab.data  = cursor;
+        slab.bytes = options.snapshot_slab_bytes;
         cursor += options.snapshot_slab_bytes;
-        offset += options.snapshot_slab_bytes;
     }
-
-    if (offset > options.total_bytes) {
-        // Misconfiguration: slabs do not fit in the total budget. Free and disable.
-        cudaFreeHost(memory);
-        block_slabs_ = nullptr;
-        snapshot_slabs_ = nullptr;
-        block_slab_count_ = 0;
-        snapshot_slab_count_ = 0;
-    }
+    host_memory_  = memory;
+    pinned_bytes_ = data_bytes;
 }
 
 HostSlabPool::~HostSlabPool() {
-    if (block_slabs_ != nullptr) {
-        cudaFreeHost(block_slabs_);
+    if (host_memory_ != nullptr) {
+        cudaFreeHost(host_memory_);
     }
 }
 
 std::size_t HostSlabPool::used_bytes() const noexcept {
     std::size_t used = 0;
-    for (std::size_t i = 0; i < block_slab_count_; ++i) {
-        if (block_slabs_[i].occupied) {
-            used += block_slabs_[i].bytes;
+    for (const HostSlab& slab : block_slabs_) {
+        if (slab.occupied) {
+            used += slab.bytes;
         }
     }
-    for (std::size_t i = 0; i < snapshot_slab_count_; ++i) {
-        if (snapshot_slabs_[i].occupied) {
-            used += snapshot_slabs_[i].bytes;
+    for (const HostSlab& slab : snapshot_slabs_) {
+        if (slab.occupied) {
+            used += slab.bytes;
         }
     }
     return used;
 }
 
 std::size_t HostSlabPool::free_bytes() const noexcept {
-    return options_.total_bytes - used_bytes();
+    return pinned_bytes_ - used_bytes();
 }
 
 void HostSlabPool::reset_slab(HostSlab& slab) noexcept {
@@ -181,11 +175,11 @@ SlabAllocation HostSlabPool::allocate_block() {
         return result;
     }
 
-    HostPageId page = find_free(0, block_slab_count_);
+    HostPageId page = find_free(0, block_slabs_.size());
     if (page == kInvalidHostPage) {
         // No free slab: evict one. The victim's previous owner must be reconciled by the caller
         // before the new data is written.
-        page = pick_victim(0, block_slab_count_);
+        page = pick_victim(0, block_slabs_.size());
         if (page == kInvalidHostPage) {
             return result; // all block slabs pinned
         }
@@ -202,12 +196,12 @@ SlabAllocation HostSlabPool::allocate_snapshot() {
         return result;
     }
 
-    const std::size_t offset = slab_offset(block_slab_count_);
-    HostPageId page = find_free(offset, snapshot_slab_count_);
+    const std::size_t offset = slab_offset(block_slabs_.size());
+    HostPageId page = find_free(offset, snapshot_slabs_.size());
     if (page == kInvalidHostPage) {
         // No free slab: evict one. The victim's previous owner must be reconciled by the caller
         // before the new data is written.
-        page = pick_victim(offset, snapshot_slab_count_);
+        page = pick_victim(offset, snapshot_slabs_.size());
         if (page == kInvalidHostPage) {
             return result; // all snapshot slabs pinned
         }
@@ -298,23 +292,33 @@ void HostSlabPool::hit(HostPageId page, std::uint64_t tick) noexcept {
 }
 
 const HostSlab* HostSlabPool::slab(HostPageId page) const noexcept {
-    if (page < 0 || page >= static_cast<HostPageId>(block_slab_count_ + snapshot_slab_count_)) {
+    if (page < 0) {
         return nullptr;
     }
-    if (static_cast<std::size_t>(page) < block_slab_count_) {
-        return &block_slabs_[page];
+    const auto idx = static_cast<std::size_t>(page);
+    if (idx < block_slabs_.size()) {
+        return &block_slabs_[idx];
     }
-    return &snapshot_slabs_[page - static_cast<HostPageId>(block_slab_count_)];
+    const std::size_t snap = idx - block_slabs_.size();
+    if (snap < snapshot_slabs_.size()) {
+        return &snapshot_slabs_[snap];
+    }
+    return nullptr;
 }
 
 HostSlab* HostSlabPool::slab_mut(HostPageId page) noexcept {
-    if (page < 0 || page >= static_cast<HostPageId>(block_slab_count_ + snapshot_slab_count_)) {
+    if (page < 0) {
         return nullptr;
     }
-    if (static_cast<std::size_t>(page) < block_slab_count_) {
-        return &block_slabs_[page];
+    const auto idx = static_cast<std::size_t>(page);
+    if (idx < block_slabs_.size()) {
+        return &block_slabs_[idx];
     }
-    return &snapshot_slabs_[page - static_cast<HostPageId>(block_slab_count_)];
+    const std::size_t snap = idx - block_slabs_.size();
+    if (snap < snapshot_slabs_.size()) {
+        return &snapshot_slabs_[snap];
+    }
+    return nullptr;
 }
 
 } // namespace ninfer::prefix_cache
