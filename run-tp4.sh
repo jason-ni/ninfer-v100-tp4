@@ -36,6 +36,13 @@ export NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS=${NINFER_V100X2_SERVE_CHAT_TEMPL
 # pool is sized to hold several conversations' taps; override with NINFER_V100X2_SERVE_HOST_CACHE_MIB.
 host_cache_mib=${NINFER_V100X2_SERVE_HOST_CACHE_MIB:-28192}
 
+# The Engine's registered Qwen3.8-27B thinking preset keeps presence penalty at 0 (its general-task
+# default), so an agent harness that sends only temperature/top-p/top-k runs unpenalized and long
+# reasoning can degenerate into repetition. Pin the coding/long-reasoning value used by the llama.cpp
+# baseline and docs/performance.md; a request's own presence_penalty still overrides it. Override the
+# pin with NINFER_V100X2_SERVE_PRESENCE_PENALTY.
+presence_penalty=${NINFER_V100X2_SERVE_PRESENCE_PENALTY:-1.0}
+
 # Split the launcher-only --raw-log flag from the arguments forwarded to ninfer-serve. A bare
 # --raw-log uses the default destination; --raw-log=PATH overrides it. NINFER_RAW_OUTPUT_LOG set in
 # the environment is preserved unless the flag is given.
@@ -76,4 +83,5 @@ fi
 
 exec "${script_dir}/tools/v100/ninfer-v100x2-serve.sh" \
     --prefix-cache --host-cache-mib "${host_cache_mib}" \
+    --presence-penalty "${presence_penalty}" \
     ${forwarded_args[@]+"${forwarded_args[@]}"}
