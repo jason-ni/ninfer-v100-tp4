@@ -12,6 +12,30 @@ KV, and MTP with up to three drafts (zero accepted drafts is valid).
 Performance results are separated into [TP4](#tp4-measurements-first-measurements) and
 [TP2 measurements](#tp2--p2p-enabled); build and launch instructions are shared below.
 
+## Model format and source
+
+The primary served checkpoint is
+**Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-MTP-DFlash2**, the
+`NVFP4-NInfer/W4A4-W8A8` NVFP4 artifact from
+[nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-MTP-DFlash2](
+https://huggingface.co/nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-MTP-DFlash2/tree/main/NVFP4-NInfer/W4A4-W8A8)
+(`Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-MTP-DFlash2.ninfer`). The container
+carries the text weights as **4-bit FP4 (W4A4)** NVFP4 for the wide prefill GEMMs, **W8A8 INT8**
+attention KV, the native **MTP route** (≤3-draft window), and the optional five-layer
+**DFlash2** draft package.
+
+All vision-tower weights — patch projection, per-block qkv/o_proj/fc1/fc2, and the merger
+fc1/fc2 — are materialized in **native FP16** by casting from the official BF16 vision
+safetensors. All other scales, biases (including `vision/patch_embedding_bias`, which stays
+BF16), MTP matrices and front-end resources are preserved byte-for-byte from the published
+container. The re-exported working artifact (`coder390-basemtp.ninfer`) is what the engine
+loads.
+
+The FP16-vision working `.ninfer` is **not yet published** separately; the published HF file is
+the raw NVFP4 container directly from the Hugging Face repo. To reproduce the served weights,
+have the AI convert from the original vision safetensors: read each vision linear matrix, cast
+BF16→FP16, and write it into the artifact as a `FP16` object before re-exporting the container.
+
 ## Concurrent serving
 
 With `max_concurrency=8`, bounded FIFO ingress and no preemption, up to 8 admitted requests run

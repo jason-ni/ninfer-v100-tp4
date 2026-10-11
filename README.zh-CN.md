@@ -7,8 +7,28 @@ TP4 是主要服务路径，TP2（两卡）作为回退，两条路径共用同�
 artifact（或 LM Studio GGUF 转换得到的 Q4_K_M `.ninfer`），180,000 token 容量，完整 INT8 group-64
 KV，最多三个草稿的 MTP（允许接受零个）。
 
-性能数据分为 [TP4](#tp4-测量首批数据) 和 [TP2 P2P 开启](#性能p2p-开启)/[P2P 关闭](#性能p2p-关闭) 两区；
-构建与 [并发 HTTP 启动命令](#构建与运行) 在下方。
+性能数据分为 [TP4](#tp4-测量首批数据) 和 [TP2 P2P 开启](#性能tp2--p2p-开启)/[P2P 关闭](#性能tp2--p2p-关闭) 两区；
+构建与 [并发 HTTP 启动命令](#构建与模型) 在下方。
+
+## 模型格式与来源
+
+主要服务模型是
+**Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-MTP-DFlash2**，来自
+[nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-MTP-DFlash2](
+https://huggingface.co/nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-MTP-DFlash2/tree/main/NVFP4-NInfer/W4A4-W8A8)
+下的 `NVFP4-NInfer/W4A4-W8A8` NVFP4 容器
+（`Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-MTP-DFlash2.ninfer`）。
+容器内文本权重为 **4-bit FP4 (W4A4)** NVFP4（宽 prefill GEMM 路径），注意力 KV 为 **W8A8 INT8**，
+原生 **MTP** 路径（≤3 token 草稿窗口），以及可选的五层 **DFlash2** 草稿包。
+
+所有 vision-tower 权重——patch 投影、每层 block 的 qkv/o_proj/fc1/fc2，以及 merger 的 fc1/fc2——
+均以**原生 FP16** 形式写入，由官方 BF16 vision safetensors 直接转换而来。其余所有 scale、bias
+（包括 `vision/patch_embedding_bias` 保留为 BF16）、MTP 矩阵和前端资源均逐字节原样保留。
+引擎实际加载的是重新导出的工作 artifact（`coder390-basemtp.ninfer`）。
+
+FP16-vision 工作版 `.ninfer` **目前未单独发布**；HF 上的原始 NVFP4 容器是下载后直接使用的形式。
+要复现已交付权重，需要由 AI 从原始 BF16 vision safetensors 转换：读取每个 vision linear
+权重矩阵，BF16→FP16 cast，写入 artifact 为 `FP16` 对象，再重新导出容器。
 
 ## 并发推理
 
