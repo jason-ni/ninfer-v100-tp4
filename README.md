@@ -1,25 +1,82 @@
-# NInfer V100X2
+# NInfer V100 TP4
 
-[中文文档](README.zh-CN.md) · [Performance methodology](docs/performance.md)
+[中文文档](README.zh-CN.md) · [Performance methodology](docs/performance.md) · [HTTP API](docs/serving.md)
 
-Performance results are separated into [P2P enabled](#p2p-enabled) and
-[P2P disabled](#p2p-disabled); build and launch instructions are shared below.
+A concurrent-serving engine for Qwen3.8-27B on **Tesla V100-SXM2 16 GB** (`sm_70`, CUDA 12.8).
+TP4 (four cards) is the primary target; each card holds roughly 9 GiB of weights plus a share of
+the KV pool, leaving enough headroom for 180,000-token context at INT8-64 KV. TP2 (two cards) is
+the two-card fallback. Both widths share the same engine code. The default profile uses the
+official NVFP4 artifact (or the Q4_K_M-derived `.ninfer`), 180,000-token capacity, INT8 group-64
+KV, and MTP with up to three drafts (zero accepted drafts is valid).
 
-This fork is tuned for one-request Qwen3.8-27B inference on **Tesla V100-SXM2 16 GB**
-(`sm_70`, CUDA 12.8), at tensor-parallel width 2 or 4. Its default profile uses the LM Studio
-Q4_K_M-derived `.ninfer` artifact, 180,000-token context capacity, complete INT8 group-64 KV,
-TP2, CUDA Graphs, and MTP with up to three drafts (zero accepted drafts is valid). TP4 splits the
-same resident model across four cards, quartering the per-GPU weight footfall to free KV headroom;
-it uses NCCL collectives and one CUDA Graph per rank. Context capacity is an allocation limit, not
-the number of prompt tokens in a benchmark.
+Performance results are separated into [TP4](#tp4-measurements-first-measurements) and
+[TP2 measurements](#tp2--p2p-enabled); build and launch instructions are shared below.
 
-The starting point combines the RTX 3060 TP2 work and the Volta implementation from
-[`geoffwatts/ninfer-v100`](https://github.com/geoffwatts/ninfer-v100), based on
-[Neroued/ninfer](https://github.com/Neroued/ninfer). This README contains V100X2-specific changes
-and measurements only; inherited RTX 5090/Ampere/Ada results and general upstream capabilities are
-intentionally omitted.
+## Concurrent serving
 
-## V100X2 changes
+With `max_concurrency=8`, bounded FIFO ingress and no preemption, up to 8 admitted requests run
+concurrently on TP4. New requests are admitted only when one of the eight slots is free; running
+requests are never evicted. The mixed prefill/decode forward eliminates the serial
+`decode → prefill → decode` alternation: when a prefill owner and concurrent decode-ready rows
+are present in the same round, the owner's prefill slab and the decode rows share one flat
+forward pass—the linear leaves run once over the whole stream. Prefill and decode tokens
+therefore complete in the same wall-time window rather than in separate scheduling units.
+
+The hybrid prefix cache (opt-in, `--prefix-cache`) recovers conversation state from device
+snapshot blocks or pinned-host demoted blocks after device eviction, so long multi-turn
+conversations survive VRAM pressure without full recomputation.
+
+MTP3 speculative decoding is fully integrated at TP4: the speculative-verify slab is folded into
+the mixed unit when both prefill and decode are present, and runs as a standalone verify step when
+the mixed unit is ineligible.
+
+## Metrics
+
+The serve exposes Prometheus metrics at `GET /metrics` (JSON is available via the serve's internal
+`MetricsSnapshot` API).
+
+```text
+ninfer_kv_pages{pool="main",kind="capacity"}  135869434
+ninfer_kv_pages{pool="main",kind="mapped"}    135869434
+ninfer_kv_pages{pool="main",kind="cached"}     9308386
+ninfer_kv_pages{pool="main",kind="free"}     126561058
+ninfer_kv_page_bytes{pool="main"}               18872576
+ninfer_prefix_cache_enabled                        1
+ninfer_prefix_cache_device_snapshot_slots{kind="total"} 7
+ninfer_prefix_cache_host_enabled                   1
+ninfer_prefix_cache_host_bytes{kind="pinned"}    29527900160
+ninfer_prefix_cache_host_bytes{kind="used"}          69206016
+ninfer_prefix_cache_host_slabs{kind="block"}       8
+ninfer_prefix_cache_host_slabs{kind="snapshot"}    6
+ninfer_requests{state="running"}                      4
+ninfer_requests{state="waiting"}                      0
+ninfer_computed_prefill_tokens_total               1499798
+ninfer_committed_decode_tokens_total                73984
+ninfer_decode_rounds_total                          47103
+ninfer_decode_row_rounds_total                     953303
+```
+
+KV pool metrics (capacity/mapped/cached/free pages and bytes-per-page) are exposed for the main
+and backend pools. Prefix cache state, device snapshot slots, pinned-host capacity and occupancy,
+and per-request scheduler state (running/prefilling/decode-ready/waiting) are also reported.
+
+## TP4 measurements (first measurements)
+
+### Single-request decode — NVFP4, INT8-64 KV, TP4 eager, MTP3
+
+NVFP4 v3 artifact, TP4, `--devices 0,1,2,3`, `--max-context 262144`, INT8-64 KV, MTP with
+three-draft window, CUDA Graph. One single-request stream: 85,000-token prompt, 512-token
+output, TTFT measured from request start to first token, committed decode rate measured as
+the post-TTFT tokens per second.
+
+| Prompt tokens | Committed decode tok/s¹ |
+|---:|---:|
+| 85,000 | **~270** |
+
+¹ First informal measurement; this cell is a single-request decode rate under TP4.
+Full P2P/peer-off A/B comparisons at TP4 are pending.
+
+## Engine changes on this branch
 
 - **Q4_K_M prefill:** cooperative SM70 GGML-K block decoding materializes rows into caller-owned
   FP16 workspace and feeds the Volta CUTLASS Tensor-Core GEMM. GDN control projection has an FP32
@@ -75,7 +132,7 @@ The two areas distinguish the current direct-P2P configuration from the peer-off
 earlier staging measurements. NVFP4 and Q4_K_M are different weight artifacts, not a matched
 quantization-quality comparison.
 
-### P2P enabled
+### TP2 — P2P enabled
 
 Measured on 2026-10-01 with two V100-SXM2 16 GB cards at 300 W each, CUDA 12.8, PCIe 3.0 ×16,
 PHB topology, `iommu=pt`, and identity IOMMU domains. NVIDIA P2P read/write checks pass and
@@ -222,7 +279,7 @@ not a universal token-parity or no-quality-loss result. All four 85K pairs match
 [Full prefill, acceptance, output-length and whole-request tables](docs/performance.md#stop-aware-non-code-workloads-dflash7-versus-mtp3)
 include the per-row output qualifications.
 
-### P2P disabled
+### TP2 — P2P disabled
 
 This area covers verified CUDA-managed UVA D2D staging, not an explicit NInfer pinned-host
 copy branch. Before `iommu=pt`, the host's translated `DMA-FQ` domains prevented direct P2P.
@@ -395,19 +452,19 @@ is the 98,304-capacity measurement above, and 180K DFlash is intentionally not a
 
 Requirements for this profile: 64-bit Linux, NVIDIA driver, CUDA 12.8, CMake 3.28+, C++20 host
 compiler, Ninja, pkg-config, FFmpeg development libraries (`libavformat >= 60`, `libavcodec >= 60`,
-`libavutil >= 58`, `libswscale >= 7`) and libcurl >= 7.85. Build dependencies locally when the
-system versions do not meet those requirements:
+`libavutil >= 58`, `libswscale >= 7`) and libcurl >= 7.85.
 
 ```bash
 tools/v100/build_dependencies.sh
-PKG_CONFIG_PATH="$PWD/build/_deps/install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
 cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
   -DCMAKE_CUDA_ARCHITECTURES=70
 cmake --build build-v100 -j2
 ```
 
-Convert the local LM Studio source model once (Python 3.11 with NumPy):
+### Single request
+
+Convert the LM Studio GGUF source (Python 3.11, NumPy):
 
 ```bash
 python3 -m tools.convert.qwen3_8_27b.convert_gguf \
@@ -416,24 +473,50 @@ python3 -m tools.convert.qwen3_8_27b.convert_gguf \
   --out /Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer
 ```
 
-Run a request with the V100X2 defaults (devices `0,1`, 180K capacity, 4K prefill chunks, INT8 KV,
-MTP3 and optimized draft head):
+TP4, NVFP4, 180K capacity, INT8-64 KV, MTP3 (devices selected via `CUDA_VISIBLE_DEVICES`):
 
 ```bash
-tools/v100/ninfer-v100x2.sh \
-  --prompt "Explain prefill and decode in three sentences." \
-  --max-new 128 --greedy --no-thinking
+CUDA_VISIBLE_DEVICES=0,1,2,3 GGML_CUDA_PDL=0 dist/tp4 \
+  --model <artifact> --tp 4 --kv-dtype int8 --prefill-chunk 4096 \
+  --max-ctx 180000 --mtp-draft-tokens 3 --lm-head-draft \
+  --prompt "Explain prefill and decode in three sentences." -ng 64 --no-thinking
 ```
 
-Set `NINFER_V100X2_ARTIFACT`, `NINFER_V100X2_DEVICES`, `NINFER_V100X2_MAX_CONTEXT`,
-`NINFER_V100X2_PREFILL_CHUNK`, `NINFER_V100X2_KV_DTYPE`, or
-`NINFER_V100X2_DRAFT_TOKENS` to override the launcher defaults. The launcher does not constrain
-host CPU affinity; benchmark CPU use should remain below the operator's 85% ceiling.
+The KV pools (capacity / mapped / cached / free pages, and bytes-per-page) are printed as JSON to
+stderr when the CLI process exits. In a running HTTP serve the same data is exposed at
+`GET /metrics` as `ninfer_kv_pages` and `ninfer_kv_page_bytes` (see [Metrics](#metrics) above).
+Set `NINFER_V100X2_DEBUG_MIXED=1` to log each mixed-unit round (owner lane, decode rows) to stderr.
 
-The current P2P corpus is local at `profiles/bench/v100-code-85000-iommu-pt.ids`; earlier staging
-measurements used `/tmp/v100-code-85000.ids`. Corpora, model artifacts and raw profiler reports
-are not included in the repository. See [performance methodology](docs/performance.md) for
-corpus generation, benchmark commands and additional qualifications.
+### Concurrent HTTP serve
+
+TP4, 4 active slots, 16-slot pending queue, 28 GiB pinned-host tier, 262,144 context capacity,
+hybrid prefix cache, CUDA Graph decode, MTP3:
+
+```bash
+./run-tp4.sh \
+  --max-concurrency 4 --pending-timeout-ms 300000 \
+  --prefix-cache --host-cache-mib 28192 --max-context 262144 \
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --cuda-graph --port 8080 --model-id qwen3.8-27b
+```
+
+Streaming chat request:
+
+```bash
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -d '{"messages":[{"role":"user","content":"Explain prefill and decode."}],
+       "max_tokens":128,"stream":true,"temperature":0,"reasoning_effort":"high"}'
+```
+
+Live KV-metrics scrape:
+
+```bash
+curl -s http://127.0.0.1:8080/metrics | grep 'ninfer_kv_pages\|ninfer_prefix_cache_host'
+```
+
+Corpora, model artifacts and raw profiler reports are not included in the repository. See
+[performance methodology](docs/performance.md) for corpus generation, benchmark commands and
+additional qualifications.
 
 ## Verification
 
@@ -459,12 +542,9 @@ CLI, server and benchmark are rebuilt with these changes.
 V100X2 implementation work builds on [Neroued/ninfer](https://github.com/Neroued/ninfer), the
 RTX 3060 TP2 fork, and [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100).
 Volta NVFP4 and TP2 behavior was cross-checked against
-[plus1998/Ninfer-V100-Duo](https://github.com/plus1998/Ninfer-V100-Duo). The prefill investigation
-consulted [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM). DFlash2 follows
+[plus1998/Ninfer-V100-Duo](https://github.com/plus1998/Ninfer-V100-Duo). DFlash2 follows
 [Inco AI's implementation](https://inco.ai/blog/dflash2/) and its
-[Qwen3.8-27B draft checkpoint](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2). KVMem was
-reviewed but not integrated: selective-history retrieval changes attention semantics, while this
-profile retains full-context attention.
+[Qwen3.8-27B draft checkpoint](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2).
 
 The measured models derive from [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B).
 The NVFP4 artifact uses the mixed FP8/NVFP4 weights from

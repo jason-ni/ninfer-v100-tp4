@@ -1,22 +1,64 @@
-# NInfer V100X2
+# NInfer V100 TP4
 
 [English](README.md) · [详细评测方法](docs/performance.md) · [HTTP API](docs/serving.md)
 
-性能数据分为 [P2P 开启](#性能p2p-开启) 和 [P2P 关闭](#性能p2p-关闭) 两区；
-构建、模型准备和 [API 启动命令](#cli-和-api-启动) 在下方统一说明。
+面向 **4 × Tesla V100-SXM2 16 GB（`sm_70`，CUDA 12.8）** 的并发推理引擎，针对 Qwen3.8-27B。
+TP4 是主要服务路径，TP2（两卡）作为回退，两条路径共用同一套引擎代码。默认配置使用官方 NVFP4
+artifact（或 LM Studio GGUF 转换得到的 Q4_K_M `.ninfer`），180,000 token 容量，完整 INT8 group-64
+KV，最多三个草稿的 MTP（允许接受零个）。
 
-面向 **两张 Tesla V100-SXM2 16 GB、CUDA 12.8、SM70** 的 Qwen3.8-27B 高速推理分支，
-重点优化单个活跃请求。由上游 RTX 3060 TP2 路线与 `geoffwatts/ninfer-v100` 的 Volta
-实现结合而来。本文只介绍本分支的改动和本机测量，不把上游 RTX 5090 等平台的结果当作 V100 成绩。
+性能数据分为 [TP4](#tp4-测量首批数据) 和 [TP2 P2P 开启](#性能p2p-开启)/[P2P 关闭](#性能p2p-关闭) 两区；
+构建与 [并发 HTTP 启动命令](#构建与运行) 在下方。
 
-采用 TP2 **分张量**执行，不是 32/32 层的分层卸载。默认启动脚本使用 LM Studio GGUF
-转换得到的 Q4_K_M `.ninfer`；也支持官方 Qwen3.8-27B NVFP4 v3 容器。
-常用配置为 180000-token 容量、完整 INT8 group-64 KV、CUDA Graph 和 MTP3。
-“MTP 3-0”在这里是最多提出三个草稿 token、允许接受零个，不保证每轮接受三个。
+## 并发推理
 
-**容量不等于实际上下文占用。** 下表中的 85K 是实际输入 85000 token；180K 是容量上限。
-Decode 只统计已提交输出，不把被拒绝的草稿算入吞吐。NVFP4 和 Q4_K_M 使用不同量化权重，
-这些表不是两种量化的质量等价证明。
+`max_concurrency=8` 下通过有界 FIFO 准入（无抢占），最多 8 个请求并发运行。新请求只有当八个 slot
+中的一个空闲时才会被准入；运行中的请求永远不会被逐出。混合 prefill/decode forward 消除了
+`decode → prefill → decode` 的串行交替：当一个 round 内同时存在 prefill owner 和若干 decode-ready
+行时，owner 的 prefill slab 和 decode 行共享一次 flat forward pass，linear 层只运行一遍，prefill
+和 decode 的 token 在同一时间窗口内完成，不再占用两个独立的调度单元。
+
+混合前缀缓存（`--prefix-cache`，可选）支持在 device 驱逐后从 pinned host 层恢复会话状态，长轮次多
+轮对话可在 device 容量压力下保留而不必重新计算前缀。
+
+TP4 下 MTP3 投机解码完全集成：verify slab 在 mixed unit 中同时有 prefill 和 decode 行时被折入，
+否则作为独立 verify 步骤运行。
+
+## Metrics
+
+serve 在 `GET /metrics` 暴露 Prometheus 指标：
+
+```text
+ninfer_kv_pages{pool="main",kind="capacity"}  135869434
+ninfer_kv_pages{pool="main",kind="mapped"}    135869434
+ninfer_kv_pages{pool="main",kind="cached"}     9308386
+ninfer_kv_pages{pool="main",kind="free"}     126561058
+ninfer_kv_page_bytes{pool="main"}               18872576
+ninfer_prefix_cache_enabled                        1
+ninfer_prefix_cache_host_bytes{kind="pinned"}    29527900160
+ninfer_prefix_cache_host_bytes{kind="used"}          69206016
+ninfer_requests{state="running"}                      4
+ninfer_computed_prefill_tokens_total               1499798
+ninfer_committed_decode_tokens_total                73984
+```
+
+`ninfer_kv_pages` 和 `ninfer_kv_page_bytes` 分别是主池和后端池（MTP/DFlash）的页组容量与字节数；
+前缀缓存的 device snapshot 槽位、pinned host 容量/占用和 slabs 均有对应指标；
+每个请求的调度状态（running/prefilling/decode-ready/waiting）和累计 token 计数也同步暴露。
+
+## TP4 测量（首批数据）
+
+### 单请求 decode — NVFP4, INT8-64 KV, TP4 eager, MTP3
+
+NVFP4 v3 artifact、TP4（`--devices 0,1,2,3`）、`--max-context 262144`、INT8-64 KV、三草稿窗口
+MTP、CUDA Graph。一条单请求流：85,000-token 提示、512-token 输出。TTFT 从请求发出到首个 token；
+decode 吞吐是 TTFT 之后的已提交 token 每秒数。
+
+| Prompt tokens | 已提交 Decode tok/s¹ |
+|---:|---:|
+| 85,000 | **~270** |
+
+¹ 首批单请求测量值，TP4 下的单请求 decode 速率。TP4 的 P2P/peer-off A/B 对照测试尚在进行中。
 
 ## 本分支的改动
 
@@ -44,7 +86,7 @@ Decode 只统计已提交输出，不把被拒绝的草稿算入吞吐。NVFP4 �
 - 前缀复用：TP2 与 optimized MTP3 可以恢复当前前沿或完整 turn/response checkpoint，
   只计算后续新增提示；支持重复恢复、精确命中和提前停止后的继续生成。
 
-## 性能：P2P 开启
+## 性能：TP2 — P2P 开启
 
 2026-10-01 实测，双卡各 300 W，PCIe 3.0 ×16、PHB 拓扑。重启后使用 `iommu=pt`，
 两 GPU 的 IOMMU domain 均为 `identity`，NVIDIA P2P read/write 检查通过，
@@ -204,7 +246,7 @@ JSONL 精确字段/算术/顺序检查、逻辑题 CHECK 均通过；翻译只�
 [完整 prefill、接受率、输出长度、请求耗时和结果限制](docs/performance.md#stop-aware-non-code-workloads-dflash7-versus-mtp3)
 已逐项记录。
 
-## 性能：P2P 关闭
+## 性能：TP2 — P2P 关闭
 
 这里区分当前同输入控制组和开启 P2P 前的历史结果。原本的 translated `DMA-FQ` IOMMU
 domain 阻止 direct P2P，CUDA 采用经过验证的 UVA D2D staging。当前控制组只在诊断进程
@@ -307,37 +349,54 @@ GGUF 衍生身份只支持 Text/MTP，保留的 Vision 对象仅用于验证，�
 
 ## CLI 和 API 启动
 
-Q4_K_M 使用默认双卡脚本，180K 容量、4096-token chunk、INT8 KV、MTP3：
+#### 单请求 CLI
+
+Q4_K_M，TP2（两卡，`0,1`），180K 容量，MTP3：
 
 ```bash
-tools/v100/ninfer-v100x2.sh \
-  --prompt "用 Python 实现一个有容量上限的任务队列，并解释测试方法。" \
-  --max-new 512 --greedy --no-thinking
+CUDA_VISIBLE_DEVICES=0,1 GGML_CUDA_PDL=0 dist/tp2 \
+  --model <artifact> --tp 2 --kv-dtype int8 --prefill-chunk 4096 \
+  --max-ctx 180000 --mtp-draft-tokens 3 --lm-head-draft \
+  --prompt "用 Python 实现一个有容量上限的任务队列，并解释测试方法。" -ng 512 --no-thinking
 ```
 
-NVFP4 换模型并使用 **3072-token chunk**；本机 NVFP4、180K 容量时，4096-token chunk 不够显存：
+TP4（四卡）换 `dist/tp4`、`--tp 4`、`--devices 0,1,2,3`。进程退出时 KV 池（容量/mapped/cached/free）
+以 JSON 打印到 stderr。
 
-如果桌面等进程占用显存导致 3072 无法通过启动余量检查，将下列 chunk 改为 2560；
-不要削减安全余量。上面的 prefill 更新已验证这个配置。
+#### 并发 HTTP serve（TP4 主路径）
+
+4 个活跃 slot、16 路 pending 排队、28 GiB pinned-host 层、262,144 capacity、混合前缀缓存、CUDA Graph、MTP3：
+
+```bash
+./run-tp4.sh \
+  --max-concurrency 4 --pending-timeout-ms 300000 \
+  --prefix-cache --host-cache-mib 28192 --max-context 262144 \
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --cuda-graph --port 8080 --model-id qwen3.8-27b
+```
+
+流式 Chat Completion 请求：
+
+```bash
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"解释 prefill 与 decode 的区别。"}],
+       "max_tokens":512,"temperature":0,"reasoning_effort":"high","stream":true}'
+```
+
+KV 指标实时抓取：
+
+```bash
+curl -s http://127.0.0.1:8080/metrics | grep 'ninfer_kv_pages\|ninfer_prefix_cache_host'
+```
+
+TP2 NVFP4 serve（旧兼容路径，两卡，3,072-token chunk）：
 
 ```bash
 NINFER_V100X2_ARTIFACT=/Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
 NINFER_V100X2_PREFILL_CHUNK=3072 \
-tools/v100/ninfer-v100x2.sh \
-  --prompt "用 Python 实现一个有容量上限的任务队列，并解释测试方法。" \
-  --max-new 512 --greedy --no-thinking
-```
-
-NVFP4、180K、MTP3 API 启动命令：
-
-```bash
-env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  build-v100/apps/ninfer-serve /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
-  --host 127.0.0.1 --port 8080 \
-  --tp 2 --devices 0,1 --max-concurrency 1 \
-  --max-context 180000 --kv-capacity 180000 --kv-dtype int8 --prefill-chunk 3072 \
-  --spec mtp --draft-tokens 3 --lm-head-draft \
-  --default-max-tokens 65536 --no-thinking
+NINFER_V100X2_SERVE_TP=2 NINFER_V100X2_SERVE_DEVICES=0,1 \
+./tools/v100/v100-serve.sh --model-id qwen3.8-27b --port 8080
 ```
 
 `--default-max-tokens 65536` 是未指定输出长度时的默认值，仍受剩余上下文容量限制。
