@@ -76,8 +76,8 @@ if [[ -n "${raw_log_path}" ]]; then
 fi
 
 if [[ "${vision_requested}" -eq 1 && -z "${NINFER_V100X2_SERVE_ARTIFACT:-}" ]]; then
-    #vision_artifact_default=/media/zt/models/orcarouter/conv_fp16vision/qwen3_8_27b_nvfp4.ninfer
-    vision_artifact_default=/media/zt/models/orcarouter/coder390-basemtp.ninfer
+    vision_artifact_default=/media/zt/models/orcarouter/conv_fp16vision/qwen3_8_27b_nvfp4.ninfer
+    #vision_artifact_default=/media/zt/models/orcarouter/coder390-basemtp.ninfer
     export NINFER_V100X2_SERVE_ARTIFACT="${NINFER_V100X2_SERVE_VISION_ARTIFACT:-${vision_artifact_default}}"
 fi
 

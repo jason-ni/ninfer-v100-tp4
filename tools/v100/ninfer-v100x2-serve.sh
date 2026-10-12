@@ -14,8 +14,9 @@ repo_dir=$(cd -- "${script_dir}/../.." && pwd)
 executable=${NINFER_V100X2_SERVE_EXECUTABLE:-"${repo_dir}/dist/ninfer-serve"}
 artifact=${NINFER_V100X2_SERVE_ARTIFACT:-/media/zt/models/orcarouter/qwen3_8_27b_nvfp4.ninfer}
 host=${NINFER_V100X2_SERVE_HOST:-0.0.0.0}
-port=${NINFER_V100X2_SERVE_PORT:-8081}
+port=${NINFER_V100X2_SERVE_PORT:-8080}
 tp=${NINFER_V100X2_SERVE_TP:-2}
+presence_penalty=${PRESENCE_PENALTY:-1.0}
 devices=${NINFER_V100X2_SERVE_DEVICES:-0,1}
 max_context=${NINFER_V100X2_SERVE_MAX_CONTEXT:-140000}
 kv_capacity=${NINFER_V100X2_SERVE_KV_CAPACITY:-auto}
@@ -99,6 +100,7 @@ exec "${executable}" "${artifact}" \
     --kv-dtype "${kv_dtype}" \
     --max-concurrency "${max_concurrency}" \
     --pending-timeout-ms "300000" \
+    --presence-penalty "${presence_penalty}" \
     --spec mtp --draft-tokens "${draft_tokens}" \
     --lm-head-draft \
     ${serve_args[@]+"${serve_args[@]}"} "$@"
