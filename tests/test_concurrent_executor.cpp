@@ -184,6 +184,17 @@ public:
             .active_lanes = max_concurrency_, .main_kv_pages = max_concurrency_, .backend_kv_pages = 0};
     }
 
+    // The executor seeds and refreshes its published /metrics snapshot from the Program at
+    // construction and at every scheduling boundary; the scripted fake carries no resource gauges.
+    [[nodiscard]] ninfer::MetricsSnapshot metrics() const noexcept { return {}; }
+
+    // The executor exposes the remaining Program telemetry through the Engine; the scripted fake
+    // models no mixed-owner merging and runs no peer egress checking.
+    [[nodiscard]] bool mixed_owner_eligible(std::uint32_t) const noexcept { return false; }
+    void enable_peer_egress_check(bool) noexcept {}
+    [[nodiscard]] std::uint64_t peer_egress_check_rounds() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t peer_egress_check_mismatches() const noexcept { return 0; }
+
     // The budget comes from the request's own options, never from the script queue: with several
     // requests in flight the executor plans one while another is still holding the queue head.
     [[nodiscard]] ScriptedPlan plan_request_base(const q36::PreparedPrompt& prompt,
