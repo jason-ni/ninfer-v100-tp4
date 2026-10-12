@@ -31,6 +31,7 @@
 
 #include "ops/common/volta_mma.cuh"
 #include "ops/kernel/gqa_attention_decode.cuh"
+#include "ops/kernel/gqa_attention_kv_iq4nl.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 
 #include <cuda_bf16.h>
@@ -83,9 +84,11 @@ inline constexpr std::size_t kGqaSmallTI8VoltaV2SmemBytes =
                     + 2 * kGqaSmallTI8VoltaV2Bc * kGqaSmallTI8VoltaV2Stride   // k_s, v_s
                     + 32 * kGqaSmallTI8VoltaV2PStride)                        // p_s
     + sizeof(float) * kGqaSmallTI8VoltaV2Warps * 32                               // red_s
-    + sizeof(std::int32_t) * kGqaSmallTI8VoltaV2Pages<Geometry>;                  // pages_s
+    + sizeof(std::int32_t) * kGqaSmallTI8VoltaV2Pages<Geometry>                  // pages_s
+    + sizeof(std::int8_t) * 16;                                                       // iq4nl lut
 
-template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool IsI4NL,
+          typename CacheInput>
 __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
     void gqa_attention_small_t_tc_volta_partial_i8_v2_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
@@ -109,7 +112,7 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
     constexpr int KeyGroups    = Bc / 8;        // 8, one per warp for QK^T
     constexpr int Stride       = kGqaSmallTI8VoltaV2Stride;
     constexpr int PStride      = kGqaSmallTI8VoltaV2PStride;
-    constexpr int Groups       = D / kGqaKvQuantGroup;
+    constexpr int Groups       = IsI4NL ? kGqaI4NLGroups : kGqaKvQuantGroups;
     constexpr float Log2E      = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
     static_assert(KeyGroups == Warps, "one 8-key QK^T group per warp");
@@ -123,6 +126,10 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
     half* p_s  = v_s + Bc * Stride;
     float* red_s = reinterpret_cast<float*>(p_s + Br * PStride);
     std::int32_t* physical_pages_s = reinterpret_cast<std::int32_t*>(red_s + Warps * 32);
+    // The IQ4_NL-G32 LUT lives at the tail of the dynamic tile for both codecs (the INT8
+    // instantiations carry the 16 bytes unused) so the launch-time smem size is one constant.
+    std::int8_t* lut_s = reinterpret_cast<std::int8_t*>(physical_pages_s +
+                                                        kGqaSmallTI8VoltaV2Pages<Geometry>);
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
@@ -131,6 +138,8 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
     const int tid         = static_cast<int>(threadIdx.x);
     const int warp        = tid >> 5;
     const int lane        = tid & 31;
+    if (tid < 16) { lut_s[tid] = gqa_i4nl_value_at(tid); }
+    __syncthreads(); // lut_s visible to every thread before the first encode/dequant use
     int valid_tokens      = tokens;
     if constexpr (Masked) {
         const int remaining = valid_columns[batch] - column_begin;
@@ -226,6 +235,42 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
 
     if constexpr (CacheInput::writes_cache) {
         // Quantize this tile's new rows into the cache before any of it is staged back out.
+        if constexpr (IsI4NL) {
+            // One warp owns one (token, 32-group): one source value per lane, so the reference
+            // encode pipeline runs as a straight warp-wide pass. Bit-for-bit the same codes and
+            // scales as every other writer of this cache must produce.
+            for (int pair = warp; pair < valid_tokens * Groups; pair += Warps) {
+                const int token    = pair / Groups;
+                const int grp      = pair - token * Groups;
+                const int position = pos[token];
+                if (position < split_start || position >= split_end || position < 0 ||
+                    position >= logical_capacity) {
+                    continue;
+                }
+                int physical_page = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+                physical_page     = __shfl_sync(FullMask, physical_page, 0);
+                const int page_offset = position & kPagedKVPageMask;
+                const int d           = grp * kGqaI4NLGroup + lane;
+                const float kv  = __bfloat162float(input.k[gqa_kv_new_index<Geometry>(kv_head, d, token)]);
+                const float vv  = __bfloat162float(input.v[gqa_kv_new_index<Geometry>(kv_head, d, token)]);
+                std::uint32_t k_byte, v_byte;
+                half k_sh, v_sh;
+                gqa_i4nl_encode_warp(kv, FullMask, lut_s, k_byte, k_sh);
+                gqa_i4nl_encode_warp(vv, FullMask, lut_s, v_byte, v_sh);
+                if (lane < 16) {
+                    const std::int64_t cb = gqa_i4nl_code_index<Geometry::KVHeads>(
+                        physical_page, kv_head, grp * kGqaI4NLGroup + 2 * lane, page_offset);
+                    cache_k_i8[cb] = static_cast<std::int8_t>(k_byte & 0xff);
+                    cache_v_i8[cb] = static_cast<std::int8_t>(v_byte & 0xff);
+                }
+                if (lane == 0) {
+                    const std::int64_t so = gqa_i4nl_scale_index<Geometry::KVHeads>(
+                        physical_page, kv_head, grp, page_offset);
+                    cache_k_scale[so]    = k_sh;
+                    cache_v_scale[so]    = v_sh;
+                }
+            }
+        } else {
         // One warp owns one (token, 64-group) pair so that the absmax reduction that sets the
         // group's scale is exactly a full-warp reduction: 32 lanes x 2 elements = 64 = one group.
         // This mirrors the phase-1 kernel's append block (and the SIMT kernel's); the codes have
@@ -270,6 +315,7 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
                 cache_v_scale[so] = vsh;
             }
         }
+        } // else !IsI4NL
     }
 
     // Q tile: 32 rows (rows >= row_count are zero). The INT8 cache stores raw values here (no
@@ -320,19 +366,41 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
     static_assert(Bc * (D / 8) % Threads == 0);
     int2 k_codes[ChunksPerThread], v_codes[ChunksPerThread];
     half k_scales[ChunksPerThread], v_scales[ChunksPerThread];
-    auto load_tile = [&](int kb) {
+auto load_tile = [&](int kb) {
         const int k0   = first_tile + kb * Bc;
         const int page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
         // Interior tile: a 64-key tile is exactly one page, and thread tid owns key (warp + 8i)
         // and columns lane*8..+7, so every address is the page base plus a constant.
         if (k0 >= split_start && k0 + Bc <= split_end) {
+            if constexpr (IsI4NL) {
+                const std::int64_t code_base =
+                    paged_kv_page_head_offset<kGqaI4NLHeadCodes, Geometry::KVHeads>(page, kv_head) +
+                    warp * kGqaI4NLHeadCodes + lane * 4;
+                const std::int64_t scale_base =
+                    paged_kv_page_head_offset<kGqaI4NLGroups, Geometry::KVHeads>(page, kv_head) +
+                    warp * kGqaI4NLGroups + (lane * 8) / kGqaI4NLGroup;
+                #pragma unroll
+                for (int i = 0; i < ChunksPerThread; ++i) {
+                    k_codes[i].x =
+                        static_cast<int>(load_vec<std::uint32_t>(cache_k_i8 + code_base +
+                                                                 i * 8 * kGqaI4NLHeadCodes));
+                    v_codes[i].x =
+                        static_cast<int>(load_vec<std::uint32_t>(cache_v_i8 + code_base +
+                                                                 i * 8 * kGqaI4NLHeadCodes));
+                    k_codes[i].y = 0;
+                    v_codes[i].y = 0;
+                    k_scales[i]  = cache_k_scale[scale_base + i * 8 * kGqaI4NLGroups];
+                    v_scales[i]  = cache_v_scale[scale_base + i * 8 * kGqaI4NLGroups];
+                }
+                return;
+            }
             const std::int64_t code_base =
                 paged_kv_page_head_offset<kGqaHeadDim, Geometry::KVHeads>(page, kv_head) +
                 warp * kGqaHeadDim + lane * 8;
             const std::int64_t scale_base =
                 paged_kv_page_head_offset<kGqaKvQuantGroups, Geometry::KVHeads>(page, kv_head) +
                 warp * kGqaKvQuantGroups + (lane * 8) / kGqaKvQuantGroup;
-#pragma unroll
+            #pragma unroll
             for (int i = 0; i < ChunksPerThread; ++i) {
                 k_codes[i]  = load_vec<int2>(cache_k_i8 + code_base + i * 8 * kGqaHeadDim);
                 v_codes[i]  = load_vec<int2>(cache_v_i8 + code_base + i * 8 * kGqaHeadDim);
@@ -341,7 +409,7 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
             }
             return;
         }
-#pragma unroll
+        #pragma unroll
         for (int i = 0; i < ChunksPerThread; ++i) {
             const int chunk = tid + i * Threads;
             const int key_l = chunk / (D / 8);
@@ -349,14 +417,29 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
             const int key   = k0 + key_l;
             if (key >= split_start && key < split_end) {
                 const int page_offset = key & kPagedKVPageMask;
-                const std::int64_t code_off =
-                    gqa_kv_quant_code_index<Geometry>(page, kv_head, d, page_offset);
-                const std::int64_t scale_off = gqa_kv_quant_scale_index<Geometry>(
-                    page, kv_head, d / kGqaKvQuantGroup, page_offset);
-                k_codes[i]  = load_vec<int2>(&cache_k_i8[code_off]);
-                v_codes[i]  = load_vec<int2>(&cache_v_i8[code_off]);
-                k_scales[i] = cache_k_scale[scale_off];
-                v_scales[i] = cache_v_scale[scale_off];
+                if constexpr (IsI4NL) {
+                    const std::int64_t code_off = gqa_i4nl_code_index<Geometry::KVHeads>(
+                        page, kv_head, d, page_offset);
+                    const std::int64_t scale_off = gqa_i4nl_scale_index<Geometry::KVHeads>(
+                        page, kv_head, d / kGqaI4NLGroup, page_offset);
+                    k_codes[i].x =
+                        static_cast<int>(load_vec<std::uint32_t>(&cache_k_i8[code_off]));
+                    v_codes[i].x =
+                        static_cast<int>(load_vec<std::uint32_t>(&cache_v_i8[code_off]));
+                    k_codes[i].y = 0;
+                    v_codes[i].y = 0;
+                    k_scales[i]  = cache_k_scale[scale_off];
+                    v_scales[i]  = cache_v_scale[scale_off];
+                } else {
+                    const std::int64_t code_off =
+                        gqa_kv_quant_code_index<Geometry>(page, kv_head, d, page_offset);
+                    const std::int64_t scale_off = gqa_kv_quant_scale_index<Geometry>(
+                        page, kv_head, d / kGqaKvQuantGroup, page_offset);
+                    k_codes[i]  = load_vec<int2>(&cache_k_i8[code_off]);
+                    v_codes[i]  = load_vec<int2>(&cache_v_i8[code_off]);
+                    k_scales[i] = cache_k_scale[scale_off];
+                    v_scales[i] = cache_v_scale[scale_off];
+                }
             } else {
                 k_codes[i]  = make_int2(0, 0);
                 v_codes[i]  = make_int2(0, 0);
@@ -391,14 +474,25 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
 
-        // ---- Dequantize the prefetched tile into shared memory, then prefetch the next one. ----
-#pragma unroll
+// ---- Dequantize the prefetched tile into shared memory, then prefetch the next one. ----
+        #pragma unroll
         for (int i = 0; i < ChunksPerThread; ++i) {
             const int chunk = tid + i * Threads;
             const int key_l = chunk / (D / 8);
             const int d     = (chunk - key_l * (D / 8)) * 8;
-            store_vec(&k_s[key_l * Stride + d], dequant8(k_codes[i], k_scales[i]));
-            store_vec(&v_s[key_l * Stride + d], dequant8(v_codes[i], v_scales[i]));
+            if constexpr (IsI4NL) {
+                // Eight nibbles share the lane's 32-group scale (d % 32 == 0 by construction), so
+                // one group scale serves the whole 8-wide dequant.
+                store_vec(&k_s[key_l * Stride + d],
+                          gqa_i4nl_dequant_x8(static_cast<std::uint32_t>(k_codes[i].x),
+                                              k_scales[i], lut_s));
+                store_vec(&v_s[key_l * Stride + d],
+                          gqa_i4nl_dequant_x8(static_cast<std::uint32_t>(v_codes[i].x),
+                                              v_scales[i], lut_s));
+            } else {
+                store_vec(&k_s[key_l * Stride + d], dequant8(k_codes[i], k_scales[i]));
+                store_vec(&v_s[key_l * Stride + d], dequant8(v_codes[i], v_scales[i]));
+            }
         }
         if (kb + 1 < key_blocks) { load_tile(kb + 1); }
         __syncthreads(); // (1) K/V tile staged

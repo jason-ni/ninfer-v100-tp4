@@ -67,6 +67,7 @@
 
 #include "ops/common/volta_mma.cuh"
 #include "ops/kernel/gqa_attention_decode.cuh"
+#include "ops/kernel/gqa_attention_kv_iq4nl.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 
 #include <cuda_bf16.h>
@@ -78,7 +79,7 @@
 namespace ninfer::ops {
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput>
+          bool IsI4NL, typename CacheInput>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial_i8_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
     std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
@@ -100,7 +101,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     constexpr int DSlice        = D / DimSplit;    // this warp's PV output width
     constexpr int DChunksLocal  = DSlice / 8;       // this warp's resident accumulator chunks
     constexpr int PageIds       = 64;
-    constexpr int Groups        = D / kGqaKvQuantGroup; // quant groups per key row
+    constexpr int Groups        = IsI4NL ? kGqaI4NLGroups : (D / kGqaKvQuantGroup); // quant groups per key row
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
@@ -127,6 +128,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     __shared__ __align__(16) half k_s[Bc * SmemStride];
     __shared__ __align__(16) half v_s[Bc * SmemStride];
     __shared__ std::int32_t physical_pages_s[PageIds];
+    __shared__ std::int8_t lut_s[16]; // IQ4_NL-G32 value table (unused by the INT8 instantiation)
     // Lane-major within each score component: consumers and producers access contiguous
     // banks, including the 24 live rows of a TP2 MTP4 call.
     __shared__ float scores_s[PVChunks][8][32];
@@ -138,6 +140,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     const int tid         = static_cast<int>(threadIdx.x);
     const int warp        = tid >> 5;
     const int lane        = tid & 31;
+    if (tid < 16) { lut_s[tid] = gqa_i4nl_value_at(tid); }
+    __syncthreads(); // lut_s visible before the first encode/dequant use
     const int dim_warp    = warp; // DimSplit == WarpsPerCta: every warp is a dim-slice of the one row-tile
     int valid_tokens       = tokens;
     if constexpr (Masked) {
@@ -232,11 +236,46 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
 
     if constexpr (CacheInput::writes_cache) {
         // Quantize this tile's new rows into the cache before any of it is staged back out.
+        const int warps = Threads / 32;
+        if constexpr (IsI4NL) {
+            // One warp owns one (token, 32-group); same bit-exact pipeline as the v2 kernel's
+            // and the SIMT kernel's IQ4 append block -- the kernels share this cache.
+            for (int pair = warp; pair < valid_tokens * Groups; pair += warps) {
+                const int token    = pair / Groups;
+                const int grp      = pair - token * Groups;
+                const int position = pos[token];
+                if (position < split_start || position >= split_end || position < 0 ||
+                    position >= logical_capacity) {
+                    continue;
+                }
+                int physical_page = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+                physical_page     = __shfl_sync(FullMask, physical_page, 0);
+                const int page_offset = position & kPagedKVPageMask;
+                const int d           = grp * kGqaI4NLGroup + lane;
+                const float kv  = __bfloat162float(input.k[gqa_kv_new_index<Geometry>(kv_head, d, token)]);
+                const float vv  = __bfloat162float(input.v[gqa_kv_new_index<Geometry>(kv_head, d, token)]);
+                std::uint32_t k_byte, v_byte;
+                half k_sh, v_sh;
+                gqa_i4nl_encode_warp(kv, FullMask, lut_s, k_byte, k_sh);
+                gqa_i4nl_encode_warp(vv, FullMask, lut_s, v_byte, v_sh);
+                if (lane < 16) {
+                    const std::int64_t cb = gqa_i4nl_code_index<Geometry::KVHeads>(
+                        physical_page, kv_head, grp * kGqaI4NLGroup + 2 * lane, page_offset);
+                    cache_k_i8[cb] = static_cast<std::int8_t>(k_byte & 0xff);
+                    cache_v_i8[cb] = static_cast<std::int8_t>(v_byte & 0xff);
+                }
+                if (lane == 0) {
+                    const std::int64_t so = gqa_i4nl_scale_index<Geometry::KVHeads>(
+                        physical_page, kv_head, grp, page_offset);
+                    cache_k_scale[so]    = k_sh;
+                    cache_v_scale[so]    = v_sh;
+                }
+            }
+        } else {
         // One warp owns one (token, 64-group) pair so that the absmax reduction that sets the
         // group's scale is exactly a full-warp reduction: 32 lanes x 2 elements = 64 = one
         // group. This mirrors the SIMT kernel's append block (gqa_attention_decode_i8.cuh);
         // the codes have to come out bit-identical, since the two kernels share a cache.
-        const int warps = Threads / 32;
         for (int pair = warp; pair < valid_tokens * Groups; pair += warps) {
             const int token    = pair / Groups;
             const int grp      = pair - token * Groups;
@@ -279,6 +318,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
                 cache_v_scale[so] = vsh;
             }
         }
+        } // else !IsI4NL
         __syncthreads();
     }
 
@@ -350,14 +390,31 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
                 half* v_dst     = &v_s[key_l * SmemStride + d];
                 if (key >= split_start && key < split_end) {
                     const int page_offset = key & kPagedKVPageMask;
-                    const std::int64_t code_off =
-                        gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d, page_offset);
-                    const std::int64_t scale_off = gqa_kv_quant_scale_index<Geometry>(
-                        physical_page, kv_head, d / kGqaKvQuantGroup, page_offset);
-                    const float ks = __half2float(cache_k_scale[scale_off]);
-                    const float vs = __half2float(cache_v_scale[scale_off]);
-                    store_vec(k_dst, gqa_kv_dequant_i8x8_f16_from(&cache_k_i8[code_off], ks));
-                    store_vec(v_dst, gqa_kv_dequant_i8x8_f16_from(&cache_v_i8[code_off], vs));
+                    if constexpr (IsI4NL) {
+                        const std::int64_t code_off = gqa_i4nl_code_index<Geometry::KVHeads>(
+                            physical_page, kv_head, d, page_offset);
+                        const std::int64_t scale_off = gqa_i4nl_scale_index<Geometry::KVHeads>(
+                            physical_page, kv_head, d / kGqaI4NLGroup, page_offset);
+                        const float ks = __half2float(cache_k_scale[scale_off]);
+                        const float vs = __half2float(cache_v_scale[scale_off]);
+                        store_vec(k_dst, gqa_i4nl_staged_f16x8(
+                                             static_cast<std::uint32_t>(load_vec<std::uint32_t>(
+                                                 &cache_k_i8[code_off])),
+                                             ks, lut_s));
+                        store_vec(v_dst, gqa_i4nl_staged_f16x8(
+                                             static_cast<std::uint32_t>(load_vec<std::uint32_t>(
+                                                 &cache_v_i8[code_off])),
+                                             vs, lut_s));
+                    } else {
+                        const std::int64_t code_off =
+                            gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d, page_offset);
+                        const std::int64_t scale_off = gqa_kv_quant_scale_index<Geometry>(
+                            physical_page, kv_head, d / kGqaKvQuantGroup, page_offset);
+                        const float ks = __half2float(cache_k_scale[scale_off]);
+                        const float vs = __half2float(cache_v_scale[scale_off]);
+                        store_vec(k_dst, gqa_kv_dequant_i8x8_f16_from(&cache_k_i8[code_off], ks));
+                        store_vec(v_dst, gqa_kv_dequant_i8x8_f16_from(&cache_v_i8[code_off], vs));
+                    }
                 } else {
                     store_vec(k_dst, make_int4(0, 0, 0, 0));
                     store_vec(v_dst, make_int4(0, 0, 0, 0));

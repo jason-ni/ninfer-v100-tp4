@@ -4,13 +4,37 @@
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
 
+#include <ninfer/types.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 
 namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::int32_t kKvQuantGroup = 64;
+// IQ4_NL-G32 (DType::I4NL) codes index a 16-entry asymmetric nibble LUT one FP16 scale per 32
+// head-dim values; the code plane stores head_dim/2 bytes per row, scales head_dim/32 per row.
+inline constexpr std::int32_t kKvQuantGroupI4NL = 32;
+
+// The engine-facing KV storage enum and the target DType/group pair this family's paged pools
+// carry. Unrecognized storage is an error rather than a default to keep a future fourth codec
+// from silently planning with wrong geometry.
+[[nodiscard]] inline DType kv_storage_dtype(KvCacheStorage storage) {
+    switch (storage) {
+    case KvCacheStorage::BFloat16: return DType::BF16;
+    case KvCacheStorage::Int8Group64: return DType::I8;
+    case KvCacheStorage::Int4NLGroup32: return DType::I4NL;
+    }
+    throw std::invalid_argument("unregistered KV cache storage");
+}
+
+[[nodiscard]] inline std::int32_t kv_storage_quant_group(KvCacheStorage storage) {
+    const DType dtype = kv_storage_dtype(storage);
+    if (dtype == DType::BF16) { return 0; }
+    return dtype == DType::I4NL ? kKvQuantGroupI4NL : kKvQuantGroup;
+}
 
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;

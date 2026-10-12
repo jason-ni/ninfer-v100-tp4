@@ -100,6 +100,7 @@ double parse_yarn_factor(const char* text) {
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
+    if (text == "iq4nl") { return KvCacheStorage::Int4NLGroup32; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -122,9 +123,9 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--rope native|yarn] [--yarn-factor F] [--yarn-origin O]\n"
-           "       [--device N] [--tp 1|2|4] [--devices N,N,...]\n"
-           "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
-           "       [--lm-head-draft]\n"
+"       [--device N] [--tp 1|2|4] [--devices N,N,...]\n"
+            "              [--kv-dtype bf16|int8|iq4nl] [--spec mtp|dflash --draft-tokens N]\n"
+            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"

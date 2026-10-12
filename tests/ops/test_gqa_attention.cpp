@@ -440,31 +440,49 @@ int run_batch_cases() {
     failures +=
         run_batch_case(kGeometries[0], DType::I8,
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
-    failures += run_batch_case(kGeometries[1], DType::BF16,
-                               {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
+failures += run_batch_case(kGeometries[1], DType::BF16,
+                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
+    failures += run_batch_case(kGeometries[0], DType::I4NL,
+                                {6, {127}, {3}, {0}, MappingPattern::Identity, 505u});
+    failures += run_batch_case(kGeometries[1], DType::I4NL,
+                                {1,
+                                 {31, 127, 511},
+                                 {1, 1, 1},
+                                 {0, 2, 1},
+                                 MappingPattern::Fragmented,
+                                 506u});
     return failures;
 }
 
 int run_geometry(const Geometry& geometry) {
     int failures = 0;
-    for (const DType dtype : {DType::BF16, DType::I8}) {
+    for (const DType dtype : {DType::BF16, DType::I8, DType::I4NL}) {
         for (const MappingPattern mapping :
              {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
             failures += run_append_case(geometry, dtype, mapping, 100u + geometry.q_heads);
             failures += run_a1_case(geometry, dtype, {6, 61, 67, 190u}, mapping);
             failures += run_a3_case(geometry, dtype, {1, 128, 129, 191u}, mapping);
         }
-        if (dtype == DType::I8) {
+        if (dtype == DType::I8 || dtype == DType::I4NL) {
             failures += run_append_case(geometry, dtype, MappingPattern::Fragmented,
                                         150u + geometry.q_heads, 129, 61);
         }
 
         const AttentionCase a1_cases[] = {
             {1, 0, 1, 201u},    {6, 17, 23, 202u},   {7, 17, 512, 203u},
-            {17, 31, 48, 204u}, {66, 63, 129, 205u},
+            {17, 31, 48, 204u}, {66, 63, 129, 205u}, {130, 400, 530, 206u},
         };
         for (const AttentionCase& test_case : a1_cases) {
             failures += run_a1_case(geometry, dtype, test_case, MappingPattern::Identity);
+        }
+
+        // A width past kVoltaFlashQBlockTokens forces the flash launcher's multi-Q-block loop and
+        // the per-layer paged gather over a longer key range, for every cache dtype (the 16q/2kv
+        // geometry falls back to ChunkedSmallT there). The IQ4_NL-G32 page-aware gather and append
+        // are only reachable on this route, so this is their wide-shape conformance witness. The
+        // envelope is exact ({visible, visible}), the shape a real prefill call passes.
+        if (geometry.q_heads == 24) {
+            failures += run_a1_case(geometry, dtype, {1100, 300, 1400, 207u}, MappingPattern::Identity);
         }
 
         const AttentionCase a3_cases[] = {
@@ -521,7 +539,7 @@ int run_int8_split_policy_cases() {
 
 int verify_workspace_capacity_contract() {
     int failures = 0;
-    for (const DType dtype : {DType::BF16, DType::I8}) {
+    for (const DType dtype : {DType::BF16, DType::I8, DType::I4NL}) {
         constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
         const std::size_t interval =
             ops::gqa_attention_workspace_capacity_bytes(16, dtype, envelope, 1, 1, 17);

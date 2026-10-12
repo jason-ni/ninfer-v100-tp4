@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
+#include "ops/kernel/gqa_attention_kv_iq4nl.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
 
@@ -82,12 +83,12 @@ __device__ __forceinline__ int4 gqa_prefill_i8_dequant_f16x8(const std::int8_t* 
 template <typename Geometry, typename Metadata>
 __launch_bounds__(256) __global__
     void gqa_attention_prefill_fill_i8_kernel(const __nv_bfloat16* __restrict__ k,
-                                              const __nv_bfloat16* __restrict__ v,
-                                              const std::int32_t* __restrict__ positions,
-                                              Metadata metadata, std::int8_t* __restrict__ cache_k,
-                                              std::int8_t* __restrict__ cache_v,
-                                              __half* __restrict__ scale_k,
-                                              __half* __restrict__ scale_v, std::int32_t width) {
+                                               const __nv_bfloat16* __restrict__ v,
+                                               const std::int32_t* __restrict__ positions,
+                                               Metadata metadata, std::int8_t* __restrict__ cache_k,
+                                               std::int8_t* __restrict__ cache_v,
+                                               __half* __restrict__ scale_k,
+                                               __half* __restrict__ scale_v, std::int32_t width) {
     constexpr int Warps         = 8;
     constexpr unsigned FullMask = 0xffffffffu;
     const int tokens            = metadata.valid_tokens(width);
@@ -139,6 +140,63 @@ __launch_bounds__(256) __global__
             gqa_kv_quant_scale_index<Geometry>(page, kv_head, group, page_off);
         scale_k[scale_off] = ksh;
         scale_v[scale_off] = vsh;
+    }
+}
+
+// One warp per (token, kv_head, 32-group) for the IQ4_NL-G32 codec -- the same bit-exact encode
+// pipeline as the decode append blocks, through one CTA-resident LUT.
+template <typename Geometry, typename Metadata>
+__launch_bounds__(256) __global__
+    void gqa_attention_prefill_fill_i4nl_kernel(const __nv_bfloat16* __restrict__ k,
+                                                const __nv_bfloat16* __restrict__ v,
+                                                const std::int32_t* __restrict__ positions,
+                                                Metadata metadata, std::int8_t* __restrict__ cache_k,
+                                                std::int8_t* __restrict__ cache_v,
+                                                __half* __restrict__ scale_k,
+                                                __half* __restrict__ scale_v, std::int32_t width) {
+    constexpr int Warps         = 8;
+    constexpr unsigned FullMask = 0xffffffffu;
+    constexpr int Groups        = kGqaI4NLGroups;
+    __shared__ std::int8_t lut_s[16];
+    if (threadIdx.x < 16) { lut_s[threadIdx.x] = gqa_i4nl_value_at(static_cast<int>(threadIdx.x)); }
+    __syncthreads();
+
+    const int tokens  = metadata.valid_tokens(width);
+    const int warp    = static_cast<int>(threadIdx.x) >> 5;
+    const int lane    = static_cast<int>(threadIdx.x) & 31;
+    const int unit    = static_cast<int>(blockIdx.x) * Warps + warp;
+    const int units   = tokens * Geometry::KVHeads * Groups;
+    if (unit >= units) { return; }
+
+    const int group     = unit % Groups;
+    const int tmp       = unit / Groups;
+    const int kv_head   = tmp % Geometry::KVHeads;
+    const int token     = tmp / Geometry::KVHeads;
+    const int position  = positions[0] + token;
+    const std::int32_t* block_table = metadata.block_table();
+    int page           = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+    page               = __shfl_sync(FullMask, page, 0);
+    const int page_off = position & kPagedKVPageMask;
+    const int d        = group * kGqaI4NLGroup + lane; // one value per lane across the whole 32-group
+
+    const std::int64_t src = gqa_kv_quant_src_index<Geometry>(kv_head, d, token);
+    const float kx         = __bfloat162float(k[src]);
+    const float vx         = __bfloat162float(v[src]);
+    std::uint32_t k_byte, v_byte;
+    half k_sh, v_sh;
+    gqa_i4nl_encode_warp(kx, FullMask, lut_s, k_byte, k_sh);
+    gqa_i4nl_encode_warp(vx, FullMask, lut_s, v_byte, v_sh);
+    if (lane < 16) {
+        const std::int64_t cb = gqa_i4nl_code_index<Geometry::KVHeads>(
+            page, kv_head, group * kGqaI4NLGroup + 2 * lane, page_off);
+        cache_k[cb] = static_cast<std::int8_t>(k_byte & 0xff);
+        cache_v[cb] = static_cast<std::int8_t>(v_byte & 0xff);
+    }
+    if (lane == 0) {
+        const std::int64_t so = gqa_i4nl_scale_index<Geometry::KVHeads>(page, kv_head, group,
+                                                                        page_off);
+        scale_k[so] = k_sh;
+        scale_v[so] = v_sh;
     }
 }
 

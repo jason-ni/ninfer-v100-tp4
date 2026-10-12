@@ -47,7 +47,9 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
         .kv_heads                  = 2,
         .attention_head_dim        = 64,
         .kv_dtype                  = dtype,
-        .kv_quant_group            = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
+        .kv_quant_group            = dtype == ninfer::DType::I8      ? q36::kKvQuantGroup
+                                     : dtype == ninfer::DType::I4NL  ? q36::kKvQuantGroupI4NL
+                                                                     : 0,
         .enable_mtp                = mtp,
         .text_physical_page_groups = 5,
         .mtp_physical_page_groups  = mtp ? 4U : 0U,
@@ -104,6 +106,27 @@ void test_decoder_layout() {
            "INT8 MTP KV has scale planes");
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
+
+    // IQ4_NL-G32 is the same four-planes-per-layer shape as INT8-G64 but the code plane is half as
+    // wide (head_dim/2 bytes) and the scale plane carries twice as many groups (head_dim/32), which
+    // is the whole point of the storage type. The consuming kernels and the pool views derive their
+    // stride from the dtype, so pin the layout geometry here.
+    ninfer::LayoutBuilder i4nl_builder;
+    const q36::DecoderStateLayout i4nl =
+        q36::plan_decoder_state(i4nl_builder, decoder_spec(ninfer::DType::I4NL, true));
+    (void)i4nl_builder.finish(256);
+    expect(i4nl.text_kv.pool.planes.size() == 8 &&
+               i4nl.text_kv.pool.planes[0].spec.dtype == ninfer::DType::I4NL &&
+               i4nl.text_kv.pool.planes[0].spec.leading_extent == 64 / 2 &&
+               i4nl.text_kv.pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
+               i4nl.text_kv.pool.planes[2].spec.leading_extent == 64 / 32,
+           "IQ4_NL Text KV has packed-code and 32-group scale planes per layer");
+    expect(i4nl.mtp_kv.has_value() && i4nl.mtp_kv->pool.planes.size() == 4 &&
+               i4nl.mtp_kv->pool.planes[2].spec.dtype == ninfer::DType::FP16,
+           "IQ4_NL MTP KV has scale planes");
+    // The IQ4_NL text pool must be smaller than the INT8 pool for the same geometry.
+    expect(i4nl.text_kv.payload_bytes() < int8.text_kv.payload_bytes(),
+           "IQ4_NL KV payload is below INT8-G64");
 }
 
 void test_round_layout() {

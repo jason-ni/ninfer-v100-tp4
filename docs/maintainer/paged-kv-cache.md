@@ -271,9 +271,10 @@ Consumer 对 K/V plane 使用统一的逻辑坐标 `K/V[d,h,p]`。Physical axis 
 固定，不由 allocator 或单次 request 选择：
 
 ```text
-Pool            K/V or code plane       INT8-G64 scale plane
-Main Text/MTP   [D, P, Hkv, Nphysical]  [D/64, P, Hkv, Nphysical]
-DFlash Full     [D, P, Nphysical, Hkv]  not used
+Pool            K/V or code plane            scale plane
+Main Text/MTP   BF16/INT8-G64: [D, P, Hkv, N]   INT8-G64: [D/64, P, Hkv, N]
+                IQ4_NL-G32:   [D/2, P, Hkv, N]   IQ4_NL-G32: [D/32, P, Hkv, N]
+DFlash Full     [D, P, Nphysical, Hkv]           not used
 ```
 
 Main Text/MTP 使用 contiguous page-major order。对 element bytes `E` 和第一维 extent `X`（K/V/code
@@ -310,8 +311,10 @@ DFlash Full: K[d,h,p] = k_pages[d,o,g,h]
              V[d,h,p] = v_pages[d,o,g,h]
 ```
 
-INT8 code 使用同一公式；scale 把 `d` 换成 quant group `d/64`。K、V、code 和 scale 不保存各自的
-page pointer table，而是使用同一个 pool-local page-group ID `g`。
+INT8 code 使用同一公式；scale 把 `d` 换成 quant group `d/64`。IQ4_NL-G32 的 code plane 每个 element
+是一个 packed nibble byte：byte `b` 的 low nibble 承载 head dim `2b`、high nibble 承载 `2b+1`（相邻对），
+所以 code plane 第一维是 `D/2`；scale 把 `d` 换成 32-value group `d/32`，第一维是 `D/32`。K、V、code 和
+scale 不保存各自的 page pointer table，而是使用同一个 pool-local page-group ID `g`。
 
 Common allocator 接收已经确定的 closed plane order、bytes、strides 和 alignment，不从中推导 head、codec
 或 Attention 语义。Production wrapper 只接受其 route 对应的上述 closed stride formula。Kernel 在
@@ -369,6 +372,10 @@ BF16 bytes/token
 INT8-G64 bytes/token
     = 2(K,V) * L * H * D
     + 2(K,V) * L * H * (D/64) * sizeof(FP16 scale)
+
+IQ4_NL-G32 bytes/token
+    = 2(K,V) * L * H * (D/2)
+    + 2(K,V) * L * H * (D/32) * sizeof(FP16 scale)
 ```
 
 一个 homogeneous pool 的 logical page-group payload 是其全部 grouped planes 的 bytes/token 之和乘以

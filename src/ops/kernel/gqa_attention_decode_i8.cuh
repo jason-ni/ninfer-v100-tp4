@@ -24,6 +24,7 @@
 #include <math_constants.h>
 
 #include "ops/kernel/gqa_attention_decode.cuh"
+#include "ops/kernel/gqa_attention_kv_iq4nl.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 
 #include <cstdint>
@@ -55,7 +56,7 @@ __device__ __forceinline__ void gqa_small_t_i8_store_swz(std::int8_t* tile, int 
 // dequantize V while producers execute QK. After both consume the code tile, the
 // next K/V tile is prefetched into the same arena while the current PV runs.
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
-          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput>
+          bool DynamicArena, bool MultiBatch, bool Masked, bool IsI4NL, typename CacheInput>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void gqa_attention_decode_i8_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
@@ -643,12 +644,15 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int RowCount   = TokenTile * Geometry::GroupSize;
     constexpr int D          = kGqaHeadDim;
     constexpr int Threads    = Wc * 32;
-    constexpr int Groups     = kGqaKvQuantGroups;
+    constexpr int Groups     = IsI4NL ? kGqaI4NLGroups : kGqaKvQuantGroups;
     constexpr int kDPerLane  = D / 32;
     static_assert(kGqaHeadDim == kGqaKvQuantHeadDim);
-    static_assert(kDPerLane * 8 == kGqaKvQuantGroup, "lane d-chunk must divide the quant group");
+    static_assert(kDPerLane == 8 && kGqaI4NLGroup % kDPerLane == 0 &&
+                  kGqaKvQuantGroup % kDPerLane == 0,
+              "a lane's 8-wide d-chunk must sit inside one quant group of either codec");
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
+    __shared__ std::int8_t lut_s[16]; // IQ4_NL-G32 value table (INT8 instantiation leaves it unwritten)
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
@@ -657,6 +661,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int tid         = static_cast<int>(threadIdx.x);
     const int warp        = tid >> 5;
     const int lane        = tid & 31;
+    if constexpr (IsI4NL) {
+        if (tid < 16) { lut_s[tid] = gqa_i4nl_value_at(tid); }
+        __syncthreads(); // LUT visible before any encode/dequant use
+    }
 
     int valid_tokens = TokenTile;
     if constexpr (Masked) {
@@ -733,6 +741,39 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     }
 
     if constexpr (CacheInput::writes_cache) {
+        if constexpr (IsI4NL) {
+            // One warp owns one (token, 32-group); identical bit-exact pipeline to the tensor-core
+            // append blocks -- all writers of this cache share it.
+            for (int pair = warp; pair < valid_tokens * Groups; pair += Wc) {
+                const int token    = pair / Groups;
+                const int grp      = pair - token * Groups;
+                const int position = pos[token];
+                if (position < split_start || position >= split_end) { continue; }
+                int physical_page = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+                physical_page     = __shfl_sync(FullMask, physical_page, 0);
+                const int page_offset = position & kPagedKVPageMask;
+                const int d           = grp * kGqaI4NLGroup + lane;
+                const float kv  = __bfloat162float(input.k[gqa_kv_new_index<Geometry>(kv_head, d, token)]);
+                const float vv  = __bfloat162float(input.v[gqa_kv_new_index<Geometry>(kv_head, d, token)]);
+                std::uint32_t k_byte, v_byte;
+                half k_sh, v_sh;
+                gqa_i4nl_encode_warp(kv, FullMask, lut_s, k_byte, k_sh);
+                gqa_i4nl_encode_warp(vv, FullMask, lut_s, v_byte, v_sh);
+                if (lane < 16) {
+                    const std::int64_t cb = gqa_i4nl_code_index<Geometry::KVHeads>(
+                        physical_page, kv_head, grp * kGqaI4NLGroup + 2 * lane, page_offset);
+                    cache_k_i8[cb] = static_cast<std::int8_t>(k_byte & 0xff);
+                    cache_v_i8[cb] = static_cast<std::int8_t>(v_byte & 0xff);
+                }
+                if (lane == 0) {
+                    const std::int64_t so = gqa_i4nl_scale_index<Geometry::KVHeads>(
+                        physical_page, kv_head, grp, page_offset);
+                    cache_k_scale[so]    = k_sh;
+                    cache_v_scale[so]    = v_sh;
+                }
+            }
+            __syncthreads();
+        } else {
         for (int pair = warp; pair < valid_tokens * Groups; pair += Wc) {
             const int token    = pair / Groups;
             const int grp      = pair - token * Groups;
@@ -774,6 +815,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 cache_v_scale[so] = vsh;
             }
         }
+        } // else !IsI4NL
         __syncthreads();
     }
 
@@ -812,6 +854,39 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 cached_block  = block;
             }
             const int page_offset = key & kPagedKVPageMask;
+            if constexpr (IsI4NL) {
+                const std::int64_t code_off = gqa_i4nl_code_index<Geometry::KVHeads>(
+                    physical_page, kv_head, lane * kDPerLane, page_offset);
+                const std::int64_t scale_off = gqa_i4nl_scale_index<Geometry::KVHeads>(
+                    physical_page, kv_head, (lane * kDPerLane) / kGqaI4NLGroup, page_offset);
+                // All eight lane values sit inside one 32-group (d % 32 == 0), so one scale and
+                // one 4-byte code word serve the whole lane.
+                const std::uint32_t kc_nib = load_vec<std::uint32_t>(&cache_k_i8[code_off]);
+                const std::uint32_t vc_nib = load_vec<std::uint32_t>(&cache_v_i8[code_off]);
+                const float k_scale = __half2float(cache_k_scale[scale_off]);
+                float partial       = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < kDPerLane; ++i) {
+                    const float kd =
+                        static_cast<float>(lut_s[(kc_nib >> (4 * i)) & 0xF]) * k_scale;
+                    partial = fmaf(q_reg[i], kd, partial);
+                }
+                const float score = warp_sum(partial, FullMask) * scale;
+
+                const float new_m = fmaxf(m, score);
+                const float alpha = (m == -CUDART_INF_F) ? 0.0f : exp2_approx((m - new_m) * Log2E);
+                const float p      = exp2_approx((score - new_m) * Log2E);
+                l = l * alpha + p;
+                m = new_m;
+
+                const float v_scale = __half2float(cache_v_scale[scale_off]);
+                #pragma unroll
+                for (int i = 0; i < kDPerLane; ++i) {
+                    const float vd =
+                        static_cast<float>(lut_s[(vc_nib >> (4 * i)) & 0xF]) * v_scale;
+                    acc[i] = fmaf(acc[i], alpha, p * vd);
+                }
+            } else {
             const std::int64_t code_off  = gqa_kv_quant_code_index<Geometry>(
                 physical_page, kv_head, lane * kDPerLane, page_offset);
             const std::int64_t scale_off =
@@ -838,6 +913,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const float vd = static_cast<float>(cache_v_i8[code_off + i]) * v_scale;
                 acc[i]         = fmaf(acc[i], alpha, p * vd);
             }
+            } // else !IsI4NL
         }
 
         if (lane == 0) {

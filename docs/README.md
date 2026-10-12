@@ -44,6 +44,7 @@ Runtime and Op references:
 
 - [Small-scale concurrent inference architecture](maintainer/concurrent-inference-architecture.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
+- [IQ4_NL KV cache adoption plan (from the llama.cpp fork)](maintainer/iq4nl-kv-plan.md)
 - [Hybrid content-addressed prefix cache: V100X2 adaptation plan](maintainer/hybrid-prefix-cache-plan.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)

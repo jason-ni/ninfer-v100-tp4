@@ -59,15 +59,18 @@ std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, D
     // A 64-key default split just above a 32-key boundary makes the partial
     // kernel execute a nearly empty second tile. These short ranges instead
     // launch one 32-key tile per split; the larger CTAs keep the small grid busy.
-    if (kv_dtype == DType::I8 && tokens == 5 && window > 128 && window <= 512) {
+    if ((kv_dtype == DType::I8 || kv_dtype == DType::I4NL) && tokens == 5 && window > 128 &&
+        window <= 512) {
         return div_up(window, 32 / Geometry::DecodeSplitScale);
     }
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 128 && window <= 160) {
+    if ((kv_dtype == DType::I8 || kv_dtype == DType::I4NL) && tokens == 6 && window > 128 &&
+        window <= 160) {
         return div_up(window, 24 / Geometry::DecodeSplitScale);
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
     // one 170-SM wave after accounting for the geometry's KV-head count.
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
+    if ((kv_dtype == DType::I8 || kv_dtype == DType::I4NL) && tokens == 6 && window > 5000 &&
+        window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::DecodeSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::DecodeSplitScale;
         constexpr std::int32_t kMax = 42 * Geometry::DecodeSplitScale;
@@ -147,17 +150,20 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
-void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
-                          PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
-                          std::int32_t logical_capacity, std::int32_t implementation_window,
-                          std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
-                          Tensor& partial_l, cudaStream_t stream) {
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool IsI4NL,
+          typename CacheInput>
+void launch_tc_partial_i8_one(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                              PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
+                              std::int32_t logical_capacity, std::int32_t implementation_window,
+                              std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
+                              Tensor& partial_l, cudaStream_t stream) {
     Tensor& cache_k       = cache.k_pages;
     Tensor& cache_v       = cache.v_pages;
     Tensor& cache_k_scale = cache.k_scale_pages;
     Tensor& cache_v_scale = cache.v_scale_pages;
 
+    // The INT8 and IQ4_NL-G32 instantiations share every pipeline stage except the code decode
+    // and the append quantizer, so one template parameter selects the kernel family.
 #ifdef NINFER_VOLTA_BUILD
     // Tensor-core route for the verify widths. The SIMT kernel below holds ~1.9 TFLOP/s at every
     // width, so its cost is linear in the width; the tensor-core tile is flat in the width
@@ -181,7 +187,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 constexpr std::size_t kSmemBytes = kGqaSmallTI8VoltaV2SmemBytes<Geometry>;
                 const auto v2_kernel =
                     gqa_attention_small_t_tc_volta_partial_i8_v2_kernel<Geometry, TokenTile,
-                                                                        MultiBatch, Masked,
+                                                                        MultiBatch, Masked, IsI4NL,
                                                                         CacheInput>;
                 ensure_func_attr_per_device(v2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             static_cast<int>(kSmemBytes));
@@ -208,7 +214,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             }
         }
         gqa_attention_small_t_tc_volta_partial_i8_kernel<Geometry, TokenTile, 4, MultiBatch, Masked,
-                                                         CacheInput><<<grid, 128, 0, stream>>>(
+                                                 IsI4NL, CacheInput><<<grid, 128, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), input,
             static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
             static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
@@ -229,19 +235,30 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     }
 #endif // NINFER_VOLTA_BUILD
 
+    // The SIMT body only exists in tensor-core form on sm_80+; the Volta SIMT branch of the same
+    // translated file carries the IQ4_NL-G32 path. On non-Volta builds IQ4_NL-G32 decode is not
+    // implemented yet and must fail loudly rather than dequantize with the INT8 tables.
+#ifndef NINFER_VOLTA_BUILD
+    if constexpr (IsI4NL) {
+        throw std::invalid_argument("gqa small-T decode: the IQ4_NL-G32 KV cache requires the "
+                                    "Volta build's decode kernels");
+    }
+#endif
+
     auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         constexpr std::size_t kDynamicBytes =
             DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0u;
         if constexpr (DynamicArena) {
-            ensure_func_attr_per_device(
-                gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
-                                                     MinBlocksPerSm, KeyBlock, DynamicArena,
-                                                     MultiBatch, Masked, CacheInput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+ensure_func_attr_per_device(
+            gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
+                                                 MinBlocksPerSm, KeyBlock, DynamicArena,
+                                                 MultiBatch, Masked, IsI4NL, CacheInput>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
         }
         gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
-                                             KeyBlock, DynamicArena, MultiBatch, Masked, CacheInput>
+                                             KeyBlock, DynamicArena, MultiBatch, Masked, IsI4NL,
+                                             CacheInput>
             <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
@@ -345,6 +362,23 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                          PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
+                          std::int32_t logical_capacity, std::int32_t implementation_window,
+                          std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
+                          Tensor& partial_l, cudaStream_t stream) {
+    if (cache.dtype == DType::I4NL) {
+        launch_tc_partial_i8_one<Geometry, TokenTile, MultiBatch, Masked, true>(
+            q, input, pos, scale, cache, invocation, logical_capacity, implementation_window, splits,
+            partial_acc, partial_m, partial_l, stream);
+    } else {
+        launch_tc_partial_i8_one<Geometry, TokenTile, MultiBatch, Masked, false>(
+            q, input, pos, scale, cache, invocation, logical_capacity, implementation_window, splits,
+            partial_acc, partial_m, partial_l, stream);
+    }
+}
+
 PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
     return {
         .k_pages       = cache.k_pages,
@@ -365,7 +399,8 @@ bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tok
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+    if (tokens < 1 || tokens > 6 ||
+        (cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::I4NL) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
@@ -391,7 +426,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 #define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                 \
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
-            if (cache.dtype == DType::I8) {                                                        \
+            if (cache.dtype == DType::I8 || cache.dtype == DType::I4NL) {                          \
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
@@ -480,7 +515,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
             launch_profile.template operator()<Int8, true, false>();
         }
     };
-    if (cache.dtype == DType::I8) {
+    if (cache.dtype == DType::I8 || cache.dtype == DType::I4NL) {
         launch_for_dtype.template operator()<true>();
     } else {
         launch_for_dtype.template operator()<false>();

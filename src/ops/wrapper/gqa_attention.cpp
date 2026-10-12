@@ -16,6 +16,8 @@ namespace {
 
 constexpr std::int32_t kHeadDim                      = 256;
 constexpr std::int32_t kQuantGroup                   = 64;
+// IQ4_NL-G32: one FP16 scale per contiguous 32 head dims; the code plane stores head_dim/2 bytes.
+constexpr std::int32_t kI4NLQuantGroup               = 32;
 constexpr float kExpectedScale                       = 0.0625f;
 // 6 is the worst value in its neighbourhood on the Volta tensor-core prefill path. That kernel
 // packs Br=32 rows per row-tile pass, and rows = TokenTile * GQA group size (6 for this model's
@@ -65,7 +67,7 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8 && cache.dtype != DType::I4NL) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -74,6 +76,9 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     }
     if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
+    }
+    if (cache.dtype == DType::I4NL && cache.quant_group != kI4NLQuantGroup) {
+        throw std::invalid_argument(std::string(op) + ": I4NL KV cache must use quant_group 32");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -84,13 +89,16 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    const DType code_dtype    = cache.dtype == DType::I8      ? DType::I8
+                           : cache.dtype == DType::I4NL   ? DType::I4NL
+                                                           : DType::BF16;
+    const std::int32_t code_extent = cache.dtype == DType::I4NL ? kHeadDim / 2 : kHeadDim;
     if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.k_pages, code_extent, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, code_extent, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -107,7 +115,8 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         return static_cast<std::uint32_t>(capacity);
     }
 
-    constexpr std::int32_t groups = kHeadDim / kQuantGroup;
+    const bool quantized = cache.dtype == DType::I8 || cache.dtype == DType::I4NL;
+    const std::int32_t groups = quantized ? cache.head_dim / cache.quant_group : 0;
     if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
@@ -122,7 +131,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
 
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8 && cache.dtype != DType::I4NL) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -131,6 +140,9 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
     if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
+    }
+    if (cache.dtype == DType::I4NL && cache.quant_group != kI4NLQuantGroup) {
+        throw std::invalid_argument(std::string(op) + ": I4NL KV cache must use quant_group 32");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -142,13 +154,16 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    const DType code_dtype    = cache.dtype == DType::I8      ? DType::I8
+                           : cache.dtype == DType::I4NL   ? DType::I4NL
+                                                           : DType::BF16;
+    const std::int32_t code_extent = cache.dtype == DType::I4NL ? kHeadDim / 2 : kHeadDim;
     if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.k_pages, code_extent, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, code_extent, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -165,7 +180,8 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         return static_cast<std::uint32_t>(capacity);
     }
 
-    constexpr std::int32_t groups = kHeadDim / kQuantGroup;
+    const bool quantized = cache.dtype == DType::I8 || cache.dtype == DType::I4NL;
+    const std::int32_t groups = quantized ? cache.head_dim / cache.quant_group : 0;
     if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
@@ -302,8 +318,10 @@ bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
     // store) for every tile. ChunkedSmallT is the correct fallback -- slower, but it is the path
     // 16q/2kv prefill used before the flash route existed. Re-enabling that geometry means
     // reconciling the two cols_per_warp definitions upstream first.
+    // The IQ4_NL-G32 cache routes here through its own page-aware gather/dequant (see the
+    // gqa_attention_volta_flash.cu staging kernels and iq4nl-kv-plan P3).
     return (q_heads == 24 || q_heads == 12 || q_heads == 6) && batch_size == 1 &&
-           (cache_dtype == DType::BF16 || cache_dtype == DType::I8) &&
+           (cache_dtype == DType::BF16 || cache_dtype == DType::I8 || cache_dtype == DType::I4NL) &&
            width >= detail::kVoltaFlashMinimumWidth;
 }
 
@@ -469,7 +487,9 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
+    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
+         cache_dtype != DType::I4NL) ||
+        batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||

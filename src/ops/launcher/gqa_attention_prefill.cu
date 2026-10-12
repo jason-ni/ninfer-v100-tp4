@@ -63,6 +63,28 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
+    if (cache.dtype == DType::I4NL) {
+        // General-purpose fill for the IQ4_NL-G32 codec (one warp per 32-group); the INT8 page
+        // fast path has no LUT counterpart yet and is measured separately before being added.
+        Tensor& cache_k_scale = cache.k_scale_pages;
+        Tensor& cache_v_scale = cache.v_scale_pages;
+        constexpr int kFillBlock = 256;
+        constexpr int kFillWarps = kFillBlock / 32;
+        const std::int64_t fill_units =
+            static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaI4NLGroups;
+        const int fill_grid = static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
+        gqa_attention_prefill_fill_i4nl_kernel<Geometry, Metadata>
+            <<<fill_grid, kFillBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data),
+                static_cast<const __nv_bfloat16*>(v.data),
+                static_cast<const std::int32_t*>(positions.data), metadata,
+                static_cast<std::int8_t*>(cache_k.data),
+                static_cast<std::int8_t*>(cache_v.data),
+                static_cast<__half*>(cache_k_scale.data),
+                static_cast<__half*>(cache_v_scale.data), tokens);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (cache.dtype == DType::I8) {
         Tensor& cache_k_scale    = cache.k_scale_pages;
         Tensor& cache_v_scale    = cache.v_scale_pages;

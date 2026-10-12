@@ -779,6 +779,15 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
+#ifndef NINFER_VOLTA_BUILD
+    // The IQ4_NL-G32 decode and append kernels are implemented on the Volta path only; other
+    // registered targets reject the storage type at startup rather than plan a layout whose
+    // consuming kernels do not exist.
+    if (options.kv_cache == KvCacheStorage::Int4NLGroup32) {
+        throw std::invalid_argument(
+            "the IQ4_NL-G32 KV cache requires the Volta (sm_70) build");
+    }
+#endif
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
@@ -976,8 +985,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
-        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
+        .kv_dtype       = qwen3_6::kv_storage_dtype(options.kv_cache),
+        .kv_quant_group = qwen3_6::kv_storage_quant_group(options.kv_cache),
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .prefix_cache   = options.prefix_cache,

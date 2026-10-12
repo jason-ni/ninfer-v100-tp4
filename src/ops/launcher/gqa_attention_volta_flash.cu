@@ -23,6 +23,7 @@
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "ops/kernel/gqa_attention_geometry.cuh"
+#include "ops/kernel/gqa_attention_kv_iq4nl.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/launcher/gqa_attention.h"
@@ -200,6 +201,67 @@ __launch_bounds__(256) __global__ void volta_flash_append_kv_i8_kernel(
     }
 }
 
+// BF16 input -> paged IQ4_NL-G32 cache. One warp owns one (token, kv-head, 32-d group) with one
+// value per lane; the encode is the shared gqa_i4nl_encode_warp pipeline, so the codes and scales
+// are bit-identical to gqa_kv_append and the ChunkedSmallT fill. Eight warps per CTA.
+template <int kKVHeads>
+__launch_bounds__(256) __global__ void volta_flash_append_kv_i4nl_kernel(
+        const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+        const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ table_rows,
+        std::int8_t* __restrict__ k_pages, std::int8_t* __restrict__ v_pages,
+        half* __restrict__ k_scales, half* __restrict__ v_scales,
+        const std::int32_t* __restrict__ block_tables, int logical_pages, int width) {
+    constexpr int kWarps        = 8;
+    constexpr unsigned FullMask = 0xffffffffu;
+    constexpr int kGroups       = kGqaI4NLGroups;
+    __shared__ std::int8_t lut_s[16];
+    if (threadIdx.x < 16) { lut_s[threadIdx.x] = gqa_i4nl_value_at(static_cast<int>(threadIdx.x)); }
+    __syncthreads();
+
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int unit  = static_cast<int>(blockIdx.x) * kWarps + warp;
+    const int units = width * kKVHeads * kGroups;
+    if (unit >= units) { return; }
+
+    const int group = unit % kGroups;
+    const int tmp   = unit / kGroups;
+    const int h     = tmp % kKVHeads;
+    const int token = tmp / kKVHeads;
+    const int d     = group * kGqaI4NLGroup + lane;
+
+    const std::int64_t src =
+        static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * token);
+    const float kx = __bfloat162float(k[src]);
+    const float vx = __bfloat162float(v[src]);
+
+    std::uint32_t k_byte, v_byte;
+    half k_sh, v_sh;
+    gqa_i4nl_encode_warp(kx, FullMask, lut_s, k_byte, k_sh);
+    gqa_i4nl_encode_warp(vx, FullMask, lut_s, v_byte, v_sh);
+
+    const std::int32_t* block_table = select_block_table(block_tables, table_rows, logical_pages);
+    const int position              = positions[token];
+    int physical_page = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+    physical_page     = __shfl_sync(FullMask, physical_page, 0);
+    const int page_offset = position & kPagedKVPageMask;
+
+    // The encode hands lanes [0,16) the packed code byte (lane b pairs 2b/2b+1), so each writer
+    // stores byte (group, 2*lane) directly through the IQ4 code index.
+    if (lane < 16) {
+        const std::int64_t cb = gqa_i4nl_code_index<kKVHeads>(
+            physical_page, h, group * kGqaI4NLGroup + 2 * lane, page_offset);
+        k_pages[cb] = static_cast<std::int8_t>(k_byte & 0xffu);
+        v_pages[cb] = static_cast<std::int8_t>(v_byte & 0xffu);
+    }
+    if (lane == 0) {
+        const std::int64_t so =
+            gqa_i4nl_scale_index<kKVHeads>(physical_page, h, group, page_offset);
+        k_scales[so] = k_sh;
+        v_scales[so] = v_sh;
+    }
+}
+
 // Paged BF16 -> contiguous FP16, one launch per layer over the whole visible key
 // range. ~50 MB of traffic per layer at 12K against the seconds the chunked route
 // spends re-walking the key range; see the cost note in the plan.
@@ -262,6 +324,50 @@ __global__ void volta_flash_gather_kv_i8_kernel(
         paged_kv_element_offset<kGqaKvQuantGroups, kKVHeads>(block_table, h, key, group);
     k_out[dst] = __float2half(static_cast<float>(k_pages[code]) * __half2float(k_scales[scale]));
     v_out[dst] = __float2half(static_cast<float>(v_pages[code]) * __half2float(v_scales[scale]));
+}
+
+// Paged IQ4_NL-G32 -> contiguous FP16, the page-aware strided counterpart of the INT8 gather.
+// One thread dequantizes an 8-wide head-dim chunk (32 threads cover the 256 head dim); the four
+// code bytes are one 32-bit load and the eight LUT entries expand through gqa_i4nl_staged_f16x8,
+// the same single-RNE product the INT8 gather applies. Dequantizing once here keeps the vendored
+// flash kernel as the already-qualified arithmetic boundary.
+template <int kKVHeads>
+__global__ void volta_flash_gather_kv_i4nl_kernel(
+        const std::int8_t* __restrict__ k_pages, const std::int8_t* __restrict__ v_pages,
+        const half* __restrict__ k_scales, const half* __restrict__ v_scales,
+        const std::int32_t* __restrict__ block_tables, const std::int32_t* __restrict__ table_rows,
+        int logical_pages, half* __restrict__ k_out, half* __restrict__ v_out, int n_kv,
+        int n_kv_padded) {
+    __shared__ std::int8_t lut_s[16];
+    if (threadIdx.x < 16) { lut_s[threadIdx.x] = gqa_i4nl_value_at(static_cast<int>(threadIdx.x)); }
+    __syncthreads();
+
+    const int key   = blockIdx.x;
+    const int h     = blockIdx.y;
+    const int chunk = threadIdx.x;
+    if (key >= n_kv_padded) { return; }
+
+    const int d0           = chunk * 8;
+    const std::int64_t dst =
+        static_cast<std::int64_t>(d0) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * key);
+    if (key >= n_kv) {
+        store_vec(k_out + dst, make_int4(0, 0, 0, 0));
+        store_vec(v_out + dst, make_int4(0, 0, 0, 0));
+        return;
+    }
+
+    const std::int32_t* block_table = select_block_table(block_tables, table_rows, logical_pages);
+    const int physical_page         = paged_kv_physical_page(block_table, key);
+    const int page_offset           = key & kPagedKVPageMask;
+    const int group                 = d0 >> 5;
+    const std::int64_t code         = gqa_i4nl_code_index<kKVHeads>(physical_page, h, d0, page_offset);
+    const std::int64_t ks           = gqa_i4nl_scale_index<kKVHeads>(physical_page, h, group, page_offset);
+    const std::int64_t vs           = gqa_i4nl_scale_index<kKVHeads>(physical_page, h, group, page_offset);
+
+    const std::uint32_t k_bytes = *reinterpret_cast<const std::uint32_t*>(k_pages + code);
+    const std::uint32_t v_bytes = *reinterpret_cast<const std::uint32_t*>(v_pages + code);
+    store_vec(k_out + dst, gqa_i4nl_staged_f16x8(k_bytes, __half2float(k_scales[ks]), lut_s));
+    store_vec(v_out + dst, gqa_i4nl_staged_f16x8(v_bytes, __half2float(v_scales[vs]), lut_s));
 }
 
 // BF16 [256, QHeads, T] -> FP32, same element order (the kernel's Q and ninfer's q
@@ -483,6 +589,16 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
             static_cast<std::int8_t*>(cache.v_pages.data),
             static_cast<half*>(cache.k_scale_pages.data),
             static_cast<half*>(cache.v_scale_pages.data), block_tables, logical_pages, width);
+    } else if (cache.dtype == DType::I4NL) {
+        constexpr int kWarpsPerBlock = 8;
+        const int units              = width * kKVHeads * kGqaI4NLGroups;
+        const int blocks             = (units + kWarpsPerBlock - 1) / kWarpsPerBlock;
+        volta_flash_append_kv_i4nl_kernel<kKVHeads><<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
+            position_ptr, rows, static_cast<std::int8_t*>(cache.k_pages.data),
+            static_cast<std::int8_t*>(cache.v_pages.data),
+            static_cast<half*>(cache.k_scale_pages.data),
+            static_cast<half*>(cache.v_scale_pages.data), block_tables, logical_pages, width);
     } else {
         volta_flash_append_kv_kernel<kKVHeads><<<dim3(width, kKVHeads), kHeadDim, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
@@ -497,6 +613,15 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     if (cache.dtype == DType::I8) {
         volta_flash_gather_kv_i8_kernel<kKVHeads>
             <<<dim3(n_kv_alloc, kKVHeads), kHeadDim, 0, stream>>>(
+                static_cast<const std::int8_t*>(cache.k_pages.data),
+                static_cast<const std::int8_t*>(cache.v_pages.data),
+                static_cast<const half*>(cache.k_scale_pages.data),
+                static_cast<const half*>(cache.v_scale_pages.data), block_tables, rows,
+                logical_pages, static_cast<half*>(k_gathered.data),
+                static_cast<half*>(v_gathered.data), n_kv_total, n_kv_alloc);
+    } else if (cache.dtype == DType::I4NL) {
+        volta_flash_gather_kv_i4nl_kernel<kKVHeads>
+            <<<dim3(n_kv_alloc, kKVHeads), kHeadDim / 8, 0, stream>>>(
                 static_cast<const std::int8_t*>(cache.k_pages.data),
                 static_cast<const std::int8_t*>(cache.v_pages.data),
                 static_cast<const half*>(cache.k_scale_pages.data),
