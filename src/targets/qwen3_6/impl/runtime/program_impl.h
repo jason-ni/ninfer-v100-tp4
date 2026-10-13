@@ -4502,6 +4502,10 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         sequence.mtp_draft_count = 0;
         release_sequence_growth_entitlement(sequence);
         unbind_sequence_kv(sequence);
+        // Release this request's cache pins now that it is done: its committed blocks stay in the
+        // cache but must become evictable, otherwise the next request's admission sees them as
+        // permanently unavailable and the tap-slot array accumulates.
+        finalize_prefix_cache_state(sequence);
         sequence.retained = true;
     }
     request.lifecycle = terminal ? Lifecycle::Complete : Lifecycle::Active;
