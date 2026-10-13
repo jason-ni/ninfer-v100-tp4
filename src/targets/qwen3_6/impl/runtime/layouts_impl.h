@@ -847,10 +847,9 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
         throw std::invalid_argument("tensor-parallel width must be 1, 2, or 4");
     }
     if (options.tp > 1) {
-        // MTP has an explicit split schedule and an explicit split Vision encode (the artifact
-        // replicates the BF16 Vision tower on every rank; each rank encodes its own ViT pass and
-        // scatters the per-rank result before the column/row parallel text leaves, adding no
-        // cross-rank collective). The DFlash split schedule remains defined for exactly two ranks.
+        // MTP and Vision both have explicit split schedules: the Vision tower is sharded across
+        // the rank group, its only collective being the allreduce_sum joining each row-parallel
+        // op. The DFlash split schedule remains defined for exactly two ranks.
         if (options.speculative.backend == SpeculativeBackend::DFlash && options.tp != 2) {
             throw std::invalid_argument("--spec dflash supports --tp 1 or --tp 2 only");
         }

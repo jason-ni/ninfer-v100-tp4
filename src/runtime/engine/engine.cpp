@@ -29,10 +29,13 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     return resolved;
 }
 
-// The tp2 feature guard is intentionally small: both text/MTP and DFlash have split-aware
-// execution paths; Vision remains primary-device-only.
+// The TP feature guard here is intentionally small: text, both speculative backends, and the
+// Vision tower all have split-aware execution paths, and their concrete `tp > 1` restrictions
+// (draft-window bounds, the DFlash width cap, per-variant rejection of `tp > 1`) are enforced by
+// the target packages and the family option validation, not in this file. This function only
+// resolves the per-rank device list. For context, what that validation relies on:
 //
-// Every weight both speculative backends need is already SHARDED by the ShardPlan and
+// Every weight either speculative backend needs is already SHARDED by the ShardPlan and
 // materialized per device, and the op-level split forms exist and are parity-tested. What decides
 // whether a backend is usable is therefore the RUNTIME wiring, not the load plan:
 //
@@ -45,15 +48,15 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
 //   * DFlash uses its own TP2 proposal/verification path. Proposal features are kept rank-local,
 //     the vocabulary head is column-parallel, and only rank 0 consumes the gathered selector
 //     image. This avoids treating the drafter as a whole-width single-device graph.
-//   * Vision is replicated, not split. The Vision tower is a self-contained ViT with no
-//     tensor-parallel head/channel axis, so the artifact replicates the BF16 tower on every rank
-//     (same mechanism as the token embedding and the DFlash draft payload). Every rank runs its
-//     own Vision encode and scatters the per-rank result into its own full-width `x` before the
-//     column/row parallel text leaves; no cross-rank collective is added, and the output is
-//     bit-identical to the single-device path by construction.
-//
-// There is currently no `tp > 1` restriction on this target; the speculative routes above are the
-// only things this file still validates.
+//   * Vision is sharded across the rank group, not replicated. The artifact binds per-rank
+//     extents of the FP16 tower: qkv (and its column-parallel bias) splits by head,
+//     o_proj/fc2/merger fc2 run row-parallel over the sharded K, and fc1/merger fc1 run
+//     column-parallel; patch_embedding, the position embedding, every norm, and the
+//     row-parallel output-projection biases stay replicated on every rank, so the residual
+//     stream is full-width from the first op. Each rank encodes its own heads, and every
+//     row-parallel join (o_proj, fc2, merger fc2) resolves with `allreduce_sum` -- the tower's
+//     only collective -- after which rank 0 writes the caller's output while peers keep
+//     private copies.
 std::vector<int> resolve_execution_device_ids(const EngineOptions& options) {
     if (options.tp != 1 && options.tp != 2 && options.tp != 4) {
         throw std::invalid_argument("EngineOptions.tp must be 1, 2, or 4");

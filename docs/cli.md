@@ -1,12 +1,12 @@
 # NInfer CLI
 
-`build/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
+`build-v100/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
 download an artifact using the [project README](../README.md) before following this guide.
 
 ## Text input
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+build-v100/apps/ninfer models/qwen3_6_27b.ninfer \
   --prompt "Summarize the difference between prefill and decode." \
   --max-context 16384 \
   --max-new 256
@@ -19,7 +19,7 @@ canonical `weights_id`), timings, throughput, GPU memory, and speculative-decodi
 written to stderr, so stdout can be redirected independently:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+build-v100/apps/ninfer models/qwen3_6_27b.ninfer \
   --prompt "Return one sentence." --max-new 64 \
   > answer.txt 2> run.log
 ```
@@ -76,7 +76,7 @@ and an optional `tools` array.
 Run message files from the repository root when they contain repository-relative media paths:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+build-v100/apps/ninfer models/qwen3_6_27b.ninfer \
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
   --max-new 128 \
@@ -110,7 +110,7 @@ containing the optional DFlash2 package. The official NVFP4 v3 container include
 `--lm-head-draft` selects the optimized proposal head and requires a selected backend:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
+build-v100/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
   --prompt "Write a short explanation of speculative decoding." \
   --max-context 16384 \
   --max-new 512 \
@@ -121,7 +121,7 @@ containing the optional DFlash2 package. The official NVFP4 v3 container include
 For DFlash:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
+build-v100/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
   --prompt "Write a short explanation of speculative decoding." \
   --max-context 16384 --max-new 512 \
   --spec dflash --draft-tokens 7 --lm-head-draft
@@ -130,7 +130,7 @@ For DFlash:
 For the two-V100 NVFP4 v3 DFlash2 profile:
 
 ```bash
-./build-v100/apps/ninfer /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
+build-v100/apps/ninfer /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
   --tp 2 --devices 0,1 --max-context 98304 --prefill-chunk 1024 --kv-dtype int8 \
   --prompt "Write a complete C++20 program." --max-new 2048 --greedy --no-thinking \
   --spec dflash --draft-tokens 7
@@ -157,7 +157,7 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--device N` | CUDA device index | `0` |
 | `--tp 1\|2\|4` | tensor-parallel width; `2` or `4` splits the model across that many GPUs | `1` |
 | `--devices A,B[,...]` | one CUDA device index per `--tp` rank; required for `--tp 2` or `--tp 4` | `--device` |
-| `--kv-dtype bf16\|int8\|iq4nl` | KV-cache storage | `bf16` |
+| `--kv-dtype bf16\|int8\|iq4nl` | KV-cache storage; `iq4nl` selects IQ4_NL group-32 and is accepted only by the Volta sm_70 build | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -204,7 +204,7 @@ unaffected. This exists for fixed-length decode work such as sustained long-cont
 throughput measurement; normal use should leave it off, because generation past the end-of-turn
 token is off-distribution and its text is not a product output.
 
-Run `./build/apps/ninfer --help` for the exact option contract.
+Run `build-v100/apps/ninfer --help` for the exact option contract.
 
 ## Tensor-parallel execution
 
@@ -214,7 +214,7 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 must agree on the primary device.
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+build-v100/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --tp 4 --devices 0,1,2,3 \
   --max-context 262144 --kv-dtype int8 --kv-capacity auto \
   --messages long_prompt.json --max-new 256 --no-thinking
@@ -222,7 +222,8 @@ must agree on the primary device.
 
 Tensor-parallel execution is implemented for the 27B execution package (`qwen3.6-27b` and
 `qwen3.8-27b`, either weight profile) at width 1, 2, or 4. `qwen3.6-35b-a3b` has no tensor-parallel
-path and rejects `--tp 2`/`--tp 4` at startup, as does `--vision`. `--spec mtp` is supported at all
+path and rejects `--tp 2`/`--tp 4` at startup. At width greater than 1 on the 27B package the
+`--vision` tower runs sharded across the rank group rather than replicated. `--spec mtp` is supported at all
 tensor-parallel widths, including compatible-prefix reuse in a resident Engine. Optional Qwen3.8
 DFlash2 remains limited to `--tp 2`. Both suffix prefill and exact-frontier sampling restore the
 complete state on every device. The HTTP server enables reuse by default; separate CLI processes do
@@ -253,8 +254,12 @@ rejected together with `--vision`, `--spec dflash`, or a target with no YaRN rop
 `rope` row reports the resolved mode, factor, origin, effective ceiling and `mscale`. The practical
 allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
 KV-cache type.
-Use `--kv-dtype int8` for large context allocations; at `--max-context 1048576` it is mandatory,
-because a BF16 pool at that window does not fit two RTX 5090s. The 1,048,576-token configuration is
+Use `--kv-dtype int8` for large context allocations; the `iq4nl` storage type stores KV codes at
+four bits with a group-32 scale, about half the per-token KV payload of `int8`, but is accepted
+only by the Volta sm_70 build -- its decode and append kernels exist on that path only, and other
+registered targets reject it at startup. At `--max-context 1048576` on the RTX 5090 pair, `int8`
+is therefore mandatory, because a BF16 pool at that window does not fit both cards. The
+1,048,576-token configuration is
 `--tp 2 --devices A,B --rope yarn --yarn-factor 4.0 --yarn-origin 262144 --kv-dtype int8
 --kv-capacity auto`; it reserves 26.93 GiB per device without a speculative backend and 28.42 GiB
 with `--spec mtp --draft-tokens 3`. A full-ceiling prefill takes about 19 minutes on the measured
