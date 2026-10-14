@@ -869,3 +869,75 @@ The local conversion produced an 18,322,586,368-byte artifact. Exact checks cove
 embedding, fused Q/K/gate/V, and MTP source rows. Host tests cover mixed-row tensor materialization
 and TP row/column slicing. Conversion success does not establish decode throughput; performance
 claims require real Engine execution and stated context occupancy.
+
+## 15. Coder390 quantized-Vision identity
+
+The published Coder390 package is a distinct registered identity whose Text/MTP/DFlash2 recipe is
+role-for-role identical to Section 1 but whose Vision tower ships the publisher's grouped-integer
+recipe instead of native FP16:
+
+```text
+filename   = Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-MTP-DFlash2.ninfer
+model_id   = qwen3.8-27b-coder390
+weights_id = nvfp4-qvis
+target_key = qwen3_8_27b
+profile    = Qwen38Nvfp4QVis
+```
+
+The text binding is shared with `qwen3.8-27b/nvfp4` (attention/GDN projections
+`FP8_E4M3FN_ROW_BF16S`, MLPs `NVFP4`, norms BF16), and it carries the same MTP and optional DFlash2
+component sets. The v3 reader adapter accepts the Coder390 `metadata.name`, derives the identity
+from the directory, and asserts the observed per-role Vision format table; a v3 artifact whose
+Vision formats match neither registered recipe is rejected at bind time.
+
+### 15.1 Vision recipe
+
+The Vision GEMM matrices bind to the formats the checkpoint ships (context-conversion record in
+Section 3.1 for the FP16 profile); biases, norms, the position embedding, `patch_embedding_bias`,
+and `qkv_bias` stay `BF16`:
+
+| role (logical) | shape `[N,K]` ×count | format | layout |
+|---|---|---|---|
+| `vision/patch_embedding` | `[1152,1536]` ×1 | `Q6G64_F16S` | `row-split-k128-v1` |
+| `vision/layers/*/attention/qkv` | `[3456,1152]` ×27 | `Q4G64_F16S` | `row-split-k128-v1` |
+| `vision/layers/*/attention/output` | `[1152,1152]` ×27 | `Q5G64_F16S` | `row-split-k128-v1` |
+| `vision/layers/*/mlp/fc1` | `[4304,1152]` ×27 | `Q4G64_F16S` | `row-split-k128-v1` |
+| `vision/layers/*/mlp/fc2` | `[1152,4304]` ×27 | `Q5G64_F16S` | `row-split-k128-v1` |
+| `vision/merger/fc1` | `[4608,4608]` ×1 | `W8G32_F16S` | `row-split-k128-v1` |
+| `vision/merger/fc2` | `[5120,4608]` ×1 | `W8G32_F16S` | `row-split-k128-v1` |
+| every bias, norm, `position_embedding` | — | `BF16` | `contiguous-le-v1` |
+
+Every format and layout above is already registered (Sections 3 and 4); the Coder390 package adds
+no new persistent numeric format. The Vision recipe is owned by
+`qwen3_6::kVisionRecipeCoder390Quantized` (`vision.h`), and `profile_vision_recipe` selects it for
+`Qwen38Nvfp4QVis`.
+
+### 15.2 Host-staged residency
+
+The Vision shards of every profile are `HostStaging`: they live in pinned host memory and stream to
+the device once per media encode, then release. Steady-state device Vision residency is ~0 rather
+than the resident tower footprint; the per-encode H2D payload is ~150 MB/rank at tp2 for the
+quantized recipe and ~464 MB/rank for the FP16 recipe. The encode-scoped weight region never
+observes a captured CUDA Graph (Vision is prefill-side, eager at tp > 1). The FP16 towers use the
+same placement, so text-only deployments pay no Vision cost.
+
+### 15.3 Sharded geometry
+
+The tower shards like Section 7.2 but on recipe-pinned extents: qkv by head (`3*hidden/tp` rows),
+`o_proj`/`fc2`/merger `fc2` row-parallel (K-sliced) and `fc1`/merger `fc1` column-parallel, with
+`patch_embedding`, the position embedding, every norm, and the row-parallel output biases
+replicated. A quantized coupled pair pads the fc1 producer width to the fc2 consumer's group size,
+so fc2's per-rank K can exceed fc1's live N; the activation tail lanes are zeroed before the
+activation. Where a quantized `o_proj` K split cannot land on the group boundary (tp4), the matrix
+is replicated behind an `allgather_columns` of the attention output. See Section 3.8 for the
+row-split column-slice rule and `quantized-vision-plan.md` for the shard map.
+
+### 15.4 Frontend
+
+Coder390 ships its own `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, and
+`generation_config.json`. The template is a reasoning-effort template that additionally falls back
+to the last tool result when no user query is present and opens an implicit user group for a
+leading tool message; it registers as `ReasoningEffortMultiStepTool` with digest `5e6532b9…` (text
+minus trailing newline). Sampling defaults match the Qwen3.8 general-task presets. The v3 reader
+normalizes `tokenizer_config.json` so the embedded `chat_template` mirrors the authoritative
+resource.

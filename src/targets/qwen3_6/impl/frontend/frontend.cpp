@@ -328,6 +328,58 @@ VisionItem convert_vision_item(fi::VisionItem item) {
     return result;
 }
 
+// FNV-1a over a Vision item's identity. The digest binds the owned media bytes; modality, grid,
+// patch span, timestamps and token spans bind the rest of the identity that token ids do not
+// encode (image and video placeholders share one token id, so a content-addressed prefix cache
+// cannot otherwise tell two media apart).
+constexpr std::uint64_t kMediaKeyOffset = 0xCBF2'9CE4'8422'2325ULL;
+constexpr std::uint64_t kMediaKeyPrime  = 0x0000'0100'0000'01B3ULL;
+
+void fold_media_bytes(std::uint64_t& hash, const void* data, std::size_t size) noexcept {
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    for (std::size_t i = 0; i < size; ++i) { hash = (hash ^ bytes[i]) * kMediaKeyPrime; }
+}
+
+std::uint64_t vision_item_media_key(const VisionItem& item) noexcept {
+    std::uint64_t hash          = kMediaKeyOffset;
+    const std::uint8_t modality = static_cast<std::uint8_t>(item.modality);
+    fold_media_bytes(hash, &modality, sizeof(modality));
+    const std::int32_t grid[3] = {item.grid.temporal, item.grid.height, item.grid.width};
+    fold_media_bytes(hash, grid, sizeof(grid));
+    fold_media_bytes(hash, &item.patch_begin, sizeof(item.patch_begin));
+    fold_media_bytes(hash, &item.patch_count, sizeof(item.patch_count));
+    fold_media_bytes(hash, item.content_digest.data(), item.content_digest.size());
+    for (const double timestamp : item.timestamps) {
+        fold_media_bytes(hash, &timestamp, sizeof(timestamp));
+    }
+    for (const TokenSpan& span : item.token_spans) {
+        fold_media_bytes(hash, &span.begin, sizeof(span.begin));
+        fold_media_bytes(hash, &span.count, sizeof(span.count));
+    }
+    return hash == 0 ? kMediaKeyOffset : hash; // 0 is reserved for "no media in this block".
+}
+
+// One media key per full 64-token block: a block that overlaps a Vision item's token span carries
+// that item's key (multiple items are folded together); every other block carries 0, matching a
+// text-only block. The result is sized exactly to the prompt's full-block count.
+std::vector<std::uint64_t> vision_block_extras(const PreparedPromptData& prompt) {
+    constexpr std::size_t block_tokens = static_cast<std::size_t>(ninfer::prefix_cache::kBlockTokens);
+    std::vector<std::uint64_t> extras(prompt.token_ids.size() / block_tokens, 0);
+    for (const VisionItem& item : prompt.vision_items) {
+        const std::uint64_t key = vision_item_media_key(item);
+        for (const TokenSpan& span : item.token_spans) {
+            if (span.count == 0) { continue; }
+            const std::size_t first = span.begin / block_tokens;
+            const std::size_t last  = (span.begin + span.count - 1) / block_tokens;
+            for (std::size_t block = first; block <= last && block < extras.size(); ++block) {
+                extras[block] =
+                    extras[block] == 0 ? key : (extras[block] ^ key) * kMediaKeyPrime;
+            }
+        }
+    }
+    return extras;
+}
+
 StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& caller) {
     StopPolicy result;
     result.publish_stop_token = caller.publish_stop_token;
@@ -1081,8 +1133,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
-    result.block_hashes = ninfer::prefix_cache::chain_block_hashes(result.token_ids);
-    result.block_extras.assign(result.block_hashes.size(), 0);
+    result.block_extras = vision_block_extras(result);
+    result.block_hashes =
+        ninfer::prefix_cache::chain_block_hashes(result.token_ids, result.block_extras);
     result.identity.reusable   = true;
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();

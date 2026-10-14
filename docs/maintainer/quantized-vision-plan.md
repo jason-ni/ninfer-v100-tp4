@@ -1,6 +1,26 @@
 # Plan — quantized (Q4/Q5/Q6/W8) Vision weights + host-staged streaming load
 
-Status: in progress (started 2026-10-13)
+Status: implemented — P0–P4 complete (2026-10-14); P5 (optional local re-convert) not started.
+Integrated authorities: §15 of [`qwen3.8-27b-artifact.md`](qwen3.8-27b-artifact.md) owns the
+identity and Vision recipe; §3.8 of [`storage-layouts.md`](storage-layouts.md) owns the row-split
+column-slice rule; `AGENTS.md` owns the product contract. E2E (§4.4): the Coder390 artifact returns
+the ground-truth answer for `image_chart.json` and `image_natural.json` at tp2 AND tp4
+(`NIFER VISION 731；3；左侧` / mailbox `24`), with per-stage merged-embedding correlation ~0.99
+against the FP16 tower (the FP16-vision sibling was re-verified at tp4 in the same session).
+
+Note (implementation deltas that went beyond this plan's text):
+1. the quantized fc1 producer's live width is shorter than its padded producer width on the last
+   rank of the coupled pair (tail 48 at tp2/tp4), and NInfer tensors are column-major, so the
+   projection writes a compact `[n_count, P]` staging tensor that a strided copy places into the
+   padded producer prefix (see §3.4's encode);
+2. the o_proj join shipped differently from the §3.3 draft table: the split is uniform `576` at
+   tp2, and at tp4 (288 is not a multiple of the Q5 group 64) the o_proj weight is replicated
+   full-width behind the new input gather `allgather_columns` — whose own first cut had the
+   flat-vs-strided placement bug of `allgather_rows` and was corrected via a stream-ordered
+   staging image + `cudaMemcpy2DAsync` (mirrors `gather_columns_rank0`; regression-guarded in
+   `tests/ops/test_allreduce.cpp`);
+3. the q5 dispatch gained the tp1 full-width padded fc2 width `k=4352`
+   (`producer_width = align_up(4304, 64)` even at tp1), which the legacy tp1 table lacks.
 Scope: Vision tower only (text/MTP/DFlash recipes untouched)
 
 Motivation: the published orcarouter checkpoint
@@ -180,24 +200,37 @@ all-FP16 map and the §1.1 quantized map), passed into the family binders:
 ### 3.3 Shard geometry
 
 FP16 contiguous shards use the mod-8 uneven split (`vision_mod8_shard_count`). Quantized
-`row-split-k128-v1` K-slices must instead be **multiples of 128** (layout rule,
-`storage_layouts.cpp:565`). Add the layout-aware K-split helper (unit 128) and emit, from the
-27B shard map, per-profile splits. These splits feed BOTH device placement (for any
-device-resident consumer) and the host-shard placement of §3.4 — the shard extents are identical
-in either case:
+`row-split-k128-v1` K-slices must instead keep **both bounds on the format's group boundary**
+(unit 64 for Q4/Q5/Q6, 32 for W8), because the storage reads span the 128-aligned `K_pad` and the
+layout clamps the copied group count to what the parent actually encodes (§3.8 of
+`storage-layouts.md`; the helper `tensor_column_slice` implements the clamp). The 27B shard map
+emits per-device extents through one coupled-partition function shared by every consumer
+(`detail::vision_coupled_partition`, which pads the logical span up to the consumer's unit and
+absorbs the remainder at the logical end as zeroed `tail` channels); these extents feed BOTH
+device placement (for any device-resident consumer) and the host-shard placement of §3.4:
 
 | matrix (split axis) | tp1 | tp2 | tp4 |
 |---|---|---|---|
-| qkv (N, by head) | 3456 | 1728 | 864 |
-| output o_proj (K) | 1152 | 640 / 512 | 384 / 256 / 256 / 256 |
-| fc1 (N) = fc2 (K) | 4304 | 2176 | 1152 / 1152 / 1024 / 1024 |
-| merger_fc1 (N) = merger_fc2 (K) | 4608 | 2304 | 1152 ×4 |
+| qkv (N, by head) | 3456 | 1728 (×2) | 864 (×4) |
+| output o_proj (K) | 1152 | 576 row-parallel (×2) | **replicated 1152 ×4**, behind an input `allgather_columns` |
+| fc1 (N, live rows) | 4304 | 2176 / 2128 | 1088 / 1088 / 1088 / 1040 |
+| fc2 (K = producer width) | 4352 = align_up(4304, 64) | 2176 | 1088 |
+| merger_fc1 (N) = merger_fc2 (K) | 4608 | 2304 | 1152 (×4, exact multiple of 32) |
 | patch_embedding, norms, biases, position (Replicated) | full | full | full |
 
-Properties: every K extent stays a multiple of 128 ⇒ shard `K_pad == K` and the kernel guard
-`w.k == padded_k && k % kGroupK == 0` holds; fc1's N split and fc2's K split are generated from
-the same counts so column-parallel output width equals row-parallel contraction width on every
-rank. qkv_bias/fc1_bias N-splits follow their weight (unchanged mechanics).
+Properties: the o_proj join is the only place where a recipe can be *unsplittable*: at tp4 the
+per-rank contraction width 288 is not a multiple of the Q5 group 64, so rather than pad a
+per-rank weight column slice to 320 (which does not divide the head-aligned attention width),
+every rank keeps the FULL o_proj and the per-rank attended images are gathered first
+(`ops::allgather_columns`, a new collective; the join then needs no post-GEMM reduce — the only
+collective the quantized encode issues besides the row-parallel `allreduce_sum` joins at tp2).
+Every other K extent stays a multiple of 128 ⇒ shard `K_pad > K` only where the layout forces it
+(o_proj tp2: K 576 → `K_pad` 640; covered by the group-boundary rule above), and the kernel guard
+`w.k == padded_k && k % kGroupK == 0` holds for each family. fc1's N split and fc2's K split are
+generated from the same counts so column-parallel output width equals row-parallel contraction
+width on every rank; fc1's live tail (48 channels on the last ranks of the fc2/merger pairs) is
+zeroed after the bias add so padded lanes never reach the activation. qkv_bias/fc1_bias N-splits
+follow their weight (unchanged mechanics).
 
 ### 3.4 Host-staged placement and per-encode upload (the new machinery)
 
@@ -236,15 +269,19 @@ rank. qkv_bias/fc1_bias N-splits follow their weight (unchanged mechanics).
 
 ### 3.5 Dispatcher launch tables (bounded additions)
 
-The tp2/tp4 Vision shard geometries are not in the `select_*_shard_launch` tables (they
-currently list only text shards). Add the finite Vision extents to q4 (k=1152 rows 1728/864;
-fc1/fc2 rows 2176 and tp4 1152/1024), q5 (o_proj k ∈ {640,512,384,256}, fc2 k ∈ {2176,1152,1024}),
-q6 (none sharded: patch stays full), w8 (merger k ∈ {2304,1152}) to
-`src/ops/linear/{q4,q5,q6,w8}/*_dispatch.cpp`, routed to each family's existing generic
-launcher (SIMT/fallback on sm_70). Also verify the tp1 Vision-shape T gates
-(`q4_dispatch.cpp:114` `t%4==0, 4<=t<=131072` etc.) against the encoder's segment patch counts
-and pad segment T in `VisionContext::encode` if any path can violate one (small-image low-T
-regime included).
+The tp1/tp2/tp4 Vision shapes are finite dispatch additions in
+`src/ops/linear/{q4,q5,w8}/*_dispatch.cpp`, routed to each family's existing generic
+runtime-dimension launcher (SIMT/fallback on sm_70); all are covered by the family oracle tests:
+
+| family | entry | covers (§3.3 rows) |
+|---|---|---|
+| q4 | `k == 1152`, any N, T-gate `4 ≤ t ≤ 131072, t % 4 == 0` | qkv 1728/864; fc1 2176/2128/1088/1040 (full tp1 N 4304 included) |
+| q5 | `n == 1152 && k ∈ {576, 4352, 2176, 1088}` | o_proj 576 (tp2); fc2 producer widths 4352 (tp1)/2176 (tp2)/1088 (tp4). The tp4-replicated full-width o_proj (k=1152) and the legacy unpadded shape (k=4304) stay on the tp1 table |
+| q6 | none sharded | patch_embedding stays full-width (replicated under every recipe) |
+| w8 | `(k == 4608 && n ∈ {2304, 1152})` and `(n == 5120 && k ∈ {2304, 1152})` | merger fc1 N / fc2 producer width, tp2 & tp4 (tp1 full-width 4608 on the tp1 table) |
+
+The T alignment gates (Vision encode patch counts are multiples of 4 via the 2×2 merge unit) were
+checked against `VisionScheduleConfig::merge_unit`; no segment-padding path could violate one.
 
 ### 3.6 No-change list (explicit)
 
@@ -276,6 +313,18 @@ GGUF identity still rejects Vision execution.
    the command + hardware provenance for each.
 5. **Negative cases**: a v3 artifact whose Vision formats match neither recipe table is rejected
    at bind/adapt time (loud failure per op-development admission rules).
+6. **C++ activation alignment**: `NINFER_VISION_TAP_DIR` makes both production Vision encodes
+   (single-device and sharded) dump rank-0 `patch_embed`, `block_00/13/26`, and `merger` as raw
+   BF16; `tools/parity/qwen3_6_27b/vision_tap.py` runs a reference and a candidate artifact on the
+   same media and asserts a per-stage cosine floor (`--min-cosine`, default 0.98; non-zero exit on
+   any miss, missing stage, or shape mismatch). Self-comparison is exact (`rmse = 0`, `cosine = 1`).
+   Measured FP16-vs-quantized on `image_chart.json` (tp2): `0.9999` patch_embed, `0.9988` block_00,
+   `0.9905` block_13, `0.9907` block_26, `0.9923` merger. On `image_natural.json` (tp2 / tp4):
+   `0.99996` patch_embed, `0.99895` block_00, `0.9939`/`0.9939` block_13, `0.9827`/`0.9834`
+   block_26, `0.9908`/`0.9916` merger — all above the `0.98` floor, the expected
+   weight-quantization profile, not an execution defect. This closes the gap that §4.1's
+   weight-decode oracle and the §4.4 end-to-end answer do not cover: the sharded/collective C++
+   schedule itself.
 
 ## 5. Phasing
 
@@ -321,3 +370,14 @@ to ~125 MB, a second-order effect).
   accounted beside (not pooled with) `--host-cache-mib`; allocation failure is a loud load error.
 - **Coder390 sampling defaults / thinking behavior** ("EfficientThink"): its
   `generation_config.json` differs from ours; P3 captures the delivered defaults explicitly.
+- **Pre-existing `concurrent_prefix` test-criterion defect (OUT OF SCOPE — separate ticket, not
+  touched by this plan).** `tests/targets/qwen3_6_27b/test_engine_v100x2_concurrent_prefix_real.cpp`
+  (introduced by `8526dc2c`, unmodified here) enforces `exact == kLanes` — all four lanes must
+  reproduce their single-lane answer — while its own header and the sibling
+  `test_engine_tp2_real.cpp` batching leg document the weaker rule (at least one fully
+  batch-invariant lane, the rest no less faithful than the reference's own batching). Measured on
+  `conv_fp16vision/qwen3_8_27b_nvfp4.ninfer` at tp2: the reproducibility leg passes, lanes 0/1 are
+  `32/32` exact and lanes 2/3 are `14/32`/`13/32` — the documented deterministic greedy knife-edge
+  under batch composition, not shared-state corruption (a defect would collapse a lane to a short
+  prefix). Text-only path, unrelated to the Vision work. The fix belongs to the prefix-cache test
+  design; this plan records the finding and leaves the test unchanged.

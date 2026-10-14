@@ -5,6 +5,7 @@
 #include "runtime/contract/transient_region.h"
 #include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/qwen3_6/runtime.h>
+#include <ninfer/targets/qwen3_6/vision.h>
 
 #include <cstdint>
 #include <memory>
@@ -36,11 +37,18 @@ enum class WeightsProfile : std::uint8_t {
     Qwen36Nvfp4,
     Qwen38Nvfp4,
     Qwen38GgmlK,
+    // qwen3.8-27b-coder390 / nvfp4-qvis: the text recipe of Qwen38Nvfp4 plus the published
+    // quantized (Q4/Q5/Q6/W8) Vision tower, streamed from host-staged shards.
+    Qwen38Nvfp4QVis,
 };
 
 using Frontend       = qwen3_6::Frontend;
 using PreparedPrompt = qwen3_6::PreparedPrompt;
 using OutputSession  = qwen3_6::OutputSession;
+
+// The published Vision recipe of a profile, or nullptr when the profile carries no executable
+// Vision tower (the GGUF-derived identity keeps its GGUF Vision weights validation-only).
+[[nodiscard]] const qwen3_6::VisionRecipe* profile_vision_recipe(WeightsProfile profile) noexcept;
 
 class LoadPlan {
 public:
@@ -85,6 +93,9 @@ struct Package {
     static constexpr std::string_view target_key         = "qwen3_6_27b";
     static constexpr std::string_view qwen3_8_model_id   = "qwen3.8-27b";
     static constexpr std::string_view qwen3_8_target_key = "qwen3_8_27b";
+    // The Coder390 efficient-think repack of Qwen3.8-27B: an own tokenizer/chat-template set, so
+    // an own model id under the same family package.
+    static constexpr std::string_view coder390_model_id  = "qwen3.8-27b-coder390";
 
     using WeightsProfile  = detail::WeightsProfile;
     using LoadPlan        = detail::LoadPlan;

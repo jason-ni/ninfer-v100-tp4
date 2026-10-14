@@ -253,6 +253,30 @@ the same plane order, with the plane offsets and zero padding recomputed from Se
 `N=row_count`. This produces another valid `row-split-k128-v1` tensor without decoding or repacking
 individual codes.
 
+### 3.8 Column views and column slices
+
+A row-parallel (K-divided) shard selects one contiguous column range `[k_begin, k_begin + k_count)`
+of the parent. Because the column axis is grouped, the range must begin and end on the format's
+group-size boundary `G` (not necessarily the 128-column alignment unit). The shard is then a
+standalone `row-split-k128-v1` tensor of shape `[N, k_count]` whose own `K_pad = align_up(k_count,
+128)` and `groups_per_row = K_pad / G` are recomputed from Section 3.6.
+
+The range is bounded by the parent's `K_pad`, not its logical `K`: when the parent's logical `K` is
+not 128-aligned, the final shard legitimately covers the parent's trailing physical columns
+`K..K_pad-1`, whose lanes are already zero per Section 3.3. A shard's own `K_pad` can therefore
+exceed its `k_count` (for example `k_count=576` gives `K_pad=640`). Each row copies
+
+```text
+skip   = k_begin / G
+copied = min(K_pad / G, parent.K_pad / G - skip)
+```
+
+groups of every plane from the parent's physical groups starting at `skip`, so the encoded planes
+stay contiguous with the shard's recomputed offsets. Groups of the shard's own row beyond `copied`
+have no parent source and are left zero. A GEMM consumer contracts only the shard's logical
+`div_up(k_count, G)` groups, so these trailing 128-alignment pad groups are never read; the
+materializer leaves them deterministic regardless.
+
 ## 4. `blockscale-k16-m128x4-v1`
 
 This layout stores only rank-two `NVFP4` matrices `[N,K]` satisfying:

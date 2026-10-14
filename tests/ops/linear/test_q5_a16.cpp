@@ -59,6 +59,32 @@ int q5_a16_conformance() {
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
                           {1152, 4304, 181U, Comparison::Sampled, false, kN1152K4304});
 
+    // Vision-tower row-parallel shards (Coder390 recipe): o_proj's K halves at tp2 (576) and fc2's
+    // K is its fc1 producer width -- the padded intermediate span (tp1 4352, tp2 2176, tp4 1088).
+    constexpr std::array kN1152K576{
+        a16(4), a16(76), a16(80), a16(636), a16(640), a16(1300), a16(131072),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
+                          {1152, 576, 183U, Comparison::Sampled, false, kN1152K576});
+
+    constexpr std::array kN1152K2176{
+        a16(4), a16(120), a16(124), a16(636), a16(640), a16(131072),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
+                          {1152, 2176, 185U, Comparison::Sampled, false, kN1152K2176});
+
+    constexpr std::array kN1152K1088{
+        a16(4), a16(120), a16(124), a16(636), a16(640), a16(131072),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
+                          {1152, 1088, 187U, Comparison::Sampled, false, kN1152K1088});
+
+    constexpr std::array kN1152K4352{
+        a16(4), a16(120), a16(124), a16(636), a16(640), a16(131072),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
+                          {1152, 4352, 189U, Comparison::Sampled, false, kN1152K4352});
+
     return failures;
 }
 

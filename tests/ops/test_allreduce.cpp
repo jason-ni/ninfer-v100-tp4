@@ -293,6 +293,71 @@ int run_gather_columns_rank0_case(const char* label, const std::vector<std::int3
     return failures;
 }
 
+// `widths_per_rank[r]` is rank r's contiguous width block along ne[0]; every rank's destination is
+// the full [full, columns] image and all ranks are written identically (the quantized Vision o_proj
+// gather, whose gathered axis is the CONTIGUOUS one so a block is placed strided per column).
+int run_allgather_columns_case(const char* label, const std::vector<std::int32_t>& widths_per_rank,
+                               std::int32_t columns, std::uint32_t seed,
+                               const ExecutionContext& ec, const ops::CollectiveComms& events) {
+    const int tp      = ec.tp;
+    std::int32_t full = 0;
+    for (std::int32_t w : widths_per_rank) full += w;
+
+    std::vector<std::vector<float>> parts_float(tp);
+    for (int rank = 0; rank < tp; ++rank) {
+        parts_float[rank].resize(static_cast<std::size_t>(widths_per_rank[rank]) * columns);
+        fill_uniform(parts_float[rank], seed + static_cast<std::uint32_t>(rank), -8.0f, 8.0f);
+    }
+
+    // Exact oracle: ne[0] is the contiguous dimension, so the owned width blocks concatenate within
+    // each of the `columns` columns; the identical image lands on every rank.
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(full) * columns);
+    std::int32_t row_base = 0;
+    for (int rank = 0; rank < tp; ++rank) {
+        const std::int32_t w = widths_per_rank[rank];
+        for (std::int32_t c = 0; c < columns; ++c) {
+            for (std::int32_t i = 0; i < w; ++i) {
+                expected[static_cast<std::size_t>(c) * full + (row_base + i)] =
+                    f32_to_bf16(parts_float[rank][static_cast<std::size_t>(c) * w + i]);
+            }
+        }
+        row_base += w;
+    }
+
+    Guards parts, destinations;
+    std::array<Tensor, kMaximumDevices> part{};
+    std::array<Tensor, kMaximumDevices> destination{};
+    for (int rank = 0; rank < tp; ++rank) {
+        set_device(ec, rank);
+        parts[rank] = std::make_unique<GuardedDeviceBuffer>(
+            static_cast<std::size_t>(widths_per_rank[rank]) * columns * sizeof(std::uint16_t));
+        const auto bits = encode_bf16(parts_float[rank]);
+        parts[rank]->copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));
+        part[rank] = Tensor(parts[rank]->data(), DType::BF16, {widths_per_rank[rank], columns});
+        destinations[rank] = std::make_unique<GuardedDeviceBuffer>(
+            static_cast<std::size_t>(full) * columns * sizeof(std::uint16_t));
+        destinations[rank]->fill(0);
+        destination[rank] = Tensor(destinations[rank]->data(), DType::BF16, {full, columns});
+    }
+
+    retire_staging(ec);
+    ops::allgather_columns(destination, part, ec, events);
+    synchronize_all(ec);
+
+    int failures = 0;
+    for (int rank = 0; rank < tp; ++rank) {
+        set_device(ec, rank);
+        failures += verify_exact(
+            (std::string(label) + " device " + std::to_string(rank)).c_str(),
+            from_device<std::uint16_t>(destinations[rank]->data(),
+                                       static_cast<std::size_t>(full) * columns),
+            expected);
+        failures += destinations[rank]->verify_guards("allgather_columns destination device guard");
+        failures += parts[rank]->verify_guards("allgather_columns part device guard");
+    }
+    return failures;
+}
+
 // `source` lives on rank 0; every peer destination must become a bit-exact copy.
 int run_broadcast_case(const char* label, std::int32_t ne0, std::int32_t ne1, std::uint32_t seed,
                        const ExecutionContext& ec, const ops::CollectiveComms& events) {
@@ -488,6 +553,16 @@ int run_suite(int tp) {
         uneven_widths[0] = 3;
         failures += run_gather_columns_rank0_case("gather_columns_rank0 [11,7] uneven", uneven_widths,
                                                   7, 206u, ec, events);
+
+        // Quantized Vision o_proj: hidden 1152 split evenly across ranks, one column per patch.
+        std::vector<std::int32_t> vision_widths(tp, 1152 / tp);
+        failures += run_allgather_columns_case("allgather_columns [1152,2304]", vision_widths, 2304,
+                                               204u, ec, events);
+
+        std::vector<std::int32_t> uneven_vision(tp, 8);
+        uneven_vision[0] = 12;
+        failures += run_allgather_columns_case("allgather_columns [36,7] uneven", uneven_vision, 7,
+                                               207u, ec, events);
 
         failures += run_broadcast_case("broadcast_rank0 [5120]", 5120, 1, 301u, ec, events);
         failures += run_broadcast_case("broadcast_rank0 [4097]", 4097, 1, 302u, ec, events);

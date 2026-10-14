@@ -30,6 +30,11 @@ export NINFER_V100X2_SERVE_MAX_CONCURRENCY=${NINFER_V100X2_SERVE_MAX_CONCURRENCY
 # generated frontier (append_frontier) instead of the conservative turn-closure checkpoint.
 export NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS=${NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS:-'{"preserve_thinking": true, "reasoning_effort":"medium"}'}
 
+# Optional public HTTP model alias (the OpenAI/Responses `model` field). Empty advertises the
+# loaded artifact's identity.model_id. Override with NINFER_V100X2_SERVE_MODEL_ID, or pass
+# --model-id <alias> as a free argument (which wins over the environment value).
+export NINFER_V100X2_SERVE_MODEL_ID=${NINFER_V100X2_SERVE_MODEL_ID:-}
+
 # Enable the hybrid prefix cache with the pinned host tier (M2): KV blocks and snapshot images that
 # no longer fit on device are demoted to pinned host RAM instead of dropped, so an evicted
 # conversation can still be restored without recomputing. Each snapshot slab is ~147 MiB, so the
@@ -76,8 +81,9 @@ if [[ -n "${raw_log_path}" ]]; then
 fi
 
 if [[ "${vision_requested}" -eq 1 && -z "${NINFER_V100X2_SERVE_ARTIFACT:-}" ]]; then
-    vision_artifact_default=/media/zt/models/orcarouter/conv_fp16vision/qwen3_8_27b_nvfp4.ninfer
+    #vision_artifact_default=/media/zt/models/orcarouter/conv_fp16vision/qwen3_8_27b_nvfp4.ninfer
     #vision_artifact_default=/media/zt/models/orcarouter/coder390-basemtp.ninfer
+    vision_artifact_default=/media/zt/models/orcarouter/Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-MTP-DFlash2.ninfer
     export NINFER_V100X2_SERVE_ARTIFACT="${NINFER_V100X2_SERVE_VISION_ARTIFACT:-${vision_artifact_default}}"
 fi
 

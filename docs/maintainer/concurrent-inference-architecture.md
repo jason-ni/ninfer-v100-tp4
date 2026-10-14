@@ -182,6 +182,13 @@ backfilled decode-ready requests 仍进入同一个 maximal compact batch。
 loop，也不独占一份 Model Runtime。`C` 个并发 request 共享同一份 weights、workspace、round frame 和
 graph families，而不是构造 `C` 个单请求 Program。
 
+Vision tower 的 weights 不属于 resident model 的 device footprint：每个 profile 的 Vision shards
+都是 host-staged，按 rank 放在 pinned host memory，在每次 media encode 时整块 H2D 到该 rank 的
+per-encode workspace 区域，encode 边界同步后释放。因此 `--vision` 的 steady-state device residency
+为 ~0，Vision 不改变 §6.2 的 KV capacity 估算，也不进入任何 captured CUDA Graph；FP16 与 quantized
+tower 走同一 placement。只有 media encode 期间该 per-rank 权重块才占用 device memory，且并发 session
+使用各自的 per-session scope，互不 alias。
+
 Blocking `Engine::generate` 可以保留为 product facade，但其语义是提交一个 owning request record 并等待该
 request 完成，而不是在 caller thread 内运行完整 generation loop。一个 Engine-owned GPU worker 执行全局
 boundary loop；并发 callers 等待各自的 result/output queue。GPU worker 只追加 committed output events，
@@ -722,7 +729,9 @@ Rewrite-checkpoint restore 保留包含 checkpoint 的部分尾页，释放其�
 
 启用 `--prefix-cache` 的 hybrid content-addressed prefix cache 在此之上增加一条复用路径：按 64-token block
 的内容 hash 匹配 prompt 路径，命中时恢复该 block 边界上捕获的完整 state image
-（`PrefixReusePath::BlockSnapshot`）。因此 common prefix 即便结束在任何 checkpoint 都没有的位置，只要落在
+（`PrefixReusePath::BlockSnapshot`）。block 的 key 除 token 内容外还折入 per-block media key（由该 block
+覆盖的 Vision item 的 content digest、modality、grid、timestamps 与 token span 派生），因此占位 token id
+相同但内容不同的图像不会互相命中。因此 common prefix 即便结束在任何 checkpoint 都没有的位置，只要落在
 block 边界上且该边界存在 state snapshot 就能复用。它不是 token 级 arbitrary LCP：capture 与复用都以
 `kBlockTokens`=64 为单位，且要求对应 frontier 上确有快照。该路径是 additive 的——block-snapshot admission
 未命中时仍回退到上面的 retained/rewrite-checkpoint 逻辑。参见

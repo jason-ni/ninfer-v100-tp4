@@ -340,6 +340,14 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
         CUDA_CHECK(cudaSetDevice(previous));
         collective_comms.emplace(execution);
     }
+    // Per-rank pinned Vision staging uploads ride in every rank's arena; record the materialized
+    // sizes for the admission check (plan-time geometry is asserted equal by the bank build).
+    for (int rank = 0; rank < tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        vision_staged_bytes[slot] = models[slot]->vision_stage.has_value()
+                                        ? models[slot]->vision_stage->region_bytes
+                                        : 0u;
+    }
     if (rope_mode == RopeMode::Yarn) {
         // ONE resident 32-float corrected inverse-frequency table PER DEVICE, uploaded once, here.
         // cudaMalloc is neither stream-ordered nor capturable, and CUDA Graph capture bakes this

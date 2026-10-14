@@ -78,12 +78,28 @@ DType dtype_for(NumericFormat format) {
 
 Weight contiguous_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
                          NumericFormat format, std::int32_t rows, std::int32_t columns,
+                         int device);
+void fill_contiguous_weight(Weight& out, NumericFormat format, const std::byte* payload,
+                            std::int32_t rows, std::int32_t columns);
+void fill_row_split_weight(Weight& out, NumericFormat format, const std::byte* payload,
+                           std::int32_t rows, std::int32_t columns);
+void fill_row_scale_weight(Weight& out, NumericFormat format, const std::byte* payload,
+                           std::int32_t rows, std::int32_t columns);
+
+Weight contiguous_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
+                         NumericFormat format, std::int32_t rows, std::int32_t columns,
                          int device) {
     Weight out{};
     require_placement_bytes(materialized, handle, device,
                             static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(columns) *
                                 dtype_size(dtype_for(format)));
-    out.payload       = materialized.device_data(handle, device);
+    fill_contiguous_weight(out, format, static_cast<const std::byte*>(materialized.device_data(handle, device)), rows, columns);
+    return out;
+}
+
+void fill_contiguous_weight(Weight& out, NumericFormat format, const std::byte* payload,
+                            std::int32_t rows, std::int32_t columns) {
+    out.payload       = payload;
     out.qdata         = out.payload;
     out.payload_bytes = static_cast<std::uint64_t>(rows) * columns * dtype_size(dtype_for(format));
     out.qtype         = qtype_for(format);
@@ -95,7 +111,6 @@ Weight contiguous_weight(const MaterializedArtifact& materialized, ObjectHandle 
     out.shape[1]      = columns;
     out.padded_shape[0] = rows;
     out.padded_shape[1] = columns;
-    return out;
 }
 
 Weight row_split_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
@@ -105,9 +120,33 @@ Weight row_split_weight(const MaterializedArtifact& materialized, ObjectHandle h
                                                 static_cast<std::uint64_t>(columns)};
     const RowSplitGeometry geometry          = row_split_geometry(format, shape);
     require_placement_bytes(materialized, handle, device, geometry.encoded_bytes);
-    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle, device));
+    Weight out{};
+    fill_row_split_weight(out, format,
+                          static_cast<const std::byte*>(materialized.device_data(handle, device)),
+                          rows, columns);
+    return out;
+}
+
+Weight row_scale_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
+                        NumericFormat format, std::int32_t rows, std::int32_t columns,
+                        int device) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const RowScaleGeometry geometry          = row_scale_geometry(format, shape);
+    require_placement_bytes(materialized, handle, device, geometry.encoded_bytes);
 
     Weight out{};
+    fill_row_scale_weight(out, format,
+                          static_cast<const std::byte*>(materialized.device_data(handle, device)),
+                          rows, columns);
+    return out;
+}
+
+void fill_row_split_weight(Weight& out, NumericFormat format, const std::byte* bytes,
+                           std::int32_t rows, std::int32_t columns) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const RowSplitGeometry geometry          = row_split_geometry(format, shape);
     out.payload          = bytes;
     out.payload_bytes    = geometry.encoded_bytes;
     out.high_plane_bytes = geometry.high_plane_bytes;
@@ -126,19 +165,13 @@ Weight row_split_weight(const MaterializedArtifact& materialized, ObjectHandle h
     out.shape[1]    = columns;
     out.padded_shape[0] = rows;
     out.padded_shape[1] = static_cast<std::int32_t>(geometry.padded_columns);
-    return out;
 }
 
-Weight row_scale_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
-                        NumericFormat format, std::int32_t rows, std::int32_t columns,
-                        int device) {
+void fill_row_scale_weight(Weight& out, NumericFormat format, const std::byte* bytes,
+                           std::int32_t rows, std::int32_t columns) {
     const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
                                                 static_cast<std::uint64_t>(columns)};
     const RowScaleGeometry geometry          = row_scale_geometry(format, shape);
-    require_placement_bytes(materialized, handle, device, geometry.encoded_bytes);
-    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle, device));
-
-    Weight out{};
     out.payload         = bytes;
     out.payload_bytes   = geometry.encoded_bytes;
     out.qtype           = qtype_for(format);
@@ -160,7 +193,6 @@ Weight row_scale_weight(const MaterializedArtifact& materialized, ObjectHandle h
     out.scale_nb[1]     = static_cast<std::int64_t>(rows) * 2;
     out.scale_nb[2]     = out.scale_nb[1];
     out.scale_nb[3]     = out.scale_nb[1];
-    return out;
 }
 
 } // namespace
@@ -172,6 +204,8 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
                               std::span<const std::uint64_t>(shape.begin(), shape.size()));
     if (placement == TensorPlacement::Device) {
         binder.materialize_on_device(handle);
+    } else if (placement == TensorPlacement::HostStaging) {
+        binder.stage_shard_on_host(handle);
     } else {
         binder.validate_only(handle);
     }
@@ -245,6 +279,30 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
         return row_scale_weight(materialized, handle, format, rows, columns, device);
     }
     return row_split_weight(materialized, handle, format, rows, columns, device);
+}
+
+Weight staged_weight_view(NumericFormat format, const void* payload, std::int32_t rows,
+                          std::int32_t columns) {
+    if (format == NumericFormat::NVFP4 || format == NumericFormat::GGML_K) {
+        throw std::invalid_argument("staged_weight_view: unsupported format");
+    }
+    const auto* bytes = static_cast<const std::byte*>(payload);
+    Weight out{};
+    if (storage_layout_for(format) == StorageLayout::ContiguousLeV1) {
+        fill_contiguous_weight(out, format, bytes, rows, columns);
+    } else if (storage_layout_for(format) == StorageLayout::RowScaleV1) {
+        fill_row_scale_weight(out, format, bytes, rows, columns);
+    } else {
+        fill_row_split_weight(out, format, bytes, rows, columns);
+    }
+    return out;
+}
+
+Tensor staged_tensor_view(DType dtype, const void* payload,
+                          std::initializer_list<std::int32_t> shape) {
+    // Tensor is a non-owning view whose constructor takes a mutable pointer; the underlying
+    // host/device backing is caller-owned and treated read-only through the view.
+    return Tensor(const_cast<void*>(payload), dtype, shape);
 }
 
 } // namespace ninfer::artifact

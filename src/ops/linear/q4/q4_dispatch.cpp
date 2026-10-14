@@ -33,6 +33,15 @@ Q4Launch select_q4_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) 
                        k == 1536 ||    // 6144  / 4 residual row shard
                        k == 2560 ||    // 10240 / 4 MTP fc row shard
                        k == 4352));    // 17408 / 4 residual row shard
+    // Vision tower column-parallel shards (Coder390 quantized recipe): qkv and fc1 divide N and
+    // keep the vision hidden (1152) as contraction. The tp1 extents are registered in the tp1
+    // table, so this covers their tp2/tp4 halvings, including the grouped fc1's remainder N.
+    if (k == 1152) {
+        if (t < 4 || t > 131072 || (t % 4) != 0) { return nullptr; }
+        if (t <= 36) { return launch_q4_simt_r8_c4; }
+        if (t <= 320) { return launch_q4_mma_r64_c64; }
+        return launch_q4_mma_r64_c128;
+    }
     if (!column_shard) { return nullptr; }
     if (t == 1) {
         // The eight-row SM70 schedule is tuned for the V100 TP2 MLP shard. Keep the

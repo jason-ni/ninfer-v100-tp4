@@ -20,9 +20,12 @@ struct LoadProgress {
 
 struct MaterializationStats {
     std::uint64_t file_bytes              = 0;
-    std::uint64_t h2d_bytes               = 0; // summed over every device
+    std::uint64_t h2d_bytes               = 0; // device-DMA copied bytes, summed over every device
     std::uint64_t device_capacity_bytes   = 0; // summed over every device
     std::uint64_t retained_resource_bytes = 0;
+    // Host-staged bytes copied out of the pinned staging buffer at load time (equals the sum of
+    // every staged placement's encoded bytes; below the aligned region capacities).
+    std::uint64_t staged_host_bytes       = 0;
     std::uint64_t peak_staging_bytes      = 0;
     std::size_t tensor_count              = 0;
     std::size_t resource_count            = 0;
@@ -30,6 +33,8 @@ struct MaterializationStats {
     int device_count                      = 1;
     std::array<std::uint64_t, kMaximumDevices> per_device_h2d_bytes{};
     std::array<std::uint64_t, kMaximumDevices> per_device_capacity_bytes{};
+    // Pinned-host staging capacity per device (zero = no region on that device).
+    std::array<std::uint64_t, kMaximumDevices> per_device_host_capacity_bytes{};
 };
 
 class MaterializedArtifact {
@@ -49,6 +54,12 @@ public:
     // its SHARD, so a caller that keeps a whole-model literal shape would read past the end of a
     // half-sized allocation with nothing else noticing.
     std::uint64_t device_bytes(ObjectHandle handle, int device = 0) const;
+    // Device `device`'s whole pinned-host staging region: one contiguous block holding every
+    // stage_shard_on_host placement for that device at its planned offset. The vision encode path
+    // uploads exactly this span to a per-encode workspace region.
+    [[nodiscard]] std::span<const std::byte> host_staging(int device) const;
+    const std::byte* host_staging_data(ObjectHandle handle, int device) const;
+    std::uint64_t host_staging_bytes(ObjectHandle handle, int device) const;
     std::span<const std::byte> resource_bytes(ObjectHandle handle) const;
     std::vector<std::byte> take_resource_bytes(ObjectHandle handle);
 
@@ -66,10 +77,15 @@ private:
     struct ObjectStorage {
         std::array<void*, kMaximumDevices> device{};
         std::array<std::uint64_t, kMaximumDevices> device_bytes{};
+        std::array<const std::byte*, kMaximumDevices> host{};
+        std::array<std::uint64_t, kMaximumDevices> host_bytes{};
         std::vector<std::byte> resource;
     };
 
     std::array<std::unique_ptr<DeviceArena>, kMaximumDevices> device_arena_;
+    // Pinned per-device staging regions (host-staged shards). Lazily created only for devices
+    // whose plan allocated capacity.
+    std::array<std::unique_ptr<PinnedHostBuffer>, kMaximumDevices> host_staging_;
     std::array<int, kMaximumDevices> physical_devices_{};
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;

@@ -407,6 +407,12 @@ public:
     PinnedHostBuffer round_host;
     TokenId* host_tokens = nullptr;
 
+    // Per-rank pinned Vision staging upload blocks (streaming recipes); zero when the tower is
+    // device-resident. The plan-time geometry reserved their arena room; the request admission
+    // check needs the same per-rank sizes to compare an item's full encode footprint against THIS
+    // rank's workspace envelope.
+    std::array<std::size_t, kMaximumDevices> vision_staged_bytes{};
+
     // Hybrid prefix cache (opt-in via SequencePlanImpl::prefix_cache). `prefix_index` owns the
     // content-addressed block tree over this Program's committed text-KV pages and the cached
     // prefix state-image slots. `prefix_sink` returns evicted pages to every rank's pool. Both are

@@ -140,6 +140,11 @@ Full P2P/peer-off A/B comparisons at TP4 are pending.
   `tokenizer_config.json` chat template is exposed verbatim. Text and MTP load through the normal
   Engine path; v3 Vision objects are projected for the existing Vision route. Its optional
   five-layer DFlash2 package is also bound for text-only TP2 experiments.
+- **Quantized Coder390 Vision:** the published `qwen3.8-27b-coder390/nvfp4-qvis` package binds its
+  grouped Q4/Q5/Q6 plus W8-merger Vision tower through the same sharded route as the FP16 tower.
+  Every profile's Vision shards are host-staged: each rank streams its pinned-host block to the
+  device once per media encode and releases it, so steady-state device Vision residency is ~0 and
+  the footprint returns to the KV pool.
 - **MTP and DFlash:** the Q4_K_M target uses the native MTP route. An optional five-layer BF16
   auxiliary / W8-projection DFlash2 route is integrated with TP2. Greedy target verification
   exchanges shard argmax values/IDs instead of full logits; proposal selection merges each

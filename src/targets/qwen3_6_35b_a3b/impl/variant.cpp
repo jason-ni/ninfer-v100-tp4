@@ -322,6 +322,14 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                     last);
 }
 
+const qwen3_6::VisionRecipe* Variant::vision_recipe(WeightsProfile) noexcept {
+    return &qwen3_6::kVisionFp16;
+}
+
+std::size_t Variant::vision_staged_weights_bytes(WeightsProfile, std::size_t, int) {
+    return 0;
+}
+
 
 // --- tp == 2 split leaves: unsupported for this variant ------------------------------------------
 namespace {

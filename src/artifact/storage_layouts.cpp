@@ -1,5 +1,6 @@
 #include "artifact/reader.h"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <string>
@@ -504,7 +505,12 @@ TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
                                 std::span<const std::byte> payload) {
     require_slice(shape.size() == 2, "a column slice requires a rank-two shape");
     const std::uint64_t rows        = shape[0];
-    const std::uint64_t total_count = validate_column_ranges(column_ranges, shape[1]);
+    // Row-split-k128 shards may extend into the parent's padded K (align_up(K, 128)): when the
+    // logical K is not itself 128-aligned, the final rank's column range legitimately covers the
+    // trailing pad groups as well. No other layout physically pads the column axis.
+    const std::uint64_t span_limit =
+        layout == StorageLayout::RowSplitK128V1 ? align_up(shape[1], kKAlignment, "padded K") : shape[1];
+    const std::uint64_t total_count = validate_column_ranges(column_ranges, span_limit);
     TensorSlice out;
 
     if (layout == StorageLayout::GgmlK256V1) {
@@ -558,16 +564,31 @@ TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
 
     if (layout == StorageLayout::RowSplitK128V1) {
         // Columns are grouped; a column range must therefore start and end on a group boundary.
-        // Requiring the 128-column K-alignment unit (a multiple of every registered group size)
-        // additionally makes the shard's own K_pad equal to its K, so the shard needs none of the
-        // parent's trailing padding groups and its groups_per_row is exactly the selected count.
+        // The unit is the format's own group size (not the legacy 128): a 128-multiple count is a
+        // special case where the shard's own K_pad equals its K, but a non-128-aligned total K
+        // forces some shards to carry the parent's trailing pad groups (the caller's ranges tile
+        // the padded span [0, K_pad) exactly). Pad groups decode per the layout's padding rule, so
+        // their contribution to a GEMM over the shard's logical K_r is zero whenever the
+        // corresponding activation lanes are zero -- the row-parallel consumers pair this with a
+        // zeroed tail segment of their up-projection.
         const RowSplitGeometry parent = row_split_geometry(format, shape);
-        require_slice(columns.begin % kKAlignment == 0 && columns.count % kKAlignment == 0,
-                      "row-split-k128-v1 column ranges must be multiples of 128");
+        require_slice(columns.begin % parent.group_size == 0 &&
+                          columns.count % parent.group_size == 0,
+                      "row-split-k128-v1 column ranges must be multiples of the format group size");
+        require_slice(columns.begin + columns.count <= parent.padded_columns,
+                      "row-split-k128-v1 column range exceeds the padded span");
         const std::array<std::uint64_t, 2> shard_shape = {rows, columns.count};
         const RowSplitGeometry shard = row_split_geometry(format, shard_shape);
         out.encoded_bytes            = shard.encoded_bytes;
         const std::uint64_t skip     = columns.begin / parent.group_size;
+        // A group-aligned range whose count is not itself 128-aligned (e.g. 576 of a 1152-wide K)
+        // still needs align_up(count, 128) columns of row storage, so the shard owns more groups
+        // than it copies: the trailing pad groups have no parent group to point at. They are
+        // row-stride padding the consumer never reads, and the destination is zero-filled before
+        // the copies land, so they are simply left uncopied. Real groups always fit -- begin +
+        // count is bounded by the parent's padded span, so every logical group has a source.
+        const std::uint64_t available = parent.groups_per_row - skip;
+        const std::uint64_t copied    = std::min(shard.groups_per_row, available);
         const std::array<SlicePlane, 3> planes = {
             SlicePlane{0, 0, parent.low_bytes_per_group},
             SlicePlane{parent.high_plane_offset, shard.high_plane_offset,
@@ -575,7 +596,7 @@ TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
             SlicePlane{parent.scale_plane_offset, shard.scale_plane_offset, 2},
         };
         append_column_plane_copies(out, planes, rows, skip, parent.groups_per_row,
-                                   shard.groups_per_row, shard.groups_per_row);
+                                   shard.groups_per_row, copied);
         return out;
     }
 

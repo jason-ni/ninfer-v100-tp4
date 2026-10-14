@@ -91,6 +91,11 @@ struct RenderedChat {
 enum class ChatTemplateSemantics : std::uint8_t {
     ThinkingToggle,
     ReasoningEffort,
+    // The reasoning-effort template of the Coder390 efficient-think package. Identical to
+    // ReasoningEffort except that a conversation whose user turns are all tool responses falls
+    // back to the last tool message as the thinking threshold, and a leading tool message opens
+    // its implicit user group.
+    ReasoningEffortMultiStepTool,
 };
 
 class CompiledChatTemplate {

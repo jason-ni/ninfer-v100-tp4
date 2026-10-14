@@ -106,6 +106,91 @@ void Binder::place(ObjectHandle handle, int device, std::uint64_t bytes, std::ui
     capacity = offset + bytes;
 }
 
+void Binder::place_host(ObjectHandle handle, int device, std::uint64_t bytes, std::uint64_t alignment,
+                        std::vector<PlaneCopy> copies) {
+    std::uint64_t& capacity = materialization_.host_capacity_bytes[static_cast<std::size_t>(device)];
+    const std::uint64_t offset = align_up(capacity, alignment);
+    if (bytes > std::numeric_limits<std::uint64_t>::max() - offset) {
+        throw ArtifactError("host staging plan size overflows u64");
+    }
+    materialization_.host_objects.push_back({handle, device, offset, bytes, std::move(copies)});
+    capacity = offset + bytes;
+}
+
+namespace {
+
+// One device's resolved slice, shared by every placement kind. Empty `copies` means the whole
+// payload lands verbatim (replicated / unsharded tp1 objects); non-empty copies plus a non-empty
+// `prefix` mark a ggml-k256 row-descriptor header written before the coded planes.
+struct ResolvedShard {
+    std::uint64_t encoded_bytes = 0;
+    std::vector<PlaneCopy> copies;
+    std::vector<std::byte> prefix;
+};
+
+ResolvedShard resolve_device_shard(const TensorDescriptor& tensor, const ShardPlacement& placement,
+                                   int device, std::span<const std::byte> payload_data) {
+    if (placement.axis == ShardAxis::Replicated) {
+        if (!placement.device_ranges[static_cast<std::size_t>(device)].empty()) {
+            throw ArtifactError("a replicated placement must carry no shard ranges: " +
+                                std::string(tensor.name));
+        }
+        // Whole object. `copies` stays empty: the materializer copies the payload verbatim, which
+        // is byte-for-byte what the single-device path has always done.
+        return ResolvedShard{tensor.bytes};
+    }
+    const std::vector<SliceRange>& ranges =
+        placement.device_ranges[static_cast<std::size_t>(device)];
+    if (ranges.empty()) {
+        throw ArtifactError("sharded object names no range for device " + std::to_string(device) +
+                            ": " + std::string(tensor.name));
+    }
+    TensorSlice slice;
+    if (placement.axis == ShardAxis::Rows) {
+        slice = tensor_row_slice(tensor.layout, tensor.format, tensor.shape, ranges, payload_data);
+    } else {
+        // Multiple column ranges are legal only where the layout allows them
+        // (contiguous-le-v1 and whole-block ggml-k256-v1);
+        // tensor_column_slice enforces that per layout rather than this call site guessing.
+        slice = tensor_column_slice(tensor.layout, tensor.format, tensor.shape, ranges, payload_data);
+    }
+    std::uint64_t covered = 0;
+    for (const PlaneCopy& copy : slice.copies) {
+        if (copy.bytes == 0 || copy.source_offset > tensor.bytes ||
+            tensor.bytes - copy.source_offset < copy.bytes ||
+            copy.dest_offset > slice.encoded_bytes ||
+            slice.encoded_bytes - copy.dest_offset < copy.bytes) {
+            throw ArtifactError("shard slice range is outside its tensor: " + std::string(tensor.name));
+        }
+        covered += copy.bytes;
+    }
+    if (covered > slice.encoded_bytes) {
+        throw ArtifactError("shard slice copies overlap: " + std::string(tensor.name));
+    }
+    // Two copies writing the same shard byte would make the result depend on staging-chunk
+    // order. The single-device path got this for free (one copy per object); reinstate it
+    // explicitly now that a shard is many copies. Ordering by destination is cheap here --
+    // every layout emits its copies plane by plane, so this is nearly sorted already.
+    {
+        std::vector<const PlaneCopy*> ordered;
+        ordered.reserve(slice.copies.size());
+        for (const PlaneCopy& copy : slice.copies) { ordered.push_back(&copy); }
+        std::sort(ordered.begin(), ordered.end(),
+                  [](const PlaneCopy* a, const PlaneCopy* b) {
+                      return a->dest_offset < b->dest_offset;
+                  });
+        for (std::size_t i = 1; i < ordered.size(); ++i) {
+            if (ordered[i]->dest_offset < ordered[i - 1]->dest_offset + ordered[i - 1]->bytes) {
+                throw ArtifactError("shard slice writes the same byte twice: " +
+                                    std::string(tensor.name));
+            }
+        }
+    }
+    return ResolvedShard{slice.encoded_bytes, std::move(slice.copies), std::move(slice.prefix)};
+}
+
+} // namespace
+
 void Binder::materialize_on_device(ObjectHandle handle) {
     const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
     if (tensor == nullptr) {
@@ -120,67 +205,37 @@ void Binder::materialize_on_device(ObjectHandle handle) {
         shard_resolver_ ? shard_resolver_(tensor->name) : ShardPlacement{};
 
     for (int device = 0; device < materialization_.device_count; ++device) {
-        const std::vector<SliceRange>& ranges =
-            placement.device_ranges[static_cast<std::size_t>(device)];
-        if (placement.axis == ShardAxis::Replicated) {
-            if (!ranges.empty()) {
-                throw ArtifactError("a replicated placement must carry no shard ranges: " +
-                                    std::string(tensor->name));
-            }
-            // Whole object. `copies` stays empty: the materializer copies the payload verbatim,
-            // which is byte-for-byte what the single-device path has always done.
-            place(handle, device, tensor->bytes, alignment, {});
-            continue;
+        const ResolvedShard shard =
+            resolve_device_shard(*tensor, placement, device, payload(handle).data);
+        place(handle, device, shard.encoded_bytes, alignment, std::move(shard.copies));
+        materialization_.device_objects.back().prefix = std::move(shard.prefix);
+    }
+    planned_[handle.index] = true;
+}
+
+void Binder::stage_shard_on_host(ObjectHandle handle) {
+    const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
+    if (tensor == nullptr) {
+        throw ArtifactError("resource cannot be staged on the host");
+    }
+    if (planned_[handle.index]) {
+        throw ArtifactError("artifact object has more than one materialization placement: " +
+                            std::string(tensor->name));
+    }
+    const std::uint64_t alignment = tensor_alignment(tensor->layout);
+    const ShardPlacement placement =
+        shard_resolver_ ? shard_resolver_(tensor->name) : ShardPlacement{};
+
+    for (int device = 0; device < materialization_.device_count; ++device) {
+        const ResolvedShard shard =
+            resolve_device_shard(*tensor, placement, device, payload(handle).data);
+        // No layout currently staged on the host carries a ggml row-descriptor header; revisit
+        // this assert rather than silently discarding bytes if that ever changes.
+        if (!shard.prefix.empty()) {
+            throw ArtifactError("host staging does not support prefix-carrying layouts: " +
+                                std::string(tensor->name));
         }
-        if (ranges.empty()) {
-            throw ArtifactError("sharded object names no range for device " +
-                                std::to_string(device) + ": " + std::string(tensor->name));
-        }
-        TensorSlice slice;
-        if (placement.axis == ShardAxis::Rows) {
-            slice = tensor_row_slice(tensor->layout, tensor->format, tensor->shape, ranges, payload(handle).data);
-        } else {
-            // Multiple column ranges are legal only where the layout allows them
-            // (contiguous-le-v1 and whole-block ggml-k256-v1);
-            // tensor_column_slice enforces that per layout rather than this call site guessing.
-            slice = tensor_column_slice(tensor->layout, tensor->format, tensor->shape, ranges, payload(handle).data);
-        }
-        std::uint64_t covered = 0;
-        for (const PlaneCopy& copy : slice.copies) {
-            if (copy.bytes == 0 || copy.source_offset > tensor->bytes ||
-                tensor->bytes - copy.source_offset < copy.bytes ||
-                copy.dest_offset > slice.encoded_bytes ||
-                slice.encoded_bytes - copy.dest_offset < copy.bytes) {
-                throw ArtifactError("shard slice range is outside its tensor: " +
-                                    std::string(tensor->name));
-            }
-            covered += copy.bytes;
-        }
-        if (covered > slice.encoded_bytes) {
-            throw ArtifactError("shard slice copies overlap: " + std::string(tensor->name));
-        }
-        // Two copies writing the same shard byte would make the result depend on staging-chunk
-        // order. The single-device path got this for free (one copy per object); reinstate it
-        // explicitly now that a shard is many copies. Ordering by destination is cheap here --
-        // every layout emits its copies plane by plane, so this is nearly sorted already.
-        {
-            std::vector<const PlaneCopy*> ordered;
-            ordered.reserve(slice.copies.size());
-            for (const PlaneCopy& copy : slice.copies) { ordered.push_back(&copy); }
-            std::sort(ordered.begin(), ordered.end(),
-                      [](const PlaneCopy* a, const PlaneCopy* b) {
-                          return a->dest_offset < b->dest_offset;
-                      });
-            for (std::size_t i = 1; i < ordered.size(); ++i) {
-                if (ordered[i]->dest_offset <
-                    ordered[i - 1]->dest_offset + ordered[i - 1]->bytes) {
-                    throw ArtifactError("shard slice writes the same byte twice: " +
-                                        std::string(tensor->name));
-                }
-            }
-        }
-        place(handle, device, slice.encoded_bytes, alignment, std::move(slice.copies));
-        materialization_.device_objects.back().prefix = std::move(slice.prefix);
+        place_host(handle, device, shard.encoded_bytes, alignment, std::move(shard.copies));
     }
     planned_[handle.index] = true;
 }

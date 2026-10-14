@@ -17,11 +17,14 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
@@ -49,24 +52,33 @@ struct VisionWorkspaceLayout {
     TensorRegion projected;
     TensorRegion mlp_down;
     TensorRegion mlp_up;
+    TensorRegion mlp_up_live;
     TensorRegion mlp_norm;
     TensorRegion normalized;
     TensorRegion merger_hidden;
     // Row-parallel allreduce scratch, present only for tp > 1 (see build_workspace_layout).
     std::optional<TensorRegion> stage_hidden;
     std::optional<TensorRegion> stage_out;
+    // One per-encode upload of this rank's pinned Vision staging block (streaming recipe); absent
+    // when the tower is device-resident. The encode uploads it here and rebases its weight views.
+    std::optional<LayoutRegion> staged_weights;
     std::size_t bytes = 0;
 };
 
-// `tp`/`rank` shard the per-rank intermediates to match the 27B shard map exactly: qkv is split by
-// head (all three planes, uniform 3*hidden/tp), while the MLP up/down and merger fc1/fc2 widths use
-// the SAME mod-8 per-device extent (`vision_mod8_shard_count`), which is even at tp == 2 but uneven
-// at tp == 4. tp == 1 reproduces the single-device layout exactly (3*hidden, intermediate,
-// merger_hidden, full head count), so the one-arena `encode` and the static capacity queries are
-// unaffected.
+// `tp`/`rank` shard the per-rank intermediates to match the target's vision shard map exactly.
+// qkv is split by head (all three planes, uniform 3*hidden/tp). The MLP and merger widths use the
+// recipe-pinned coupled extents (`vision_shard_extents`): quantized formats pad the producer width
+// to group granularity, so fc2's contraction width per rank can EXCEED fc1's live output (the tail
+// lanes are zeroed before the activation); the FP16 recipe splits unit-8, reproducing the
+// historical values. o_proj K-splitting is decided by the same extents; where it cannot be
+// group-aligned the input is gathered instead (see the encode). tp == 1 returns full-width every
+// shape, so the one-arena `encode` and the static capacity queries are unaffected.
 VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t tokens64,
                                              std::size_t segment_count, std::size_t tp = 1,
-                                             std::size_t rank = 0) {
+                                             std::size_t rank = 0,
+                                             std::size_t staged_weight_bytes = 0,
+                                             const qwen3_6::VisionRecipe& recipe =
+                                                 qwen3_6::kVisionFp16) {
     if (patches64 == 0 || tokens64 == 0 ||
         patches64 !=
             checked_mul(tokens64, VisionScheduleConfig::merge_unit, "patch/token relation")) {
@@ -88,13 +100,17 @@ VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t 
     // rank; at tp == 1 that helper returns the full width, leaving the layout unchanged.
     const int heads_per_rank      = static_cast<int>(VisionScheduleConfig::heads / tp);
     // Each rank's attention output spans only its own heads (heads/tp * head_dim == hidden/tp);
-    // that is the row-parallel K of o_proj, so `attended` is sharded too.
+    // `attended` is sharded by that regardless of the join strategy below.
     const int attn_out_width      = heads_per_rank * VisionScheduleConfig::head_dim;
     const int qkv_width           = 3 * attn_out_width;
-    const int mlp_up_width        = static_cast<int>(qwen3_6::vision_mod8_shard_count(
-        VisionScheduleConfig::intermediate, static_cast<int>(tp), static_cast<int>(rank)));
-    const int merger_hidden_width = static_cast<int>(qwen3_6::vision_mod8_shard_count(
-        VisionScheduleConfig::merger_hidden, static_cast<int>(tp), static_cast<int>(rank)));
+    // Coupled extents pin fc1's live N extent and fc2's K extent to one padded producer width; the
+    // MLP/merger activation regions size the producer width so fc2 always reads a group-aligned K.
+    const qwen3_6::VisionShardExtents ext =
+        qwen3_6::vision_shard_extents(recipe, static_cast<std::int32_t>(tp),
+                                      static_cast<std::int32_t>(rank));
+    const int mlp_up_width        = ext.mlp.producer_width;
+    const int mlp_up_live_width   = ext.mlp.n_count;
+    const int merger_hidden_width = ext.merger.producer_width;
     const auto patches            = static_cast<std::int32_t>(patches64);
     const auto tokens             = static_cast<std::int32_t>(tokens64);
 
@@ -112,6 +128,13 @@ VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t 
     out.x           = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision residual");
     out.patch_bf16 =
         add(DType::BF16, {VisionScheduleConfig::patch_dim, patches}, "vision BF16 patches");
+    // The per-encode staged weight bank outlives every transient in this layout, so it is placed
+    // with the other persistent regions (ahead of the transient scopes) instead of after them: a
+    // post-scope allocation reuses the scope's memory, so the encode would overwrite the weights.
+    if (staged_weight_bytes > 0) {
+        out.staged_weights = builder.add(staged_weight_bytes, kWorkspaceAlignment,
+                                         "vision staged weights");
+    }
     {
         auto attention_scope = builder.scope();
         out.attended = add(DType::BF16, {attn_out_width, patches}, "vision attended");
@@ -137,6 +160,15 @@ VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t 
     {
         auto mlp_scope = builder.scope();
         out.mlp_up = add(DType::BF16, {mlp_up_width, patches}, "vision MLP up");
+        // Compact fc1 staging for ranks whose live N extent is shorter than the padded producer
+        // width: the projection must write a contiguous [n_count, P] result, then a strided copy
+        // places it in the producer's live prefix (Tensors are column-major, so the live prefix of
+        // the padded region is not itself contiguous). Absent when live == producer width, where
+        // the projection writes the producer region directly.
+        if (mlp_up_live_width != mlp_up_width) {
+            out.mlp_up_live =
+                add(DType::BF16, {mlp_up_live_width, patches}, "vision MLP up live staging");
+        }
         {
             auto norm_scope = builder.scope();
             out.mlp_norm =
@@ -164,6 +196,46 @@ VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t 
 void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
     if (dst.bytes() == 0) { return; }
     CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
+}
+
+// Diagnostic activation tap for numerical alignment of the Vision tower: when NINFER_VISION_TAP_DIR
+// names a directory, each stage's rank-0 activation is copied to host and written as raw
+// little-endian BF16 as <dir>/<stage>.bf16, with one JSON line per stage appended to
+// <dir>/manifest.jsonl describing the shape. The Vision encode runs eagerly (never inside a decode
+// CUDA Graph), so the synchronous copy is safe. Unset (the default) costs one cached env lookup
+// per stage and nothing else.
+const char* vision_tap_dir() {
+    static const char* dir = std::getenv("NINFER_VISION_TAP_DIR");
+    return dir != nullptr && *dir != '\0' ? dir : nullptr;
+}
+
+bool vision_tap_layer(std::size_t layer) noexcept {
+    return layer == 0 || layer == 13 || layer == 26;
+}
+
+void vision_tap(const Tensor& stage, const char* name, cudaStream_t stream) {
+    const char* dir = vision_tap_dir();
+    if (dir == nullptr || stage.data == nullptr || stage.bytes() == 0) { return; }
+    std::vector<std::uint8_t> host(stage.bytes());
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), stage.data, host.size(), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::string path = std::string(dir) + "/" + name + ".bf16";
+    if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(host.data(), 1, host.size(), file);
+        std::fclose(file);
+    }
+    const std::string manifest = std::string(dir) + "/manifest.jsonl";
+    if (std::FILE* log = std::fopen(manifest.c_str(), "ab")) {
+        std::fprintf(log, "{\"stage\":\"%s\",\"dtype\":\"bf16\",\"ne\":[%d,%d,%d,%d],\"bytes\":%zu}\n",
+                     name, stage.ne[0], stage.ne[1], stage.ne[2], stage.ne[3], host.size());
+        std::fclose(log);
+    }
+}
+
+void vision_tap_block(const Tensor& x, std::size_t layer, cudaStream_t stream) {
+    char name[16];
+    std::snprintf(name, sizeof(name), "block_%02zu", layer);
+    vision_tap(x, name, stream);
 }
 
 } // namespace
@@ -227,16 +299,22 @@ void VisionContext::bind_rank(int rank, const LoadedModelData& weights) {
     out.merger.fc1_bias    = &vision.common.merger_fc1_bias;
     out.merger.fc2         = &vision.merger_fc2;
     out.merger.fc2_bias    = &vision.merger_fc2_bias;
+    family_views_[static_cast<std::size_t>(rank)] =
+        const_cast<qwen3_6::VisionWeights*>(&vision);
+    stages_[static_cast<std::size_t>(rank)] = weights.vision_stage ? &*weights.vision_stage : nullptr;
 }
 
 std::size_t VisionContext::workspace_bytes(const qwen3_6::VisionItemControl& item,
-                                           std::size_t tp) {
+                                           std::size_t tp, const std::size_t* staged_per_rank,
+                                           const qwen3_6::VisionRecipe& recipe) {
     std::size_t bytes = 0;
     for (std::size_t rank = 0; rank < tp; ++rank) {
-        bytes = std::max(
-            bytes, build_workspace_layout(item.patch_count, item.merged_count,
-                                          static_cast<std::size_t>(item.segment_count), tp, rank)
-                       .bytes);
+        bytes = std::max(bytes, build_workspace_layout(
+                                    item.patch_count, item.merged_count,
+                                    static_cast<std::size_t>(item.segment_count), tp, rank,
+                                    staged_per_rank == nullptr ? 0 : staged_per_rank[rank],
+                                    recipe)
+                                    .bytes);
     }
     return bytes;
 }
@@ -254,7 +332,9 @@ std::size_t VisionContext::output_transient_bytes(std::size_t merged_tokens) {
 }
 
 std::size_t VisionContext::workspace_capacity_bytes(std::uint32_t max_merged_tokens,
-                                                    std::uint32_t max_segments, std::size_t tp) {
+                                                    std::uint32_t max_segments, std::size_t tp,
+                                                    const std::size_t* staged_per_rank,
+                                                    const qwen3_6::VisionRecipe& recipe) {
     if (max_merged_tokens == 0 || max_segments == 0) {
         throw std::invalid_argument("Vision workspace capacity bounds must be positive");
     }
@@ -264,12 +344,16 @@ std::size_t VisionContext::workspace_capacity_bytes(std::uint32_t max_merged_tok
     const std::uint32_t segments = std::min(max_merged_tokens, max_segments);
     const std::size_t patches = checked_mul(max_merged_tokens, VisionScheduleConfig::merge_unit,
                                             "capacity patch count");
-    // Each rank's arena must fit its own layout; tp == 4's mod-8 split is uneven, so size to the
+    // Each rank's arena must fit its own layout; tp == 4's split is uneven, so size to the
     // maximum over ranks. tp == 1 is a single rank and reproduces the historical value exactly.
+    // The per-rank staging block rides in the same arena, so it adds on the same per-rank term.
     std::size_t bytes = 0;
     for (std::size_t rank = 0; rank < tp; ++rank) {
         bytes = std::max(
-            bytes, build_workspace_layout(patches, max_merged_tokens, segments, tp, rank).bytes);
+            bytes, build_workspace_layout(patches, max_merged_tokens, segments, tp, rank,
+                                          staged_per_rank == nullptr ? 0 : staged_per_rank[rank],
+                                          recipe)
+                       .bytes);
     }
     return bytes;
 }
@@ -289,8 +373,10 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
         output.ne[3] != 1 || !output.is_contiguous() || output.data == nullptr) {
         throw std::invalid_argument("Vision output must be contiguous BF16 [H,V]");
     }
+    const qwen3_6::VisionStageRank* staged = stages_[0];
     const VisionWorkspaceLayout layout = build_workspace_layout(
-        patches64, tokens64, static_cast<std::size_t>(control.segment_count));
+        patches64, tokens64, static_cast<std::size_t>(control.segment_count), 1, 0,
+        staged ? staged->region_bytes : 0u, staged ? staged->recipe : qwen3_6::kVisionFp16);
     if (workspace.capacity() < layout.bytes) {
         throw std::invalid_argument("Vision workspace capacity is too small for request");
     }
@@ -300,6 +386,18 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
     const VisionWeights& w = weights_for(0);
     workspace.reset();
     const DeviceSpan backing = workspace.alloc_bytes(layout.bytes, kWorkspaceAlignment);
+    // Streaming recipe: upload this rank's pinned staging block and rebase the descriptor-only
+    // weight views onto the device copy. The single inference thread serializes vision encodes, so
+    // no locking is needed around the model-view weights.
+    if (staged != nullptr) {
+        const DeviceSpan staged_region = layout.staged_weights->bind(backing);
+        if (staged_region.bytes != staged->region_bytes) {
+            throw std::runtime_error("Vision staging upload lost its workspace slot");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(staged_region.data, staged->host_source, staged->region_bytes,
+                                   cudaMemcpyHostToDevice, stream));
+        qwen3_6::fill_staged_vision_weights(*staged, staged_region.data, *family_views_[0]);
+    }
 
     Tensor position_ids = layout.position_ids.bind(backing);
     Tensor cu_seqlens   = layout.cu_seqlens.bind(backing);
@@ -321,6 +419,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
     Tensor position_table = w.position_embed->reshape(
         {VisionScheduleConfig::hidden, VisionScheduleConfig::position_embeddings});
     ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
+    vision_tap(x, "patch_embed", stream);
     for (std::size_t layer = 0; layer < w.blocks.size(); ++layer) {
         const BlockW& block = w.blocks[layer];
         {
@@ -376,6 +475,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
             ops::add_bias(*block.fc2_bias, down, stream);
             ops::residual_add(down, x, stream);
         }
+        if (vision_tap_layer(layer)) { vision_tap_block(x, layer, stream); }
     }
 
     Tensor normalized = layout.normalized.bind(backing);
@@ -388,6 +488,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
     ops::gelu(hidden, ops::GeluMode::Exact, stream);
     ops::linear(hidden, *w.merger.fc2, output, stream);
     ops::add_bias(*w.merger.fc2_bias, output, stream);
+    vision_tap(output, "merger", stream);
 }
 
 void VisionContext::encode(const VisionItemView& item, const std::array<Tensor, kMaximumDevices>& out,
@@ -418,6 +519,19 @@ void VisionContext::encode(const VisionItemView& item, const std::array<Tensor, 
     const int attn_out_width = heads_per_rank * VisionScheduleConfig::head_dim;
     const auto patches       = static_cast<std::int32_t>(patches64);
     const auto tokens        = static_cast<std::int32_t>(tokens64);
+    // Every rank of one program streams (or does not stream) its tower under one published
+    // recipe, so rank 0's bank identifies the layout for the encode: the coupled producer
+    // extents, the o_proj join strategy, and the per-rank staging uploads.
+    const qwen3_6::VisionStageRank* staged0 = stages_[0];
+    const qwen3_6::VisionRecipe& recipe_eff =
+        staged0 != nullptr ? staged0->recipe : qwen3_6::kVisionFp16;
+    const bool o_proj_replicated =
+        qwen3_6::vision_shard_extents(recipe_eff, tp, 0).o_proj_replicated;
+    std::array<qwen3_6::VisionShardExtents, kMaximumDevices> extents{};
+    for (int r = 0; r < tp; ++r) {
+        extents[static_cast<std::size_t>(r)] =
+            qwen3_6::vision_shard_extents(recipe_eff, tp, r);
+    }
 
     // Per-rank state. Each rank builds its own (possibly uneven, tp == 4) layout in its own arena.
     // The replicated tensors (x, norms, position tables) hold identical values on every rank by
@@ -429,12 +543,27 @@ void VisionContext::encode(const VisionItemView& item, const std::array<Tensor, 
     for_each_rank(ec, [&](int rank) {
         const auto r      = static_cast<std::size_t>(rank);
         const auto stream = ec.dev[r]->stream;
-        layouts[r] = build_workspace_layout(patches64, tokens64, control.segment_count, tp, rank);
+        layouts[r] = build_workspace_layout(patches64, tokens64, control.segment_count, tp, rank,
+                                            stages_[r] != nullptr ? stages_[r]->region_bytes : 0u,
+                                            recipe_eff);
         if (work[r] == nullptr || work[r]->capacity() < layouts[r].bytes) {
             throw std::invalid_argument("Vision rank workspace capacity is too small");
         }
         work[r]->reset();
         backing[r] = work[r]->alloc_bytes(layouts[r].bytes, kWorkspaceAlignment);
+        // Streaming recipe: upload this rank's pinned staging block before any weight-consuming
+        // launch and rebase its descriptor-only views onto the device copy. All ranks are driven
+        // from here by one host thread, so the rebases cannot interleave with an encode.
+        if (stages_[r] != nullptr) {
+            const DeviceSpan staged_region = layouts[r].staged_weights->bind(backing[r]);
+            if (staged_region.bytes != stages_[r]->region_bytes) {
+                throw std::runtime_error("Vision staging upload lost its workspace slot");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(staged_region.data, stages_[r]->host_source,
+                                       stages_[r]->region_bytes, cudaMemcpyHostToDevice, stream));
+            qwen3_6::fill_staged_vision_weights(*stages_[r], staged_region.data,
+                                                *family_views_[r]);
+        }
         position_ids[r] = layouts[r].position_ids.bind(backing[r]);
         cu_seqlens[r]   = layouts[r].cu_seqlens.bind(backing[r]);
         pos_indices[r]  = layouts[r].pos_indices.bind(backing[r]);
@@ -460,6 +589,7 @@ void VisionContext::encode(const VisionItemView& item, const std::array<Tensor, 
             {VisionScheduleConfig::hidden, VisionScheduleConfig::position_embeddings});
         ops::vision_pos_embed_add(position_table, pos_indices[r], pos_weights[r], x[r], stream);
     });
+    vision_tap(x[0], "patch_embed", ec.dev[0]->stream);
 
     for (std::size_t layer = 0; layer < VisionScheduleConfig::layers; ++layer) {
         std::array<Weight, kMaximumDevices> qkv_w{}, oproj_w{}, fc1_w{}, fc2_w{};
@@ -522,13 +652,25 @@ void VisionContext::encode(const VisionItemView& item, const std::array<Tensor, 
                 ops::vision_attention(q, k, v, cu_seqlens[r], attention_workspace, attended_heads,
                                       stream);
             });
-            // o_proj: row-parallel (sharded K), single allreduce -> replicated projected[r].
+            // o_proj join. Either row-parallel (K-sliced quantized/FP16 weights, one allreduce) or the
+            // replicated gather path when the recipe cannot group-align hidden/tp (quantized at
+            // tp == 4): allgather the per-rank attended blocks into the row-parallel stage, then
+            // one full-width GEMM on every rank's identical weight (no post-GEMM reduce).
             std::array<Tensor, kMaximumDevices> projected{}, stage{};
             for (int r = 0; r < tp; ++r) {
                 projected[r] = layouts[r].projected.bind(backing[r]);
                 stage[r]     = layouts[r].stage_hidden->bind(backing[r]);
             }
-            ops::linear_row_parallel(attended, oproj_w, projected, stage, ec, events);
+            if (o_proj_replicated) {
+                ops::allgather_columns(stage, attended, ec, events);
+                for_each_rank(ec, [&](int rank) {
+                    const auto r      = static_cast<std::size_t>(rank);
+                    const auto stream = ec.dev[r]->stream;
+                    ops::linear(stage[r], oproj_w[r], projected[r], stream);
+                });
+            } else {
+                ops::linear_row_parallel(attended, oproj_w, projected, stage, ec, events);
+            }
             for_each_rank(ec, [&](int rank) {
                 const auto r      = static_cast<std::size_t>(rank);
                 const auto stream = ec.dev[r]->stream;
@@ -538,11 +680,23 @@ void VisionContext::encode(const VisionItemView& item, const std::array<Tensor, 
         }
         // MLP sub-block.
         {
-            std::array<Tensor, kMaximumDevices> down{}, up{}, h{};
+            std::array<Tensor, kMaximumDevices> down{}, up{}, up_live{}, h{};
             for (int r = 0; r < tp; ++r) {
                 down[r] = layouts[r].mlp_down.bind(backing[r]);
                 up[r]   = layouts[r].mlp_up.bind(backing[r]);
                 h[r]    = layouts[r].mlp_norm.bind(backing[r]);
+                // fc1's live N extent can be SHORTER than the padded producer width the fc2
+                // contraction reads (the group-aligned tail). The projection writes the live
+                // prefix; the tail lanes hold exact zeros so the activation sees strict pad values.
+                const auto slot     = static_cast<std::size_t>(r);
+                const int live      = extents[slot].mlp.n_count;
+                const int producer  = extents[slot].mlp.producer_width;
+                // Tensors are column-major (dim 0 contiguous), so the live prefix of the padded
+                // [producer, P] producer region is NOT contiguous. Where live < producer the fc1
+                // projection writes a compact [live, P] staging tensor, which a strided copy below
+                // places into the producer prefix and whose pad channels are zeroed. Where
+                // live == producer the projection writes the producer region directly.
+                up_live[r] = live == producer ? up[r] : layouts[r].mlp_up_live.bind(backing[r]);
             }
             for_each_rank(ec, [&](int rank) {
                 const auto r      = static_cast<std::size_t>(rank);
@@ -550,12 +704,35 @@ void VisionContext::encode(const VisionItemView& item, const std::array<Tensor, 
                 ops::layer_norm(x[r], norm2_w[r], norm2_b[r], VisionScheduleConfig::norm_eps, h[r],
                                 stream);
             });
-            // fc1: column-parallel (sharded N), no collective.
-            ops::linear_column_parallel(h, fc1_w, up, ec);
+            // fc1: column-parallel (sharded N), no collective, written to the live prefix.
+            ops::linear_column_parallel(h, fc1_w, up_live, ec);
             for_each_rank(ec, [&](int rank) {
                 const auto r      = static_cast<std::size_t>(rank);
                 const auto stream = ec.dev[r]->stream;
-                ops::add_bias(fc1_bias[r], up[r], stream);
+                ops::add_bias(fc1_bias[r], up_live[r], stream);
+            });
+            // Place the compact fc1 result into the padded producer's live prefix (strided, since
+            // the prefix of a column-major [producer, P] region is not contiguous) and zero the pad
+            // channels [live, producer) so the fc2 contraction reads strict pad values. gelu(0) == 0
+            // keeps them exact through the activation.
+            for (int r = 0; r < tp; ++r) {
+                const auto slot            = static_cast<std::size_t>(r);
+                const std::size_t live     = extents[slot].mlp.n_count;
+                const std::size_t producer = extents[slot].mlp.producer_width;
+                if (live == producer) { continue; }
+                const std::size_t pitch      = producer * 2;
+                const std::size_t live_bytes = live * 2;
+                auto* const stream           = ec.dev[slot]->stream;
+                CUDA_CHECK(cudaMemcpy2DAsync(up[slot].data, pitch, up_live[slot].data, live_bytes,
+                                             live_bytes, static_cast<std::size_t>(patches),
+                                             cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemset2DAsync(
+                    static_cast<unsigned char*>(up[slot].data) + live_bytes, pitch, 0,
+                    (producer - live) * 2, static_cast<std::size_t>(patches), stream));
+            }
+            for_each_rank(ec, [&](int rank) {
+                const auto r      = static_cast<std::size_t>(rank);
+                const auto stream = ec.dev[r]->stream;
                 ops::gelu(up[r], ops::GeluMode::Tanh, stream);
             });
             // fc2: row-parallel (sharded K), single allreduce -> replicated down[r].
@@ -569,6 +746,7 @@ void VisionContext::encode(const VisionItemView& item, const std::array<Tensor, 
                 ops::residual_add(down[r], x[r], stream);
             });
         }
+        if (vision_tap_layer(layer)) { vision_tap_block(x[0], layer, ec.dev[0]->stream); }
     }
 
     // Merger: layer_norm (replicated) -> fc1 (column, sharded N) -> gelu(Exact) -> fc2 (row,
@@ -614,6 +792,7 @@ void VisionContext::encode(const VisionItemView& item, const std::array<Tensor, 
             ops::add_bias(mfc2_bias[r], down[r], stream);
         });
     }
+    vision_tap(out[0], "merger", ec.dev[0]->stream);
 }
 
 VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
@@ -647,8 +826,21 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
         if (max_merged == 0 || max_segments == 0) {
             throw std::invalid_argument("tensor-parallel Vision plan has no encodable item");
         }
-        const std::size_t capacity =
-            VisionContext::workspace_capacity_bytes(max_merged, max_segments, tp_count_);
+        // Per-rank staging upload blocks (streaming recipe): each rank's pinned block rides in its
+        // own arena for exactly one encode at a time, so the arena reservation must carry it.
+        std::array<std::size_t, kMaximumDevices> staged{};
+        const qwen3_6::VisionRecipe* recipe_ptr = nullptr;
+        for (int r = 0; r < tp_count_; ++r) {
+            const auto slot    = static_cast<std::size_t>(r);
+            const LoadedModelData* view = r == 0 ? &model : tp->peer_models[slot];
+            staged[slot] = view->vision_stage ? view->vision_stage->region_bytes : 0u;
+            if (r == 0 && view->vision_stage.has_value()) {
+                recipe_ptr = &view->vision_stage->recipe;
+            }
+        }
+        const std::size_t capacity = VisionContext::workspace_capacity_bytes(
+            max_merged, max_segments, tp_count_, staged.data(),
+            recipe_ptr != nullptr ? *recipe_ptr : qwen3_6::kVisionFp16);
         const std::size_t embed_bytes = checked_mul(
             checked_mul(static_cast<std::size_t>(VisionScheduleConfig::out_hidden), max_merged,
                         "peer embedding elements"),

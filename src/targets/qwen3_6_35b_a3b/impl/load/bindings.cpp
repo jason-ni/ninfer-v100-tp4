@@ -182,8 +182,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
     const artifact::TensorPlacement vision_placement =
         features.vision ? artifact::TensorPlacement::Device
                         : artifact::TensorPlacement::ValidateOnly;
-    out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
-    out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
+    out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement,
+                                      qwen3_6::kVisionFp16);
+    out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement,
+                                      qwen3_6::kVisionFp16);
     out.vision_merger_fc2   = artifact::bind_tensor(
         binder, "vision/merger/fc2", NumericFormat::FP16, {2048, 4608}, vision_placement);
     out.vision_merger_fc2_bias = artifact::bind_tensor(
@@ -332,7 +334,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         // extent in materialize_vision_common is the full matrix.
         auto& vision  = runtime.vision.emplace();
         vision.common = qwen3_6::materialize_vision_common(
-            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm, 0, 1);
+            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm, 0, 1,
+            qwen3_6::kVisionFp16);
         vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
                                                                 NumericFormat::FP16, 2048, 4608);
         vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,

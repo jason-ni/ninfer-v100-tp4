@@ -753,11 +753,20 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         constexpr std::uint32_t kFrontendMergedLimit  = 32768;
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
         const std::uint32_t merged = std::min(plan.capacity, kFrontendMergedLimit);
-        // Size for THIS rank's shard of the widest admissible item, exactly as the runtime session
+        // Size for each rank's shard of the widest admissible item, exactly as the runtime session
         // queries it. Sizing at tp == 1 would reserve the full-width tower layout on every rank,
-        // which over-books device memory at tp > 1 (the sharded encode needs less).
-        out.vision_encode = schedule::VisionContext::workspace_capacity_bytes(
-            merged, std::min(merged, kFrontendSegmentLimit), static_cast<std::size_t>(plan.tp));
+        // which over-books device memory at tp > 1 (the sharded encode needs less). Streaming
+        // recipes add that rank's pinned staging upload block on top (pure geometry: the bank's
+        // materialized region is asserted equal to it at build time).
+        std::array<std::size_t, kMaximumDevices> staged{};
+        for (int rank = 0; rank < plan.tp; ++rank) {
+            staged[static_cast<std::size_t>(rank)] =
+                Variant::vision_staged_weights_bytes(plan.weights_profile, plan.tp, rank);
+        }
+        const qwen3_6::VisionRecipe* vrecipe = Variant::vision_recipe(plan.weights_profile);
+        out.vision_encode                    = schedule::VisionContext::workspace_capacity_bytes(
+            merged, std::min(merged, kFrontendSegmentLimit), static_cast<std::size_t>(plan.tp),
+            staged.data(), vrecipe != nullptr ? *vrecipe : qwen3_6::kVisionFp16);
     }
 
     out.capacity = std::max({out.text_prefill, out.ordinary_round, out.mixed_round, out.mtp_prefill,

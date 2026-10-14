@@ -292,12 +292,16 @@ int main() {
                      build_row_split(format, kRows, 128, 0, 128 / geometry.group_size),
                      label + " row-split column slice");
 
-        expect_throws(
-            [&] {
-                (void)ninfer::artifact::tensor_column_slice(StorageLayout::RowSplitK128V1, format,
-                                                            shape, one(SliceRange{64, 64}));
-            },
-            label + " row-split column slice off the 128 boundary");
+        // Off-128 but group-aligned boundaries are legal: the shard keeps its own K_pad window, filled
+        // with the following whole parent groups. Pad-group lanes decode per the layout's padding
+        // rule and row-parallel consumers zero the matching activation tail, so they contribute
+        // nothing to the summed GEMM.
+        const TensorSlice off128_slice = ninfer::artifact::tensor_column_slice(StorageLayout::RowSplitK128V1,
+                                                                           format, shape,
+                                                                           one(SliceRange{64, 64}));
+        expect_equal(apply_slice(parent, off128_slice),
+                     build_row_split(format, kRows, 64, 0, 64 / geometry.group_size),
+                     label + " row-split column slice off the 128 boundary");
 
         // Grouped/tiled/swizzled column axes cannot express a multi-range shard; it must be
         // rejected, not mis-encoded. (contiguous-le-v1 is the sole exception -- see above.)
@@ -334,6 +338,49 @@ int main() {
                                                                 one(SliceRange{128, 72}));
                 },
                 label + " ragged-K trailing column slice (remainder is not 128-aligned)");
+        }
+
+        // A group-aligned slice whose own K_pad reaches past the parent's physical groups: range
+        // [576, 1152) of a 128-aligned K=1152 owns align_up(576, 128)=640 columns of row storage,
+        // but the parent holds only the groups from column 576 on. The unconsumed trailing
+        // row-padding is left zero -- reading past the parent's groups would be out of bounds.
+        {
+            constexpr std::uint64_t kWideRows         = 4;
+            constexpr std::uint64_t kWideK            = 1152;
+            const std::array<std::uint64_t, 2> wide_shape = {kWideRows, kWideK};
+            const auto wide_geometry =
+                ninfer::artifact::row_split_geometry(format, wide_shape);
+            const Bytes wide_parent = build_row_split(format, kWideRows, kWideK, 0, 0);
+            const TensorSlice tail  = ninfer::artifact::tensor_column_slice(
+                StorageLayout::RowSplitK128V1, format, wide_shape, one(SliceRange{576, 576}));
+            const auto shard = ninfer::artifact::row_split_geometry(
+                format, std::array<std::uint64_t, 2>{kWideRows, 576});
+            if (shard.padded_columns <= 576) {
+                fail(label + " wide-K fixture does not exercise trailing shard padding");
+            }
+            Bytes wide_expected = build_row_split(format, kWideRows, 576, 0,
+                                                  576 / wide_geometry.group_size);
+            for (std::uint64_t n = 0; n < kWideRows; ++n) {
+                for (std::uint64_t g = 576 / wide_geometry.group_size; g < shard.groups_per_row;
+                     ++g) {
+                    const std::uint64_t index = n * shard.groups_per_row + g;
+                    for (std::uint64_t i = 0; i < shard.low_bytes_per_group; ++i) {
+                        wide_expected[static_cast<std::size_t>(index * shard.low_bytes_per_group +
+                                                               i)] = 0;
+                    }
+                    for (std::uint64_t i = 0; i < shard.high_bytes_per_group; ++i) {
+                        wide_expected[static_cast<std::size_t>(shard.high_plane_offset +
+                                                               index * shard.high_bytes_per_group +
+                                                               i)] = 0;
+                    }
+                    for (std::uint64_t i = 0; i < 2; ++i) {
+                        wide_expected[static_cast<std::size_t>(shard.scale_plane_offset +
+                                                               index * 2 + i)] = 0;
+                    }
+                }
+            }
+            expect_equal(apply_slice(wide_parent, tail), wide_expected,
+                         label + " row-split K_pad column slice");
         }
     }
 

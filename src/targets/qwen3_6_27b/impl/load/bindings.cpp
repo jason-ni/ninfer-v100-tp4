@@ -46,6 +46,7 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
     case WeightsProfile::Qwen36Nvfp4:
         return NumericFormat::W8G32_F16S;
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4QVis:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
     case WeightsProfile::Qwen38GgmlK:
         return NumericFormat::GGML_K;
@@ -622,62 +623,76 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
     // geometry for its selector/codebooks and costs less than one Q4 target layer per rank.
     if (object.find("dflash/") != std::string_view::npos) { return {}; }
 
-    // Vision tower (option C; docs/maintainer/fp16-vision-plan.md §5). The residual stream stays
-    // full-width on every rank: patch_embedding is replicated so the first op produces a full x,
-    // and the only collective is allreduce_sum (the row-parallel joins below). Geometry comes from
-    // VisionBackboneConfig. Scoped to vision/ names so the text suffix rules below are untouched --
-    // this block must run BEFORE them, because e.g. "vision/layers/0/attention/output" would
-    // otherwise match the text o_proj rule and be split by the wrong width.
+    // Vision tower (recipe-driven; docs/maintainer/quantized-vision-plan.md). The residual stream
+    // stays full-width on every rank: patch_embedding and every elementwise tensor stay replicated,
+    // and the only collectives are the row-parallel joins (allreduce_sum), plus the o_proj input
+    // gather when a quantized recipe cannot group-align its K split (o_proj_replicated at tp == 4).
+    // Geometry comes from vision_shard_extents over the profile's published recipe, so the shard
+    // map, the host-staged byte planning, and the per-rank views can never disagree. Scoped to
+    // vision/ names so the text suffix rules below are untouched -- this block must run BEFORE
+    // them, because e.g. "vision/layers/0/attention/output" would otherwise match the text o_proj
+    // rule and be split by the wrong width.
     if (object.starts_with("vision/")) {
         using V = qwen3_6::VisionBackboneConfig;
-        // qkv: column-parallel by head -- three q|k|v planes, each split by its 16-head count so
-        // every rank gets (16/tp) whole heads per plane. Contraction K=hidden is unchanged, so no
-        // mod-8 constraint on the N split (it is bounds-checked in the kernel).
-        if (ends("attention/qkv")) {
+        const qwen3_6::VisionRecipe& recipe = *profile_vision_recipe(profile);
+        // qkv / qkv_bias: column-parallel by head -- three q|k|v planes, each split by its
+        // 16-head count so every rank gets (16/tp) whole heads per plane. Head alignment holds
+        // identically under every recipe, so the geometry (and the bias split) is shared.
+        if (ends("attention/qkv") || ends("attention/qkv_bias")) {
             for (std::uint64_t plane = 0; plane < 3; ++plane) {
                 append_column_block(plan, plane * V::hidden, V::hidden, tp, V::heads, object, false);
             }
             return by_rows(std::move(plan));
         }
-        // qkv_bias: the column-parallel N bias, split exactly like the qkv weight (three q|k|v
-        // planes by head) so each rank's bias width equals its sharded qkv output width.
-        if (ends("attention/qkv_bias")) {
-            for (std::uint64_t plane = 0; plane < 3; ++plane) {
-                append_column_block(plan, plane * V::hidden, V::hidden, tp, V::heads, object, false);
-            }
-            return by_rows(std::move(plan));
-        }
-        // o_proj: row-parallel over the hidden-wide attention output. Even at every supported tp.
+        // o_proj: row-parallel over the hidden-wide attention output. K slices land on the
+        // recipe's group boundaries (unit-8 for native FP16, group-aligned for the Q formats);
+        // where the per-rank contraction width is not group-aligned (Q-format at tp == 4) the
+        // matrix is REPLICATED behind an input allgather instead.
         if (ends("attention/output")) {
-            append_mod8_split(plan, V::hidden, tp, object);
+            if (qwen3_6::vision_shard_extents(recipe, tp, 0).o_proj_replicated) {
+                return {};   // full copy on every rank
+            }
+            for (int rank = 0; rank < tp; ++rank) {
+                const auto e = qwen3_6::vision_shard_extents(recipe, tp, rank);
+                plan.push_back(Shard{rank, static_cast<std::uint64_t>(e.o_proj_k_begin),
+                                     static_cast<std::uint64_t>(e.o_proj_cols)});
+            }
             return by_columns(std::move(plan));
         }
-        // MLP: fc1 column-parallel (N split) and fc2 row-parallel (K split) share the SAME mod-8
-        // per-device extent so fc2's contraction width equals fc1's output width on every rank.
-        if (ends("mlp/fc1")) {
-            append_mod8_split(plan, V::intermediate, tp, object);
-            return by_rows(std::move(plan));
-        }
-        // fc1_bias: column-parallel N bias, split exactly like the fc1 weight (mod-8 intermediate).
-        if (ends("mlp/fc1_bias")) {
-            append_mod8_split(plan, V::intermediate, tp, object);
+        // MLP coupled pair: fc1 column-parallel (N split) and fc2 row-parallel (K split) share
+        // the SAME CoupledShard extent, so fc2's contraction width equals fc1's (padded) producer
+        // width on every rank; fc1_bias splits exactly like the fc1 weight.
+        if (ends("mlp/fc1") || ends("mlp/fc1_bias")) {
+            for (int rank = 0; rank < tp; ++rank) {
+                const auto e = qwen3_6::vision_shard_extents(recipe, tp, rank);
+                plan.push_back(Shard{rank, static_cast<std::uint64_t>(e.mlp.n_begin),
+                                     static_cast<std::uint64_t>(e.mlp.n_count)});
+            }
             return by_rows(std::move(plan));
         }
         if (ends("mlp/fc2")) {
-            append_mod8_split(plan, V::intermediate, tp, object);
+            for (int rank = 0; rank < tp; ++rank) {
+                const auto e = qwen3_6::vision_shard_extents(recipe, tp, rank);
+                plan.push_back(Shard{rank, static_cast<std::uint64_t>(e.mlp.k_begin),
+                                     static_cast<std::uint64_t>(e.mlp.producer_width)});
+            }
             return by_columns(std::move(plan));
         }
-        // Merger: fc1 column-parallel (N=merger_hidden), fc2 row-parallel (K=merger_hidden); even.
-        if (ends("merger/fc1")) {
-            append_mod8_split(plan, V::merger_hidden, tp, object);
-            return by_rows(std::move(plan));
-        }
-        if (ends("merger/fc1_bias")) {
-            append_mod8_split(plan, V::merger_hidden, tp, object);
+        // Merger coupled pair, same structure over merger_hidden.
+        if (ends("merger/fc1") || ends("merger/fc1_bias")) {
+            for (int rank = 0; rank < tp; ++rank) {
+                const auto e = qwen3_6::vision_shard_extents(recipe, tp, rank);
+                plan.push_back(Shard{rank, static_cast<std::uint64_t>(e.merger.n_begin),
+                                     static_cast<std::uint64_t>(e.merger.n_count)});
+            }
             return by_rows(std::move(plan));
         }
         if (ends("merger/fc2")) {
-            append_mod8_split(plan, V::merger_hidden, tp, object);
+            for (int rank = 0; rank < tp; ++rank) {
+                const auto e = qwen3_6::vision_shard_extents(recipe, tp, rank);
+                plan.push_back(Shard{rank, static_cast<std::uint64_t>(e.merger.k_begin),
+                                     static_cast<std::uint64_t>(e.merger.producer_width)});
+            }
             return by_columns(std::move(plan));
         }
         // Everything else under vision/ is elementwise (row-parallel output biases, norms,
@@ -988,6 +1003,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     BindingPlan& out = load_plan.bindings;
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
     out.features     = features;
+    out.weights_profile = weights_profile;
     const bool ggml_k = weights_profile == WeightsProfile::Qwen38GgmlK;
     if (ggml_k && features.vision) {
         throw std::invalid_argument("qwen3.8-27b/gguf-q4-k-m supports Text and MTP; its preserved GGUF Vision weights are not execution-qualified");
@@ -1009,6 +1025,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         bind_nvfp4_text_layers(binder, out);
         break;
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4QVis:
         bind_qwen38_fused_text_layers(binder, out, false);
         break;
     case WeightsProfile::Qwen38GgmlK:
@@ -1065,8 +1082,11 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         throw std::invalid_argument("qwen3.8-27b: --spec dflash requires the DFlash2 package in the artifact");
     }
     if (has_dflash2) {
-        out.dflash.projection_format = weights_profile == WeightsProfile::Qwen38Nvfp4
-                                            ? NumericFormat::W8G32_F16S : NumericFormat::BF16;
+out.dflash.projection_format =
+        (weights_profile == WeightsProfile::Qwen38Nvfp4 ||
+         weights_profile == WeightsProfile::Qwen38Nvfp4QVis)
+            ? NumericFormat::W8G32_F16S
+            : NumericFormat::BF16;
         const artifact::TensorPlacement dflash_placement =
             features.dflash() ? artifact::TensorPlacement::Device
                                : artifact::TensorPlacement::ValidateOnly;
@@ -1080,13 +1100,23 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
             return artifact::bind_tensor(binder, name, out.dflash.projection_format, shape,
                                          dflash_placement);
         };
-        out.dflash.feature_projection = bind_projection("dflash/feature_projection", {5120, 25600});
-        out.dflash.context_norm       = bind_dflash("dflash/context_norm", {5120});
+        // The separate-projection DFlash2 package publishes dedicated context K/V matrices of the
+        // same [N,K] extent as the QKV rows; alias-form artifacts carry none of these names. Both
+        // planes must be present together (the reader enforces the same symmetry).
+        const bool separate_context_kv =
+            binder.has_tensor("dflash/layers/0/attention/context_key");
+        out.dflash.separate_context_kv   = separate_context_kv;
+        out.dflash.feature_projection    = bind_projection("dflash/feature_projection", {5120, 25600});
+        out.dflash.context_norm          = bind_dflash("dflash/context_norm", {5120});
         for (std::size_t layer = 0; layer < out.dflash.layers.size(); ++layer) {
             auto& target = out.dflash.layers[layer];
             const std::string prefix = "dflash/layers/" + std::to_string(layer) + "/";
             target.input_norm = bind_dflash(prefix + "input_norm", {5120});
             target.query_key_value = bind_projection(prefix + "attention/query_key_value", {6144, 5120});
+            if (separate_context_kv) {
+                target.context_key   = bind_projection(prefix + "attention/context_key", {1024, 5120});
+                target.context_value = bind_projection(prefix + "attention/context_value", {1024, 5120});
+            }
             target.query_norm = bind_dflash(prefix + "attention/query_norm", {128});
             target.key_norm = bind_dflash(prefix + "attention/key_norm", {128});
             target.attention_output = bind_projection(prefix + "attention/output", {5120, 4096});
@@ -1110,19 +1140,24 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
             bind_dflash("dflash/candidate_selector/successor_codebook", {248320, 256});
     }
 
+    // Vision tower (docs/maintainer/quantized-vision-plan.md). Every enabled profile STREAMS the
+    // tower from pinned host shards (HostStaging): the encode path uploads one per-rank block per
+    // media item and rebases its weight views there, so the tower costs zero steady-state VRAM.
+    // The GGUF-derived identity keeps its preserved GGUF Vision weights validation-only instead.
     const artifact::TensorPlacement vision_placement =
-        features.vision ? artifact::TensorPlacement::Device
+        features.vision ? artifact::TensorPlacement::HostStaging
                         : artifact::TensorPlacement::ValidateOnly;
     if (ggml_k) {
         binder.validate_unconsumed_matching("vision/gguf/");
     } else {
-    out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
-    out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
-    out.vision_merger_fc2   = artifact::bind_tensor(
-        binder, "vision/merger/fc2", NumericFormat::FP16, {5120, 4608}, vision_placement);
-    out.vision_merger_fc2_bias = artifact::bind_tensor(
-        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
-    out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
+        const qwen3_6::VisionRecipe& recipe = *profile_vision_recipe(weights_profile);
+        out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement, recipe);
+        out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement, recipe);
+        out.vision_merger_fc2   = artifact::bind_tensor(
+            binder, "vision/merger/fc2", recipe.merger_fc2, {5120, 4608}, vision_placement);
+        out.vision_merger_fc2_bias = artifact::bind_tensor(
+            binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
+        out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
     }
 
     // Every DFlash2 object is bound above (or ValidateOnly when disabled), so a typo in the
@@ -1297,9 +1332,16 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
             backing, plan.dflash.feature_projection, plan.dflash.projection_format, 5120, 25600, device);
         draft.context_norm = artifact::materialized_tensor(backing, plan.dflash.context_norm,
                                                             NumericFormat::BF16, {5120}, device);
+        draft.separate_context_kv = plan.dflash.separate_context_kv;
         for (std::size_t layer = 0; layer < draft.layers.size(); ++layer) {
             const auto& source = plan.dflash.layers[layer];
             auto& target = draft.layers[layer];
+            if (plan.dflash.separate_context_kv) {
+                target.context_key = artifact::materialized_weight(
+                    backing, source.context_key, plan.dflash.projection_format, 1024, 5120, device);
+                target.context_value = artifact::materialized_weight(
+                    backing, source.context_value, plan.dflash.projection_format, 1024, 5120, device);
+            }
             target.input_norm = artifact::materialized_tensor(backing, source.input_norm,
                                                                 NumericFormat::BF16, {5120}, device);
             const Weight packed = artifact::materialized_weight(
@@ -1338,21 +1380,22 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
             backing, plan.dflash.selector_successor_codebook, NumericFormat::BF16, {248320, 256}, device);
     }
 
-    if (plan.features.vision) {
-        // Per-rank vision shard. At tp == 1 this is the whole tower on device 0; at tp > 1 each
-        // rank's arena holds only its own rows/columns, with extents matching `shard_mapping`'s
-        // vision/ block (the shared `vision_mod8_shard_count` helper). The forward path that
-        // consumes these shards is the sharded encode (docs/maintainer/fp16-vision-plan.md §5.5).
-        auto& vision = runtime.vision.emplace();
-        vision.common = qwen3_6::materialize_vision_common(
-            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm,
-            device, tp);
-        const std::int32_t merger_fc2_cols = static_cast<std::int32_t>(
-            qwen3_6::vision_mod8_shard_count(qwen3_6::VisionBackboneConfig::merger_hidden, tp, device));
-        vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
-                                                                 NumericFormat::FP16, 5120, merger_fc2_cols, device);
-        vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
-                                                                NumericFormat::BF16, {5120}, device);
+if (plan.features.vision) {
+        // Per-rank staged (streaming) Vision bank
+        // (docs/maintainer/quantized-vision-plan.md). Nothing vision-related lives in this rank's
+        // device arena: the 333 shards sit in the pinned host-staging region and are uploaded one
+        // region per encode by the runtime, which then points `runtime.vision` at the upload. Here
+        // we only (a) record the bank (offsets/bytes/extents + the pinned source) and (b) fill
+        // `runtime.vision` with descriptor-only views (payload nullptr) so `bind_rank` can bind its
+        // pointer indirection now and rebase the payloads after each upload.
+        const qwen3_6::VisionRecipe& recipe = *profile_vision_recipe(plan.weights_profile);
+        auto& stage                       = runtime.vision_stage.emplace();
+        stage = qwen3_6::materialize_vision_stage_rank(
+            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_fc2,
+            plan.vision_merger_fc2_bias, plan.vision_merger_norm, recipe,
+            /*out_hidden=*/TextConfig::hidden, device, tp);
+        auto& vision               = runtime.vision.emplace();
+        qwen3_6::fill_staged_vision_weights(stage, nullptr, vision);
     }
 }
 

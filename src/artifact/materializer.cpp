@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <memory>
@@ -70,6 +72,9 @@ struct CopyRange {
     std::uint64_t source_end   = 0;
     std::byte* destination     = nullptr;
     int device                 = 0;
+    // The destination is pinned HOST memory (a staging region) instead of device memory; the
+    // copy is a synchronous memcpy that needs no stream or completion event.
+    bool host_destination      = false;
 };
 
 struct ReadSpan {
@@ -101,6 +106,37 @@ std::uint64_t MaterializedArtifact::device_bytes(ObjectHandle handle, int device
         throw ArtifactError("object handle does not name a materialized tensor");
     }
     return objects_[handle.index].device_bytes[static_cast<std::size_t>(device)];
+}
+
+std::span<const std::byte> MaterializedArtifact::host_staging(int device) const {
+    if (device < 0 || device >= stats_.device_count ||
+        !host_staging_[static_cast<std::size_t>(device)]) {
+        throw ArtifactError("artifact has no host staging region on that device");
+    }
+    auto& block = *host_staging_[static_cast<std::size_t>(device)];
+    return std::span<const std::byte>(static_cast<const std::byte*>(block.data()), block.size());
+}
+
+const std::byte* MaterializedArtifact::host_staging_data(ObjectHandle handle, int device) const {
+    if (device < 0 || device >= stats_.device_count) {
+        throw ArtifactError("materialized artifact does not cover that device");
+    }
+    if (handle.index >= objects_.size() ||
+        objects_[handle.index].host[static_cast<std::size_t>(device)] == nullptr) {
+        throw ArtifactError("object handle does not name a host-staged tensor");
+    }
+    return objects_[handle.index].host[static_cast<std::size_t>(device)];
+}
+
+std::uint64_t MaterializedArtifact::host_staging_bytes(ObjectHandle handle, int device) const {
+    if (device < 0 || device >= stats_.device_count) {
+        throw ArtifactError("materialized artifact does not cover that device");
+    }
+    if (handle.index >= objects_.size() ||
+        objects_[handle.index].host[static_cast<std::size_t>(device)] == nullptr) {
+        throw ArtifactError("object handle does not name a host-staged tensor");
+    }
+    return objects_[handle.index].host_bytes[static_cast<std::size_t>(device)];
 }
 
 std::span<const std::byte> MaterializedArtifact::resource_bytes(ObjectHandle handle) const {
@@ -173,20 +209,36 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         out.stats_.device_capacity_bytes =
             checked_add(out.stats_.device_capacity_bytes, capacity, "device capacity overflows u64");
     }
+    for (int index = 0; index < device_count; ++index) {
+        const auto slot              = static_cast<std::size_t>(index);
+        const std::uint64_t capacity = plan.host_capacity_bytes[slot];
+        if (capacity == 0) { continue; }
+        if (capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
+            throw ArtifactError("host staging size is invalid");
+        }
+        // Zero the whole region once at load. Sharded placements leave plane-interleave gaps that
+        // no copy covers and the layouts define those gap bytes as zero; a single host memset at
+        // load time covers every placement instead of per-copy tracking.
+        out.host_staging_[slot] = std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(capacity));
+        std::memset(out.host_staging_[slot]->data(), 0, static_cast<std::size_t>(capacity));
+        out.stats_.per_device_host_capacity_bytes[slot] = capacity;
+    }
     // One placement per (object, device); every device tensor has a device-0 placement, so
     // counting those keeps `tensor_count` the number of distinct tensors at any tp.
     out.stats_.tensor_count = static_cast<std::size_t>(
         std::count_if(plan.device_objects.begin(), plan.device_objects.end(),
                       [](const DeviceMaterialization& placement) { return placement.device == 0; }));
-    out.stats_.resource_count = plan.host_objects.size();
+    out.stats_.resource_count = 0;
 
     for (const HostMaterialization& placement : plan.host_objects) {
+        if (placement.device >= 0) { continue; } // staged shards are handled with the tensors below
         auto& resource            = out.objects_.at(placement.object.index).resource;
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
         resource.assign(payload.data.begin(), payload.data.end());
         out.stats_.retained_resource_bytes += resource.size();
         out.stats_.file_bytes =
             checked_add(out.stats_.file_bytes, resource.size(), "artifact read bytes overflow u64");
+        ++out.stats_.resource_count;
     }
 
     std::size_t range_count = 0;
@@ -251,7 +303,58 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             }
         }
     }
-    if (ranges.empty()) { throw ArtifactError("materialization plan has no device tensors"); }
+    // Host-staged shards share the same read machinery as device placements; only the destination
+    // and its final copy step differ (synchronous memcpy into the pinned region).
+    std::uint64_t host_total = 0;
+    for (const HostMaterialization& placement : plan.host_objects) {
+        if (placement.device < 0 || placement.device >= device_count) {
+            continue;
+        }
+        const auto slot           = static_cast<std::size_t>(placement.device);
+        const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+        if (!out.host_staging_[slot]) {
+            throw ArtifactError("host staging placement on a device with no staging region");
+        }
+        if (placement.offset > out.stats_.per_device_host_capacity_bytes[slot] ||
+            out.stats_.per_device_host_capacity_bytes[slot] - placement.offset < placement.bytes) {
+            throw ArtifactError("host staging placement is outside its region");
+        }
+        out.objects_.at(placement.object.index).host[slot]       =
+            static_cast<const std::byte*>(out.host_staging_[slot]->data()) + placement.offset;
+        out.objects_.at(placement.object.index).host_bytes[slot] = placement.bytes;
+        auto* const base =
+            static_cast<std::byte*>(out.host_staging_[slot]->data()) + placement.offset;
+        const auto add_range = [&](std::uint64_t source_offset, std::uint64_t dest_offset,
+                                   std::uint64_t bytes) {
+            if (source_offset > payload.data.size() ||
+                payload.data.size() - source_offset < bytes || dest_offset > placement.bytes ||
+                placement.bytes - dest_offset < bytes) {
+                throw ArtifactError("materialization plan does not match artifact payload");
+            }
+            ranges.push_back(CopyRange{
+                .source_begin = checked_add(payload.absolute_offset, source_offset,
+                                            "artifact tensor source range overflows u64"),
+                .source_end   = checked_add(payload.absolute_offset + source_offset, bytes,
+                                            "artifact tensor source range overflows u64"),
+                .destination  = base + dest_offset,
+                .device       = placement.device,
+                .host_destination = true,
+            });
+            host_total = checked_add(host_total, bytes, "host staging byte count overflows u64");
+        };
+        if (placement.copies.empty()) {
+            if (payload.data.size() != placement.bytes) {
+                throw ArtifactError("materialization plan does not match artifact payload");
+            }
+            add_range(0, 0, placement.bytes);
+        } else {
+            for (const PlaneCopy& copy : placement.copies) {
+                add_range(copy.source_offset, copy.dest_offset, copy.bytes);
+            }
+        }
+    }
+    total = checked_add(total, host_total, "materialized byte count overflows u64");
+    if (ranges.empty()) { throw ArtifactError("materialization plan has no materialized tensors"); }
     // Destination ranges must stay disjoint *within* a device. The single-device path used to get
     // this from the source-range disjointness check below, which sharding had to drop (a
     // replicated object legitimately reads the same source twice). Check the destinations
@@ -344,13 +447,13 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                    ranges[first_unfinished].source_end <= source) {
                 ++first_unfinished;
             }
-            // One pass per destination device: a stream belongs to its device, so the copies are
+// One pass per destination device: a stream belongs to its device, so the copies are
             // grouped rather than interleaved, and only devices this chunk actually fed record an
-            // event on it.
+            // event on it. Host-staged destinations are synchronous memcpies: no stream, no event.
             for (int index = 0; index < device_count; ++index) {
-                const auto device_slot = static_cast<std::size_t>(index);
-                if (device_count > 1) { CUDA_CHECK(cudaSetDevice(devices[device_slot]->device)); }
-                bool fed = false;
+                const auto device_slot          = static_cast<std::size_t>(index);
+                bool fed                        = false;
+                std::uint64_t host_copied_here  = 0;
                 for (std::size_t range_index = first_unfinished;
                      range_index < ranges.size() &&
                      ranges[range_index].source_begin < chunk_end;
@@ -361,16 +464,34 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                     const std::uint64_t copy_end   = std::min(chunk_end, range.source_end);
                     if (copy_begin >= copy_end) { continue; }
                     const auto amount = static_cast<std::size_t>(copy_end - copy_begin);
+                    if (range.host_destination) {
+                        std::memcpy(
+                            range.destination +
+                                static_cast<std::size_t>(copy_begin - range.source_begin),
+                            static_cast<std::byte*>(slot.buffer.data()) +
+                                static_cast<std::size_t>(copy_begin - source),
+                            amount);
+                        host_copied_here += amount;
+                        continue;
+                    }
+                    if (!fed && device_count > 1) { CUDA_CHECK(cudaSetDevice(devices[device_slot]->device)); }
                     CUDA_CHECK(cudaMemcpyAsync(
                         range.destination +
                             static_cast<std::size_t>(copy_begin - range.source_begin),
                         static_cast<std::byte*>(slot.buffer.data()) +
                             static_cast<std::size_t>(copy_begin - source),
                         amount, cudaMemcpyHostToDevice, devices[device_slot]->load_stream));
-                    copied =
-                        checked_add(copied, amount, "artifact copied byte count overflows u64");
+                    copied           = checked_add(copied, amount,
+                                                   "artifact copied byte count overflows u64");
                     out.stats_.per_device_h2d_bytes[device_slot] += amount;
                     fed = true;
+                }
+                if (host_copied_here != 0) {
+                    copied = checked_add(copied, host_copied_here,
+                                         "artifact copied byte count overflows u64");
+                    out.stats_.staged_host_bytes =
+                        checked_add(out.stats_.staged_host_bytes, host_copied_here,
+                                    "host staging byte count overflows u64");
                 }
                 if (fed) {
                     CUDA_CHECK(cudaEventRecord(slot.events[device_slot],

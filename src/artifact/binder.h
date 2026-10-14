@@ -17,6 +17,11 @@ inline constexpr std::size_t kMaximumDevices = 4;
 
 enum class TensorPlacement : std::uint8_t {
     Device,
+    // Every device's shard lands in PINNED HOST memory instead of a device arena: same slice and
+    // per-plane copy semantics as device placement, but the materializer records a host-region
+    // placement and defers upload. The vision encode path uploads its one per-rank block to a
+    // per-encode workspace region and builds weight views into that upload.
+    HostStaging,
     ValidateOnly,
 };
 
@@ -58,13 +63,22 @@ struct DeviceMaterialization {
 
 struct HostMaterialization {
     ObjectHandle object;
+    // -1: retained resource bytes (no per-device staging region). >= 0: this device's pinned-host
+    // shard lives at byte `offset` inside device `device`'s host staging region.
+    int device      = -1;
+    std::uint64_t offset = 0;
+    std::uint64_t bytes  = 0;
+    std::vector<PlaneCopy> copies;
 };
 
 struct MaterializationPlan {
     std::size_t object_count = 0;
-    // Devices this plan targets; device_capacity_bytes[d] is valid for d < device_count.
+    // Devices this plan targets; device_capacity_bytes[d] / host_capacity_bytes[d] are valid for
+    // d < device_count.
     int device_count = 1;
     std::array<std::uint64_t, kMaximumDevices> device_capacity_bytes{};
+    // Pinned-host staging capacity per device; zero means no host region on that device.
+    std::array<std::uint64_t, kMaximumDevices> host_capacity_bytes{};
     // One entry per (object, device) pair that receives bytes; ascending by device within object.
     std::vector<DeviceMaterialization> device_objects;
     std::vector<HostMaterialization> host_objects;
@@ -96,6 +110,10 @@ public:
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;
     void materialize_on_device(ObjectHandle handle);
+    // Places every device's shard of `handle` into that device's pinned-host staging region with
+    // the exact slice semantics of `materialize_on_device`; the bytes stay on the host until the
+    // consumer uploads them.
+    void stage_shard_on_host(ObjectHandle handle);
     void retain_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
     void validate_unconsumed_matching(std::string_view prefix = "");
@@ -105,6 +123,8 @@ private:
     ObjectHandle find_unconsumed(std::string_view name);
     void place(ObjectHandle handle, int device, std::uint64_t bytes, std::uint64_t alignment,
                std::vector<PlaneCopy> copies);
+    void place_host(ObjectHandle handle, int device, std::uint64_t bytes, std::uint64_t alignment,
+                    std::vector<PlaneCopy> copies);
 
     const Reader& reader_;
     std::vector<bool> consumed_;

@@ -112,7 +112,8 @@ with the Volta implementation from `geoffwatts/ninfer-v100`. Ampere `sm_86` and 
 builds remain available; the RTX 5090 `sm_120a` results are inherited upstream evidence, not
 measurements of this target. The supported identities are
 `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
-`qwen3.8-27b/nvfp4`, `qwen3.8-27b/gguf-q4-k-m`, and `qwen3.6-35b-a3b/groupwise-int`.
+`qwen3.8-27b/nvfp4`, `qwen3.8-27b-coder390/nvfp4-qvis`, `qwen3.8-27b/gguf-q4-k-m`, and
+`qwen3.6-35b-a3b/groupwise-int`.
 The V100X2 workload uses the GGUF-derived Qwen3.8-27B Q4_K_M artifact from the local LM Studio
 directory, 180000-token context capacity, INT8 group-64 KV, eager decode at tensor-parallel
 width > 1 (CUDA Graph capture is optional there and measurably slower on this target), and MTP
@@ -121,14 +122,21 @@ Its Q4_K/Q6_K codes and scales must remain unchanged. Numerical transformations 
 optimizations require evidence against their applicable exact, mathematical, or behavioral oracle;
 preserving packed bytes alone does not prove absence of end-to-end quality loss.
 
-The five published identities retain Text, image/video Vision, MTP, prefix reuse, CLI,
+The published identities retain Text, image/video Vision, MTP, prefix reuse, CLI,
 OpenAI/Anthropic serving, and measurement through the same public `.ninfer` Engine route.
-The Vision tower weights are native FP16 (cast from the official BF16 source), and at
-tensor-parallel width greater than one the tower is sharded across the rank group: qkv (and its
-column-parallel bias) by head, `o_proj`/`fc2`/merger `fc2` row-parallel, and `fc1`/merger `fc1`
+The Vision tower's GEMM matrices bind at the registry formats the checkpoint ships: native FP16
+(cast from the official BF16 source) for the text-nvfp4 towers, and grouped Q4/Q5/Q6 plus a W8
+merger for the Coder390 package; biases, norms, and the position embedding stay BF16. The tower's
+shards are host-staged: each rank streams its pinned-host shard block to the device once per media
+encode and releases it afterwards, so steady-state Vision residency is ~0. At tensor-parallel
+width greater than one the tower is sharded across the rank group: qkv (and its column-parallel
+bias) by head, `o_proj`/`fc2`/merger `fc2` row-parallel (K-sliced), and `fc1`/merger `fc1`
 column-parallel; `patch_embedding`, the position embedding, every norm, and the row-parallel
-(output-projection) biases are replicated, and `allreduce_sum` in the row-parallel joins is the
-tower's only collective.
+(output-projection) biases are replicated. The join collectives are `allreduce_sum` for the
+row-parallel GEMMs plus, where a quantized `o_proj` per-rank K split cannot land on its group
+boundary (tp4), one input `allgather_columns` ahead of the replicated full-width `o_proj`. Where a
+coupled pair's padded producer span exceeds a rank's live rows, the projection zeros those pad
+channels before the activation.
 The GGUF-derived identity uses this same route for Text/MTP and rejects Vision; its retained
 Vision objects are validation-only. The 35B-A3B target additionally supports text-only DFlash.
 Qwen3.8-27B artifacts containing the optional DFlash2 package also support text-only DFlash,

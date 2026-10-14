@@ -27,6 +27,16 @@ W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
                                             k == 1536 ||     // 6144   / 4 (attention/gdn output)
                                             k == 2560 ||     // 10240  / 4 (mtp/input_projection)
                                             k == 4352);      // 17408  / 4 (mlp/down)
+    // Vision merger shards (Coder390 recipe): fc1 divides N (k = merger hidden 4608), fc2 divides K
+    // to its fc1 producer width (n = text hidden 5120). The tp1 extents (4608/4608, 5120/4608) are
+    // registered in the tp1 table; these are the tp2/tp4 halves and quarters.
+    const bool vision_shard = (k == 4608 && (n == 2304 || n == 1152)) ||
+                              (n == 5120 && (k == 2304 || k == 1152));
+    if (vision_shard) {
+        if (t <= 8) { return launch_w8_simt_r8_c4; }
+        if (t <= 256) { return launch_w8_mma_r32_c128; }
+        return launch_w8_mma_r64_c128;
+    }
     if (!column_shard && !row_shard) { return nullptr; }
     if (t <= 4) { return launch_w8_simt_r8_c4; }
     if (t <= 16) { return launch_w8_simt_r8_c8; }

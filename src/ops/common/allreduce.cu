@@ -277,6 +277,105 @@ void allgather_rows(const std::array<Tensor, kMaximumDevices>& destination,
     nccl_check(ncclGroupEnd(), kOp);
 }
 
+void allgather_columns(const std::array<Tensor, kMaximumDevices>& destination,
+                       const std::array<Tensor, kMaximumDevices>& part, const ExecutionContext& ec,
+                       const CollectiveComms& comms) {
+    static constexpr const char* kOp = "allgather_columns";
+    require_tp(ec, kOp);
+    require_comms(ec, comms, kOp);
+
+    const int tp = ec.tp;
+    require(destination[0].data != nullptr && part[0].data != nullptr,
+            std::string(kOp) + ": tensors are null");
+    const DType elem      = part[0].dtype;
+    const std::size_t es  = dtype_size(elem);
+    const ncclDataType_t dt         = nccl_element_type(elem, kOp);
+    const std::int32_t columns      = destination[0].ne[1];
+    const std::int32_t total_width  = destination[0].ne[0];
+    std::int32_t gathered_width     = 0;
+    std::size_t total_elems         = 0;
+    std::array<std::size_t, kMaximumDevices> block_elems{};
+    std::array<std::size_t, kMaximumDevices> offset_elems{};
+    for (int rank = 0; rank < tp; ++rank) {
+        require_contiguous(part[rank], kOp, "part");
+        require_contiguous(destination[rank], kOp, "destination");
+        require(part[rank].dtype == elem && destination[rank].dtype == elem,
+                std::string(kOp) + ": tensors must share one element type");
+        require(part[rank].ne[1] == columns,
+                std::string(kOp) + ": part columns must match the destination");
+        require(destination[rank].ne[0] == total_width && destination[rank].ne[1] == columns,
+                std::string(kOp) + ": destination shape must be uniform across ranks");
+        block_elems[rank]  = static_cast<std::size_t>(part[rank].ne[0]) *
+                            static_cast<std::size_t>(columns);
+        offset_elems[rank] = total_elems;
+        total_elems += block_elems[rank];
+        gathered_width += part[rank].ne[0];
+    }
+    require(gathered_width == total_width,
+            std::string(kOp) + ": part widths must sum to the destination width");
+    if (tp == 1) return;
+    if (total_elems == 0) return;
+
+    // The gathered axis is the CONTIGUOUS one (ne[0]), so a rank's block is NOT a contiguous span
+    // of the destination: it occupies `widths[rank]` leading rows of every column. Move each rank's
+    // contiguous [W,T] block into a stream-ordered staging image (own block first, then one NCCL
+    // receive per peer, exactly as gather_columns_rank0 does), then place every block with a
+    // per-column strided copy. A flat concatenation is only correct when the blocked axis is the
+    // strided one (allgather_rows), not here. Vision eager work has no small-message fast path, so
+    // this Op always runs the NCCL route.
+    const CurrentDeviceGuard guard;
+    std::array<void*, kMaximumDevices> staging{};
+    for (int rank = 0; rank < tp; ++rank) {
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        cuda_check(cudaMallocAsync(&staging[rank], total_elems * es, ec.dev[rank]->stream),
+                   "cudaMallocAsync");
+    }
+
+    nccl_check(ncclGroupStart(), kOp);
+    for (int rank = 0; rank < tp; ++rank) {
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        cuda_check(cudaMemcpyAsync(static_cast<char*>(staging[rank]) + offset_elems[rank] * es,
+                                   part[rank].data, block_elems[rank] * es,
+                                   cudaMemcpyDeviceToDevice, ec.dev[rank]->stream),
+                   "cudaMemcpyAsync");
+        for (int peer = 0; peer < tp; ++peer) {
+            if (peer == rank) continue;
+            nccl_check(ncclRecv(static_cast<char*>(staging[rank]) + offset_elems[peer] * es,
+                                block_elems[peer], dt, peer, comms.comm(rank),
+                                ec.dev[rank]->stream),
+                       kOp);
+            nccl_check(ncclSend(part[rank].data, block_elems[rank], dt, peer,
+                                comms.comm(rank), ec.dev[rank]->stream),
+                       kOp);
+        }
+    }
+    nccl_check(ncclGroupEnd(), kOp);
+
+    const std::size_t destination_pitch = static_cast<std::size_t>(total_width) * es;
+    for (int rank = 0; rank < tp; ++rank) {
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        std::size_t destination_bytes = 0;
+        for (int source = 0; source < tp; ++source) {
+            const std::size_t width_bytes = static_cast<std::size_t>(part[source].ne[0]) * es;
+            if (width_bytes != 0) {
+                cuda_check(
+                    cudaMemcpy2DAsync(
+                        reinterpret_cast<char*>(destination[rank].data) + destination_bytes,
+                        destination_pitch,
+                        static_cast<char*>(staging[rank]) + offset_elems[source] * es, width_bytes,
+                        width_bytes, static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice,
+                        ec.dev[rank]->stream),
+                    "cudaMemcpy2DAsync");
+            }
+            destination_bytes += width_bytes;
+        }
+    }
+    for (int rank = 0; rank < tp; ++rank) {
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        cuda_check(cudaFreeAsync(staging[rank], ec.dev[rank]->stream), "cudaFreeAsync");
+    }
+}
+
 void gather_columns_rank0(const Tensor& destination,
                           const std::array<Tensor, kMaximumDevices>& part,
                           const ExecutionContext& ec, const CollectiveComms& comms) {

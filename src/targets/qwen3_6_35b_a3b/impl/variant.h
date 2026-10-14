@@ -223,6 +223,14 @@ struct Variant {
                                         std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                                              std::int32_t last);
+
+    // --- Vision plan-time geometry -------------------------------------------------------------
+    //
+    // The 35B-A3B tower is device-resident native FP16 (tp == 1 only): no streaming bank, so the
+    // staging block is zero-width and the layout always runs the FP16 recipe.
+    [[nodiscard]] static const qwen3_6::VisionRecipe* vision_recipe(WeightsProfile) noexcept;
+    [[nodiscard]] static std::size_t vision_staged_weights_bytes(WeightsProfile, std::size_t tp,
+                                                                 int rank);
 };
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b::detail

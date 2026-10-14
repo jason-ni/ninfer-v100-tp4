@@ -123,8 +123,16 @@ struct Variant {
     [[nodiscard]] static std::size_t
     post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile, qwen3_6::TextPhase phase,
                                         std::int32_t first, std::int32_t last);
-    [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
-                                                                             std::int32_t last);
+[[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
+                                                                         std::int32_t last);
+
+    // --- Vision streaming plan-time geometry ----------------------------------------------------
+    //
+    // The 27B tower streams from pinned host shards on every enabled profile; these give the
+    // family workspace composer the per-rank upload-block sizes before any model view exists.
+    [[nodiscard]] static const qwen3_6::VisionRecipe* vision_recipe(WeightsProfile weights_profile) noexcept;
+    [[nodiscard]] static std::size_t vision_staged_weights_bytes(WeightsProfile weights_profile,
+                                                                 std::size_t tp, int rank);
 
     // --- tp > 1 split forms --------------------------------------------------------------------
     //

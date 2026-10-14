@@ -133,6 +133,32 @@ int w8_a16_conformance() {
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {5120, 4608, 281U, Comparison::Sampled, false, kN5120K4608});
 
+    // Vision merger shards (Coder390 recipe): fc1 divides N (k = 4608 merger hidden) at tp2/tp4,
+    // and fc2 divides K to its fc1 producer width (tp2 2304, tp4 1152).
+    constexpr std::array kN2304K4608{
+        a16(1), a16(8), a16(9), a16(16), a16(17), a16(256), a16(32768),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {2304, 4608, 283U, Comparison::Sampled, false, kN2304K4608});
+
+    constexpr std::array kN1152K4608{
+        a16(1), a16(8), a16(9), a16(16), a16(17), a16(256), a16(32768),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {1152, 4608, 285U, Comparison::Sampled, false, kN1152K4608});
+
+    constexpr std::array kN5120K2304{
+        a16(1), a16(4), a16(5), a16(6), a16(128), a16(32768),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {5120, 2304, 287U, Comparison::Sampled, false, kN5120K2304});
+
+    constexpr std::array kN5120K1152{
+        a16(1), a16(4), a16(5), a16(6), a16(128), a16(32768),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {5120, 1152, 289U, Comparison::Sampled, false, kN5120K1152});
+
     constexpr std::array kN2048K16384{
         a16(1),    a16(2),    a16(4),    a16(5),    a16(8),    a16(9),    a16(16),   a16(17),
         a16(24),   a16(25),   a16(32),   a16(33),   a16(36),   a16(37),   a16(40),   a16(41),

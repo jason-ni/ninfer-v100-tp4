@@ -89,6 +89,18 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
+const std::string& multi_step_tool_template_source() {
+    static const std::string source = read_template_fixture(
+        NINFER_SOURCE_DIR "/tests/fixtures/frontend/multi_step_tool_chat_template.jinja");
+    return source;
+}
+
+const fi::CompiledChatTemplate& multi_step_tool_template() {
+    static const fi::CompiledChatTemplate value =
+        fi::CompiledChatTemplate::resolve(multi_step_tool_template_source());
+    return value;
+}
+
 const char* official_model_dir() {
     if (const char* configured = std::getenv("NINFER_QWEN3_6_27B_DIR")) { return configured; }
     return "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16";
@@ -633,6 +645,63 @@ int test_reasoning_effort_chat_template() {
     return failures;
 }
 
+int test_multi_step_tool_chat_template() {
+    // The Coder390 efficient-think template is the reasoning-effort template plus two behaviors:
+    // a conversation whose user turns are all tool responses thresholds at the last tool message
+    // instead of rejecting the history, and a tool result that opens the conversation opens its
+    // implicit user group. Its capability set matches the reasoning-effort variant.
+    const ninfer::PromptCapabilities capabilities = multi_step_tool_template().capabilities();
+    int failures = check(capabilities.enable_thinking && capabilities.reasoning_effort.low &&
+                             capabilities.reasoning_effort.medium &&
+                             capabilities.reasoning_effort.xhigh &&
+                             capabilities.reasoning_effort.default_effort ==
+                                 ninfer::ReasoningEffort::XHigh,
+                         "multi-step-tool template did not advertise the effort capability set");
+
+    fi::ChatRenderOptions no_generation;
+    no_generation.add_generation_prompt = false;
+
+    const std::string xhigh_system =
+        "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the "
+        "task, validate key assumptions, consider plausible alternatives, and prioritize "
+        "correctness, consistency, and clarity in the final answer.<|im_end|>\n";
+
+    const auto tool_result = [](std::string content) {
+        fi::ChatMessage message = chat_message(ninfer::ChatRole::Tool, std::move(content));
+        message.tool_call_id    = "t1";
+        return message;
+    };
+
+    fi::ChatMessage call = chat_message(ninfer::ChatRole::Assistant, "");
+    call.tool_calls.push_back({.id = "", .name = "calc", .arguments_json = R"({"expr":"2+2"})"});
+    const std::vector<fi::ChatMessage> tool_only{call, tool_result("4")};
+    failures += check(
+        multi_step_tool_template().render(tool_only, no_generation).text ==
+            xhigh_system + "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                           "<tool_call>\n<function=calc>\n<parameter=expr>\n2+2\n</parameter>\n"
+                           "</function>\n</tool_call><|im_end|>\n"
+                           "<|im_start|>user\n<tool_response>\n4\n</tool_response><|im_end|>\n",
+        "multi-step-tool template did not render a tool-result-only history");
+    failures += check(throws_invalid_argument([&] {
+                          (void)reasoning_effort_template().render(tool_only, no_generation);
+                      }),
+                      "reasoning-effort template accepted a tool-result-only history");
+
+    const std::vector<fi::ChatMessage> leading_tool{tool_result("4"),
+                                                     chat_message(ninfer::ChatRole::User, "hi")};
+    failures += check(
+        multi_step_tool_template().render(leading_tool, no_generation).text ==
+            xhigh_system + "<|im_start|>user\n<tool_response>\n4\n</tool_response><|im_end|>\n"
+                           "<|im_start|>user\nhi<|im_end|>\n",
+        "multi-step-tool template did not open the leading tool group");
+    failures += check(
+        reasoning_effort_template().render(leading_tool, no_generation).text ==
+            xhigh_system + "\n<tool_response>\n4\n</tool_response><|im_end|>\n"
+                           "<|im_start|>user\nhi<|im_end|>\n",
+        "reasoning-effort template changed its leading tool rendering");
+    return failures;
+}
+
 int test_rewrite_checkpoint_trace() {
     const std::string assistant_header = "<|im_start|>assistant\n";
     fi::ChatMessage first              = chat_message(ninfer::ChatRole::Assistant, "");
@@ -859,6 +928,33 @@ int test_text_and_image_prepare(const Frontend& frontend) {
                               image_patches[1536] == bf16_bits(16.0F / 127.5F - 1.0F),
                           "image frontend patch normalization/order is incorrect");
     }
+
+    // Content-addressed prefix keys must bind the Vision content, not just the placeholder token
+    // ids (every image shares the <|image_pad|> id). Two prompts with the same text and the same
+    // image geometry but different pixels must publish different block keys, or a prefix cache
+    // reuses the first image's KV for the second. The stub vocabulary encodes each 'x' as one
+    // token, padding the prompt past a full 64-token cache block.
+    const std::string padding(200, 'x');
+    const auto photo_a =
+        frontend.prepare(image_text_input(block_ppm(64, 64, 0x10), padding, "a.ppm"));
+    const auto photo_b =
+        frontend.prepare(image_text_input(block_ppm(64, 64, 0x80), padding, "b.ppm"));
+    const auto photo_a2 =
+        frontend.prepare(image_text_input(block_ppm(64, 64, 0x10), padding, "a.ppm"));
+    const auto& photo_a_data  = FrontendFactory::inspect(photo_a);
+    const auto& photo_b_data  = FrontendFactory::inspect(photo_b);
+    const auto& photo_a2_data = FrontendFactory::inspect(photo_a2);
+    failures += check(!photo_a_data.block_hashes.empty() &&
+                          photo_a_data.block_hashes.size() == photo_a_data.block_extras.size(),
+                      "vision prompt did not publish one cache key per full block");
+    failures += check(photo_a_data.token_ids == photo_b_data.token_ids,
+                      "different pixels of the same geometry changed the token layout");
+    failures += check(photo_a_data.block_extras != photo_b_data.block_extras &&
+                          photo_a_data.block_hashes != photo_b_data.block_hashes,
+                      "vision block keys did not bind the image content digest");
+    failures += check(photo_a_data.block_hashes == photo_a2_data.block_hashes &&
+                          photo_a_data.block_extras == photo_a2_data.block_extras,
+                      "vision block keys are not deterministic for identical media");
     return failures;
 }
 
@@ -1498,6 +1594,7 @@ int main() {
     failures += test_official_chat_template();
     failures += test_ordered_instruction_turns();
     failures += test_reasoning_effort_chat_template();
+    failures += test_multi_step_tool_chat_template();
     failures += test_rewrite_checkpoint_trace();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);

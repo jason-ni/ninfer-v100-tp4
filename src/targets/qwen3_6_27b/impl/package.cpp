@@ -36,6 +36,18 @@ LoadedModel::LoadedModel(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(
 
 LoadedModel::~LoadedModel() = default;
 
+const qwen3_6::VisionRecipe* profile_vision_recipe(WeightsProfile profile) noexcept {
+    switch (profile) {
+    case WeightsProfile::Qwen38GgmlK: return nullptr;   // validation-only GGUF Vision weights
+    case WeightsProfile::Qwen38Nvfp4QVis: return &qwen3_6::kVisionRecipeCoder390Quantized;
+    case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4: return &qwen3_6::kVisionFp16;
+    }
+    return nullptr;
+}
+
 } // namespace ninfer::targets::qwen3_6_27b::detail
 
 namespace ninfer::targets::qwen3_6_27b {
@@ -76,6 +88,11 @@ constexpr ModelSamplingDefaults kQwen3_8Defaults{
 } // namespace
 
 ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
+    if (model == coder390_model_id) {
+        // The Coder390 repack publishes the same Qwen3.8 general-task presets (thinking mode at
+        // temperature 1.0 / top-p 0.95 / top-k 20; its chat template enables thinking by default).
+        return kQwen3_8Defaults;
+    }
     if (model == model_id) { return kQwen3_6Defaults; }
     if (model == qwen3_8_model_id) { return kQwen3_8Defaults; }
     throw std::runtime_error("model '" + std::string(model) +
@@ -99,12 +116,15 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "gguf-q4-k-m") {
         return WeightsProfile::Qwen38GgmlK;
     }
-    throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
+    if (identity.model_id == coder390_model_id && identity.weights_id == "nvfp4-qvis") {
+        return WeightsProfile::Qwen38Nvfp4QVis;
+    }
+throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
-                                     WeightsProfile weights_profile) {
+                                      WeightsProfile weights_profile) {
     if (binder.device_count() != options.tp) {
         throw std::invalid_argument("artifact binder device count does not match EngineOptions.tp");
     }

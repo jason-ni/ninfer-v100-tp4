@@ -159,9 +159,17 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 layer_roots.value.view({Config::head_dim, Config::kv_heads, layer_columns});
             Tensor key_flat   = key_raw.view({Config::kv_size, layer_columns});
             Tensor value_flat = value.view({Config::kv_size, layer_columns});
-            ops::linear(layer_context, weight.key, key_flat,
+            // The separate-projection DFlash2 package publishes dedicated context K/V matrices;
+            // the alias form feeds the QKV rows through the same two GEMMs.
+            const auto& context_key_weight = state.execution.model.dflash->separate_context_kv
+                                                ? weight.context_key
+                                                : weight.key;
+            const auto& context_value_weight = state.execution.model.dflash->separate_context_kv
+                                                   ? weight.context_value
+                                                   : weight.value;
+            ops::linear(layer_context, context_key_weight, key_flat,
                         state.execution.device.stream);
-            ops::linear(layer_context, weight.value, value_flat,
+            ops::linear(layer_context, context_value_weight, value_flat,
                         state.execution.device.stream);
             Tensor key = layer_roots.key.view({Config::head_dim, Config::kv_heads, layer_columns});
             ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,

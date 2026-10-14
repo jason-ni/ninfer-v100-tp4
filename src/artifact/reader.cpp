@@ -286,9 +286,24 @@ public:
                          std::uint64_t payload_start)
         : directory_(directory), file_(file), payload_start_(payload_start) {
         if (!directory_.is_object() || !directory_.contains("metadata") ||
-            !directory_.at("metadata").is_object() ||
-            directory_.at("metadata").value("name", "") != "qwen3.8-27b") {
-            throw ArtifactError("NInfer v3 compatibility is limited to qwen3.8-27b");
+            !directory_.at("metadata").is_object()) {
+            throw ArtifactError("NInfer v3 directory is missing its metadata");
+        }
+        // The native NVFP4 27B package and the published Coder390 W4A4/W8A8 package share one
+        // v3 object/binding schema; the only differences are the vision quantization recipe
+        // (native FP16 vs the Q4/Q5/Q6/W8 set) and the DFlash2 optional component, so both map
+        // through this adapter to their registered 27B identities.
+        const auto meta_name = directory_.at("metadata").value("name", "");
+        if (meta_name == "qwen3.8-27b") {
+            model_id_   = "qwen3.8-27b";
+            weights_id_ = "nvfp4";
+        } else if (meta_name == "qwen3.8-27b-coder390-w4a4-w8a8-mtp-dflash2") {
+            model_id_   = "qwen3.8-27b-coder390";
+            weights_id_ = "nvfp4-qvis";
+        } else {
+            throw ArtifactError(
+                "NInfer v3 compatibility is limited to qwen3.8-27b and "
+                "qwen3.8-27b-coder390-w4a4-w8a8-mtp-dflash2");
         }
         if (!directory_.contains("files") || !directory_.at("files").is_array() ||
             directory_.at("files").size() != 1 ||
@@ -421,8 +436,10 @@ public:
         if (has_dflash2) { add_dflash2(); }
 
         constexpr std::size_t kStructuralObjects = 1012;
-        const std::size_t expected = kStructuralObjects + 2 * nvfp4_mlp_layers +
-                                     (has_dflash2 ? 66 : 0);
+        constexpr std::size_t kDFlash2Objects    = 66; // alias context-K/V package
+        const std::size_t expected =
+            kStructuralObjects + 2 * nvfp4_mlp_layers +
+            (has_dflash2 ? kDFlash2Objects + dflash_context_kv_objects_ : 0);
         if (selected_.size() != expected) {
             throw ArtifactError("qwen3.8-27b v3 projection produced " +
                                 std::to_string(selected_.size()) + " objects; expected " +
@@ -478,18 +495,66 @@ public:
             return a.at("offset").get<std::uint64_t>() < b.at("offset").get<std::uint64_t>();
         });
 
-        const auto template_bytes = embedded_chat_template();
-        auto template_it = std::find_if(objects.begin(), objects.end(), [](const Json& object) {
-            return object.at("name") == "frontend/chat_template.jinja";
-        });
-        if (template_it == objects.end() || template_bytes.size() > template_it->at("bytes").get<std::uint64_t>()) {
-            throw ArtifactError("embedded chat template does not fit its resource allocation");
-        }
-        (*template_it)["bytes"] = template_bytes.size();
+        // The template ships either as its own raw-bytes resource or embedded in
+        // tokenizer_config.json. In the resource form the resource is authoritative: the projected
+        // config is made to carry exactly those bytes, replacing whatever (possibly stale) field the
+        // published package shipped, because the native directory contract requires the two to
+        // agree. The embedded form instead shrinks the jinja allocation to the config's bytes.
+        const auto resource_names = directory_.at("components").at("text").value("resources",
+                                                                                Json::object());
         V3CompatibilityDirectory result;
-        result.directory = {{"identity", {{"model_id", "qwen3.8-27b"}, {"weights_id", "nvfp4"}}},
+        if (resource_names.contains("chat_template.jinja")) {
+            // add_resource already projected the resource under its native name with true extent;
+            // verify the converted entry exists and leave its allocation untouched.
+            const auto template_it = std::find_if(objects.begin(), objects.end(),
+                                                  [](const Json& object) {
+                                                      return object.at("name") ==
+                                                             "frontend/chat_template.jinja";
+                                                  });
+            if (template_it == objects.end()) {
+                throw ArtifactError("chat_template.jinja resource did not project to its object");
+            }
+            const auto template_span = object_payload(*template_it);
+            const std::string template_text(
+                reinterpret_cast<const char*>(template_span.data()), template_span.size());
+            const auto config_it = std::find_if(
+                objects.begin(), objects.end(), [](const Json& object) {
+                    return object.at("name") == "frontend/tokenizer_config.json";
+                });
+            if (config_it == objects.end()) {
+                throw ArtifactError(
+                    "tokenizer_config.json resource did not project to its object");
+            }
+            const auto config_span = object_payload(*config_it);
+            Json config;
+            try {
+                const auto* begin = reinterpret_cast<const char*>(config_span.data());
+                config = Json::parse(begin, begin + config_span.size());
+            } catch (const Json::exception& error) {
+                throw ArtifactError(std::string("invalid tokenizer_config.json: ") + error.what());
+            }
+            config["chat_template"] = template_text;
+            // The override fully replaces the read bytes, so the physical allocation stays at its
+            // declared extent (it abuts the next object); only the payload changes.
+            const auto patched = config.dump(-1, ' ', /*ensure_ascii=*/false);
+            const auto raw = std::as_bytes(std::span(patched.data(), patched.size()));
+            result.payload_overrides.emplace("frontend/tokenizer_config.json",
+                                             std::vector<std::byte>(raw.begin(), raw.end()));
+        } else {
+            const auto template_bytes = embedded_chat_template();
+            auto template_it =
+                std::find_if(objects.begin(), objects.end(), [](const Json& object) {
+                    return object.at("name") == "frontend/chat_template.jinja";
+                });
+            if (template_it == objects.end() ||
+                template_bytes.size() > template_it->at("bytes").get<std::uint64_t>()) {
+                throw ArtifactError("embedded chat template does not fit its resource allocation");
+            }
+            (*template_it)["bytes"] = template_bytes.size();
+            result.payload_overrides.emplace("frontend/chat_template.jinja", template_bytes);
+        }
+        result.directory = {{"identity", {{"model_id", model_id_}, {"weights_id", weights_id_}}},
                             {"objects", std::move(objects)}};
-        result.payload_overrides.emplace("frontend/chat_template.jinja", template_bytes);
         return result;
     }
 
@@ -521,13 +586,27 @@ private:
             const std::string prefix = "dflash2/" + suffix;
             add(old_prefix + "attention/query_key_value",
                 {prefix + "attention/query", prefix + "attention/key", prefix + "attention/value"});
-            // Context K/V are aliases of the same QKV rows, not independent parameters.
-            for (const char* role : {"key", "value"}) {
-                if (binding_parts(prefix + "attention/context_" + role) !=
-                    binding_parts(prefix + "attention/" + role)) {
-                    throw ArtifactError(prefix + "attention/context_" + role + ": alias differs");
+// Context K/V come from one of two published DFlash2 packages. The single-matrix package aliases
+                // them onto the QKV rows (the draft and context streams share the projection); the
+                // later fine-tuned package carries dedicated context matrices of the same [N,K]
+                // extent. Both map through this adapter: the alias form adds no native objects,
+                // the separate form adds two per layer. A mixed form would mis-decode the draft
+                // context, so it is rejected.
+                const auto context_key   = binding_parts(prefix + "attention/context_key");
+                const auto context_value = binding_parts(prefix + "attention/context_value");
+                const bool key_alias     = context_key == binding_parts(prefix + "attention/key");
+                const bool value_alias   = context_value == binding_parts(prefix + "attention/value");
+                if (key_alias != value_alias) {
+                    throw ArtifactError(prefix + "attention/context_key: mixed alias and "
+                        "independent context projections are unsupported");
                 }
-            }
+                if (!key_alias) {
+                    add(old_prefix + "attention/context_key",
+                        {prefix + "attention/context_key"});
+                    add(old_prefix + "attention/context_value",
+                        {prefix + "attention/context_value"});
+                    dflash_context_kv_objects_ += 2;
+                }
             add(old_prefix + "mlp/gate_up", {prefix + "mlp/gate", prefix + "mlp/up"});
             for (const char* role : {"input_norm", "post_attention_norm", "attention/query_norm",
                     "attention/key_norm", "attention/output", "mlp/down",
@@ -687,6 +766,10 @@ private:
         return {raw.begin(), raw.end()};
     }
 
+    std::string model_id_;
+    std::string weights_id_;
+    // Separate-package DFlash2 layers each add a context K/V pair; zero for the alias form.
+    std::size_t dflash_context_kv_objects_ = 0;
     const Json& directory_;
     const MappedFile& file_;
     std::uint64_t payload_start_;

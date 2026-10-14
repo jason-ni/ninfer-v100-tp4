@@ -7,6 +7,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include <ninfer/ops/allreduce.h>
+#include <ninfer/targets/qwen3_6/vision.h>
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "runtime/contract/transient_region.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -55,17 +56,26 @@ public:
                   const ops::CollectiveComms& events,
                   const std::array<const LoadedModelData*, kMaximumDevices>& peer_weights);
 
-    [[nodiscard]] static std::size_t output_transient_bytes(std::size_t merged_tokens);
+[[nodiscard]] static std::size_t output_transient_bytes(std::size_t merged_tokens);
     // Per-rank scratch the item needs. `tp` selects the shard width the encode will run at; the
-    // default is the single-device value.
+    // default is the single-device value. `staged_per_rank[r]` adds rank r's pinned Vision staging
+    // block (the streaming recipe uploads one region per encode inside the same arena) when the
+    // model streams its tower; null keeps the device-resident layout exactly as before.
     [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::VisionItemControl& item,
-                                                     std::size_t tp = 1);
+                                                     std::size_t tp = 1,
+                                                     const std::size_t* staged_per_rank = nullptr,
+                                                     const qwen3_6::VisionRecipe& recipe =
+                                                         qwen3_6::kVisionFp16);
     // Per-rank scratch capacity for the widest supported vision item. `tp` sizes for a sharded
     // encode (max over ranks, since tp == 4's mod-8 split is uneven); tp == 1 is the single-device
-    // value and is unchanged from before this parameter existed.
+    // value. `staged_per_rank` and `recipe` as in `workspace_bytes`.
     [[nodiscard]] static std::size_t workspace_capacity_bytes(std::uint32_t max_merged_tokens,
-                                                               std::uint32_t max_segments,
-                                                               std::size_t tp = 1);
+                                                              std::uint32_t max_segments,
+                                                              std::size_t tp = 1,
+                                                              const std::size_t* staged_per_rank =
+                                                                  nullptr,
+                                                              const qwen3_6::VisionRecipe& recipe =
+                                                                  qwen3_6::kVisionFp16);
     // Single-device encode (tp == 1).
     void encode(const VisionItemView& item, Tensor& output, WorkspaceArena& workspace) const;
     // Sharded encode (tp > 1). `out[r]` is rank r's [H,V] BF16 destination (the replicated result
@@ -127,6 +137,12 @@ private:
     const ExecutionContext* ec_     = nullptr;
     const ops::CollectiveComms* events_ = nullptr;
     int tp_count_                    = 1;
+    // Streaming Vision banks: rank r's pinned host-staging shard (nullptr when the tower is
+    // device-resident, e.g. the 35B target) and the model-view weight object it rebases. The encode
+    // uploads the block into the per-rank arena and points these weights at the upload in place;
+    // the single inference thread serializes encodes, so no cross-session locking is needed.
+    std::array<const qwen3_6::VisionStageRank*, kMaximumDevices> stages_{};
+    std::array<qwen3_6::VisionWeights*, kMaximumDevices> family_views_{};
 };
 
 struct VisionChunk {

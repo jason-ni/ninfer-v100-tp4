@@ -270,10 +270,14 @@ struct DFlashLayerPlan {
     artifact::ObjectHandle attention_conv_kernel_projection;
     artifact::ObjectHandle mlp_conv_base_kernel;
     artifact::ObjectHandle mlp_conv_kernel_projection;
+    // Separate-projection DFlash2 package only; unbound when the artifact aliases them.
+    artifact::ObjectHandle context_key;
+    artifact::ObjectHandle context_value;
 };
 
 struct DFlashPlan {
     artifact::NumericFormat projection_format = artifact::NumericFormat::BF16;
+    bool separate_context_kv                  = false;
     artifact::ObjectHandle feature_projection;
     artifact::ObjectHandle context_norm;
     std::array<DFlashLayerPlan, 5> layers;
@@ -286,6 +290,9 @@ struct DFlashPlan {
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
+    // The weights profile the bind ran under; carried so per-device model views (which are built
+    // after binding) can look up published per-profile geometry without re-deriving it.
+    WeightsProfile weights_profile = WeightsProfile::Qwen36GroupwiseInt;
     artifact::NumericFormat draft_format = artifact::NumericFormat::Q4G64_F16S;
     artifact::NumericFormat mtp_format = artifact::NumericFormat::W8G32_F16S;
 

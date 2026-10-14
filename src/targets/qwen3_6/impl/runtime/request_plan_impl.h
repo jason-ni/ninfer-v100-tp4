@@ -144,10 +144,13 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             if (end > base->summary.prompt_tokens) {
                 throw std::invalid_argument("vision item consumer span exceeds prompt");
             }
-            if (schedule::VisionContext::workspace_bytes(item, static_cast<std::size_t>(tp)) >
-                work.capacity()) {
-                throw std::invalid_argument("vision item exceeds the Program workspace envelope");
-            }
+if (schedule::VisionContext::workspace_bytes(
+                item, static_cast<std::size_t>(tp), vision_staged_bytes.data(),
+                model.vision_stage.has_value() ? model.vision_stage->recipe
+                                              : qwen3_6::kVisionFp16) >
+            work.capacity()) {
+            throw std::invalid_argument("vision item exceeds the Program workspace envelope");
+        }
             previous_end = end;
             max_merged   = std::max(max_merged, item.merged_count);
         }

@@ -78,6 +78,23 @@ int q4_a16_conformance() {
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
                           {4304, 1152, 139U, Comparison::Sampled, false, kN4304K1152});
 
+    // Vision-tower column-parallel shards (tp2/tp4 halves and the grouped fc1 remainder).
+    constexpr std::array kN2176K1152{
+        a16(4), a16(128), a16(1024), a16(1536), a16(1536 + 8),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {2176, 1152, 141U, Comparison::Sampled, false, kN2176K1152});
+    constexpr std::array kN2128K1152{
+        a16(4), a16(128), a16(1024), a16(1536),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {2128, 1152, 143U, Comparison::Sampled, false, kN2128K1152});
+    constexpr std::array kN1728K1152{
+        a16(4), a16(128), a16(1024), a16(1536),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {1728, 1152, 145U, Comparison::Sampled, false, kN1728K1152});
+
     return failures;
 }
 

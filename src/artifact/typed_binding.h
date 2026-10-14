@@ -42,4 +42,12 @@ class MaterializedArtifact;
 void require_placement_bytes(const MaterializedArtifact& materialized, ObjectHandle handle,
                              int device, std::uint64_t required_bytes);
 
+// Views over caller-owned bytes (a per-encode upload of a host-staged shard). The byte region has
+// already been validated against the planned placement at load time; these builders only re-derive
+// the geometry and point into `payload`. Use the matching layout-aware builder per format class.
+[[nodiscard]] Weight staged_weight_view(NumericFormat format, const void* payload, std::int32_t rows,
+                                        std::int32_t columns);
+[[nodiscard]] Tensor staged_tensor_view(DType dtype, const void* payload,
+                                        std::initializer_list<std::int32_t> shape);
+
 } // namespace ninfer::artifact

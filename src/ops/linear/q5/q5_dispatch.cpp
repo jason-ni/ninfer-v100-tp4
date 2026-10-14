@@ -38,6 +38,16 @@ Q5Launch select_q5_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) 
                                             k == 8704 ||  // 17408 / 2 (mlp/down)
                                             k == 1536 ||  // 6144  / 4 (attention/gdn output)
                                             k == 4352);   // 17408 / 4 (mlp/down)
+    // Vision tower Q5 shards (Coder390 recipe): o_proj is row-parallel with K = hidden/tp where
+    // that width is group-aligned (576 at tp2); at tp4 it is replicated full-width behind an input
+    // gather and hits the tp1 n=1152/k=1152 entry. fc2's K is its fc1 producer width, which is the
+    // PADDED intermediate span: 4352 at tp1 (full) and 2176/1088 at tp2/tp4. The remaining tp1
+    // extent (n=1152, k=4304) stays registered in the tp1 table.
+    if (n == 1152 && (k == 576 || k == 4352 || k == 2176 || k == 1088)) {
+        if (t <= 76) { return launch_q5_simt_r8_c4; }
+        if (t <= 636) { return launch_q5_mma_r64_c64; }
+        return launch_q5_mma_r64_c128;
+    }
     if (!column_shard && !row_shard) { return nullptr; }
     if (t <= 4) { return launch_q5_simt_r8_c4; }
     if (t <= 24) { return launch_q5_simt_r8_c8; }

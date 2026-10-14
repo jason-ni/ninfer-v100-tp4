@@ -201,6 +201,39 @@ void gather_columns_rank0(const Tensor& destination,
                           const std::array<Tensor, kMaximumDevices>& part,
                           const ExecutionContext& ec, const CollectiveComms& comms);
 
+/**
+ * N-device inner-dimension gather, exact (no arithmetic). The gathered axis is `ne[0]`, the
+ * mirror image of `allgather_rows`: each rank contributes one contiguous width block of a
+ * `[W, T]` tensor (`ne[0] == W` the block width, `ne[1] == T` the column count), and the blocks
+ * concatenate, in rank order, to the destination width:
+ *
+ *   destination[r][i, c] = part[s][i - offset(s), c]   where offset(s) = sum_{u<s} part[u].ne[0]
+ *
+ * for every destination rank r and every source rank s, so each device ends up holding the
+ * identical full image. `part[r]` is the width block owned by `ec.dev[r]`: rank 0 owns the
+ * leading rows and higher ranks the following ranges, and the per-rank widths must sum to the
+ * destination width. `destination[r]` and `part[r]` are contiguous, share one dtype, agree on
+ * `ne[1]`, live on `ec.dev[r]`, and must not overlap.
+ *
+ * The caller uses this for row-parallel joins whose per-rank contraction width is not group
+ * aligned (the quantized Vision o_proj at tp > 2): instead of a partial-GEMM all-reduce, the
+ * per-rank attended outputs are gathered into the full-width tensor first and every rank runs the
+ * same full-width GEMM on the replicated weight. The gathered axis is the CONTIGUOUS one, so a
+ * block is placed strided per column (not flat-concatenated as `allgather_rows` does along the
+ * strided axis): `destination[r]` is filled by grouped point-to-point NCCL send/receive through a
+ * stream-ordered staging image, like `gather_columns_rank0` (uneven per-rank blocks allowed). The
+ * transformation is a pure relocation of storage, verified by exact byte comparison. The Op holds
+ * no persistent state; its staging image is a transient `cudaMallocAsync` on each rank's stream and
+ * is freed before return.
+ *
+ * Requires `ec.tp >= 1`, `ec.tp <= kMaximumDevices`, a live `comms` created for the same `tp`.
+ * At `ec.tp == 1` it validates and returns. Consecutive calls sharing the same arguments need no
+ * host synchronization between them.
+ */
+void allgather_columns(const std::array<Tensor, kMaximumDevices>& destination,
+                       const std::array<Tensor, kMaximumDevices>& part, const ExecutionContext& ec,
+                       const CollectiveComms& comms);
+
 // Exact one-way relocation from rank 0 to every peer. `destination[r]` (r >= 1) has the same
 // contiguous dtype and shape as `source`, and lives on `ec.dev[r]`; `destination[0]` is ignored.
 // Uses ncclBroadcast(root 0) and orders rank 0's next overwrite after every peer has consumed the

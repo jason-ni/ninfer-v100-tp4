@@ -24,6 +24,9 @@ prefill_chunk=${NINFER_V100X2_SERVE_PREFILL_CHUNK:-4096}
 kv_dtype=${NINFER_V100X2_SERVE_KV_DTYPE:-int8}
 draft_tokens=${NINFER_V100X2_SERVE_DRAFT_TOKENS:-3}
 max_concurrency=${NINFER_V100X2_SERVE_MAX_CONCURRENCY:-1}
+# Optional public HTTP model alias. Empty keeps the loaded artifact's identity.model_id; a value
+# makes the OpenAI/Responses endpoints advertise and require it (Anthropic accepts any model).
+model_id=${NINFER_V100X2_SERVE_MODEL_ID:-}
 # --chat-template-kwargs defaults to the V100X2 reasoning profile. Override with a JSON object via
 # NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS, or set it to an empty string to disable the flag.
 if [[ -n "${NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS+set}" ]]; then
@@ -46,6 +49,7 @@ Defaults: artifact=${artifact}
            kv-dtype=${kv_dtype} spec=mtp draft-tokens=${draft_tokens} lm-head-draft
            max-concurrency=${max_concurrency}
            chat-template-kwargs=${chat_template_kwargs}
+           model-id=${model_id:-<artifact identity.model_id>}
 
 Environment overrides: NINFER_V100X2_SERVE_EXECUTABLE, NINFER_V100X2_SERVE_ARTIFACT,
 NINFER_V100X2_SERVE_HOST, NINFER_V100X2_SERVE_PORT, NINFER_V100X2_SERVE_TP,
@@ -53,8 +57,8 @@ NINFER_V100X2_SERVE_DEVICES,
 NINFER_V100X2_SERVE_MAX_CONTEXT, NINFER_V100X2_SERVE_KV_CAPACITY,
 NINFER_V100X2_SERVE_PREFILL_CHUNK, NINFER_V100X2_SERVE_KV_DTYPE,
 NINFER_V100X2_SERVE_DRAFT_TOKENS, NINFER_V100X2_SERVE_MAX_CONCURRENCY,
-NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS, NINFER_V100X2_RUNTIME_LIBDIR,
-NINFER_V100X2_CUDA_LIBDIR.
+NINFER_V100X2_SERVE_MODEL_ID, NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS,
+NINFER_V100X2_RUNTIME_LIBDIR, NINFER_V100X2_CUDA_LIBDIR.
 EOF
     exit 0
 fi
@@ -89,6 +93,11 @@ fi
 serve_args=()
 if [[ -n "${chat_template_kwargs}" ]]; then
     serve_args+=(--chat-template-kwargs "${chat_template_kwargs}")
+fi
+# --model-id is passed only when non-empty; empty leaves the artifact's identity.model_id in place.
+# An explicit --model-id in "$@" (below) is appended last, so it overrides this environment value.
+if [[ -n "${model_id}" ]]; then
+    serve_args+=(--model-id "${model_id}")
 fi
 
 exec "${executable}" "${artifact}" \
