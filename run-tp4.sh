@@ -26,6 +26,10 @@ export NINFER_V100X2_SERVE_MAX_CONTEXT=${NINFER_V100X2_SERVE_MAX_CONTEXT:-262144
 # KV pool is provisioned for max-concurrency full sequences, so four lanes share the fixed VRAM
 # budget: auto resolves the largest per-sequence capacity that fits all four.
 export NINFER_V100X2_SERVE_MAX_CONCURRENCY=${NINFER_V100X2_SERVE_MAX_CONCURRENCY:-4}
+# KV cache storage type: int8 (group-64, the acceptance profile) or iq4nl (low-bit growing cache for
+# higher capacity). Override with NINFER_V100X2_SERVE_KV_DTYPE; an explicit --kv-dtype argument still
+# wins because it is appended last.
+export NINFER_V100X2_SERVE_KV_DTYPE=${NINFER_V100X2_SERVE_KV_DTYPE:-int8}
 # Round-trip the model's reasoning in assistant history so prefix reuse resumes at the exact
 # generated frontier (append_frontier) instead of the conservative turn-closure checkpoint.
 export NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS=${NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS:-'{"preserve_thinking": true, "reasoning_effort":"medium"}'}
