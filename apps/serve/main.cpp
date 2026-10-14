@@ -36,6 +36,16 @@ std::string format_bytes(std::size_t bytes) {
     return out.str();
 }
 
+// The `--kv-dtype` vocabulary, so the startup line names the storage the engine actually uses.
+std::string format_kv_dtype(ninfer::KvCacheStorage storage) {
+    switch (storage) {
+        case ninfer::KvCacheStorage::BFloat16: return "bf16";
+        case ninfer::KvCacheStorage::Int8Group64: return "int8";
+        case ninfer::KvCacheStorage::Int4NLGroup32: return "iq4nl";
+    }
+    return "unknown";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -75,6 +85,7 @@ int main(int argc, char** argv) {
         capacity << "KV capacity "
                  << (memory.kv_capacity_mode == ninfer::KvCapacityMode::Automatic ? "auto"
                                                                                   : "explicit")
+                 << " kv-dtype=" << format_kv_dtype(options.kv_cache)
                  << " resolved=" << memory.kv_capacity
                  << " tokens pages=" << memory.kv_capacity_page_groups << '/'
                  << memory.kv_capacity_max_page_groups
