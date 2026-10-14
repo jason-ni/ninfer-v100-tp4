@@ -934,6 +934,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             : 0U;
     request.lifecycle = Lifecycle::Empty;
     sequence.retained = false;
+    // Whether this reuse keeps the resident KV allocation (and hence its prior cache-owned leading
+    // pages) for the next request on this lane. Only the AppendAtFrontier and rewrite-checkpoint
+    // restore branches do: FullReset and BlockSnapshot rebuild the allocation fresh.
+    bool keep_resident_kv = false;
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
             sequence.kv.reset();
@@ -960,11 +964,12 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                        sequence.dflash_context_frontier != base) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");
             }
-            trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
-            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
-                                           request_plan.backend_kv_page_entitlement);
-            sequence.text_kv_valid = base;
-            sequence.ledger.resize(base);
+trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
+                               request_plan.backend_kv_page_entitlement);
+sequence.text_kv_valid = base;
+sequence.ledger.resize(base);
+keep_resident_kv = true;
         } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
             if (!sequence.kv || sequence.text_kv_valid < base) {
                 throw std::logic_error("resident rewrite checkpoint has no complete KV allocation");
@@ -1188,6 +1193,22 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.prefix_capture      = true;
             sequence.prefix_matched_blocks = request_plan.block_path_blocks;
             sequence.prefix_pinned_nodes = request_plan.block_path;
+            // A reusable reuse that keeps the resident KV allocation already handed its leading blocks'
+            // pages to the cache on this lane's previous life (cache-owned). Baseline the capture state from
+            // that retained committed-node path -- truncated to the longest still-live prefix, since
+            // concurrent eviction pressure can erase trailing nodes once the prior turn unpinned them -- so
+            // the promotion resumes at the watermark instead of re-promoting already-cache-owned leading
+            // pages. Fresh allocations (FullReset / BlockSnapshot) have an empty block_path and no retained
+            // baseline, so they fall through to the root-only baseline below.
+            if (sequence.prefix_pinned_nodes.empty() && keep_resident_kv) {
+                sequence.prefix_pinned_nodes.clear();
+                sequence.prefix_pinned_nodes.push_back(prefix_index->root());
+                for (std::size_t i = 1; i < sequence.prefix_retained_commit_nodes.size(); ++i) {
+                    const ninfer::prefix_cache::NodeId nid = sequence.prefix_retained_commit_nodes[i];
+                    if (prefix_index->node(nid) == nullptr) { break; } // chain erased here
+                    sequence.prefix_pinned_nodes.push_back(nid);
+                }
+            }
             if (sequence.prefix_pinned_nodes.empty()) {
                 sequence.prefix_pinned_nodes.push_back(prefix_index->root());
             }
@@ -1600,6 +1621,11 @@ void ProgramImplCore::finalize_prefix_cache_state(SequenceState& sequence) noexc
         prefix_index->unpin_node(id);
     }
     // Reset the per-request capture state so the next request starts clean.
+    // If this lane keeps its KV allocation past retention, the committed-block node path must
+    // SURVIVE so a later reuse that preserves the resident KV can re-seed prefix_pinned_nodes at the
+    // promotion watermark. capture resumes there instead of re-promoting already cache-owned leading
+    // pages. A non-retained lane (abort/clear) resets prefix_retained_commit_nodes in clear_lane.
+    sequence.prefix_retained_commit_nodes = sequence.prefix_pinned_nodes;
     sequence.prefix_pinned_nodes.clear();
     sequence.prefix_tap_positions.clear();
     sequence.prefix_tap_slots.clear();
@@ -1624,6 +1650,7 @@ void ProgramImplCore::finalize_prefix_cache_state(SequenceState& sequence) noexc
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
     finalize_prefix_cache_state(sequence);
+    sequence.prefix_retained_commit_nodes.clear();
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
     sequence.execution_frontier = 0;
@@ -2811,15 +2838,24 @@ void ProgramImplCore::capture_prefix_after_chunk(SequenceState& sequence) {
         }
         if (adopted && sequence.kv) {
             // The index took this page: fold it into the cache-owned set on every rank (lockstep
-            // pools) so release() never returns it.
-            sequence.kv->text.promote_page_at(b);
-            if (sequence.kv->backend) { sequence.kv->backend->promote_page_at(b); }
+            // pools) so release() never returns it. Skip any pool whose `b`-th page is already
+            // cache-owned -- this lane promoted it earlier and the entitlement was already folded
+            // into the cache's ownership, so re-promoting would double-decrement and throw.
+            // Happens when a reusable reuse re-baselines its capture path short of this lane's prior
+            // promotion watermark (a committed node having been evicted by a concurrent client
+            // between the two turns).
+            if (!sequence.kv->text.is_cache_owned(b)) { sequence.kv->text.promote_page_at(b); }
+            if (sequence.kv->backend && !sequence.kv->backend->is_cache_owned(b)) {
+                sequence.kv->backend->promote_page_at(b);
+            }
             for (int rank = 1; rank < tp; ++rank) {
                 const auto slot = static_cast<std::size_t>(rank);
-                if (sequence.kv->text_peer[slot]) {
+                if (sequence.kv->text_peer[slot] &&
+                    !sequence.kv->text_peer[slot]->is_cache_owned(b)) {
                     sequence.kv->text_peer[slot]->promote_page_at(b);
                 }
-                if (sequence.kv->backend_peer[slot]) {
+                if (sequence.kv->backend_peer[slot] &&
+                    !sequence.kv->backend_peer[slot]->is_cache_owned(b)) {
                     sequence.kv->backend_peer[slot]->promote_page_at(b);
                 }
             }

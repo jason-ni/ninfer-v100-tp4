@@ -209,6 +209,12 @@ struct SequenceState {
     ninfer::prefix_cache::SnapshotId prefix_snapshot =
         ninfer::prefix_cache::kInvalidSnapshot;
     bool prefix_borrowed = false;
+    // Committed-block node path ([root, node0, ...]) left behind when a lane TERMINATES while it had
+    // promoted (cache-owned) pages but its KV allocation survives retention. Reusages that keep that
+    // resident KV (AppendAtFrontier / rewrite-checkpoint restore) must seed prefix_pinned_nodes from
+    // this so capture resumes at the promotion watermark instead of re-promoting already-cache-owned
+    // leading pages. Cleared with the allocation on abort/clear_lane.
+    std::vector<ninfer::prefix_cache::NodeId> prefix_retained_commit_nodes;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine

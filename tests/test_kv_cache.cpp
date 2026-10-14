@@ -344,6 +344,23 @@ int main() {
     }
     promoter.promote_page_at(2);
     promoter.promote_page_at(3);
+    // Accessor backing the capture loop's skip guard: a borrowed/promoted index reports cache-owned,
+    // and re-promoting it must be rejected so capture can skip pages it already handed to the cache.
+    if (!promoter.is_cache_owned(0) || !promoter.is_cache_owned(1) || !promoter.is_cache_owned(2) ||
+        !promoter.is_cache_owned(3)) {
+        ++failures;
+        std::cerr << "is_cache_owned did not report borrowed/promoted pages\n";
+    }
+    bool double_promote_rejected = false;
+    try {
+        promoter.promote_page_at(2);
+    } catch (const std::invalid_argument&) {
+        double_promote_rejected = true;
+    }
+    if (!double_promote_rejected) {
+        ++failures;
+        std::cerr << "Re-promoting an already promoted (cache-owned) page was not rejected\n";
+    }
     failures += expect_size(promoter.borrowed_page_count(), 4, "promoted pages joined the prefix");
     failures += expect_size(promoter.owned_page_count(), 0, "promotion left no owned pages");
     failures += expect_size(cache_pool.cached_pages(), 4, "promotion counted cache pages");

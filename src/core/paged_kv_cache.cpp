@@ -487,6 +487,10 @@ bool PagedKVAllocation::belongs_to(const PagedKVPool& pool) const noexcept {
     return pool_ == &pool;
 }
 
+bool PagedKVAllocation::is_cache_owned(std::uint32_t page_index) const noexcept {
+    return page_index < cache_owned_.size() && cache_owned_[page_index];
+}
+
 void PagedKVAllocation::borrow_prefix(std::span<const std::int32_t> page_ids) {
     if (!valid()) {
         throw std::logic_error("Cannot borrow prefix pages into an empty Paged KV allocation");

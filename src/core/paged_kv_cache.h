@@ -192,6 +192,11 @@ public:
     [[nodiscard]] std::span<const std::int32_t> page_ids() const noexcept;
     [[nodiscard]] bool belongs_to(const PagedKVPool& pool) const noexcept;
 
+    // True when page `page_index` is already in the cache-owned set (borrowed from a reused prefix or
+    // promoted by an earlier committed block). Lets a caller skip re-promoting a page whose
+    // entitlement has already been folded into the cache's ownership instead of double-decrementing.
+    [[nodiscard]] bool is_cache_owned(std::uint32_t page_index) const noexcept;
+
     // Prepends cache-owned physical pages borrowed from the prefix cache, before any page of this
     // allocation is materialized. Borrowed pages are counted in mapped_page_count() and published
     // in the block table, but the allocation never returns them to the pool and page_entitlement()
