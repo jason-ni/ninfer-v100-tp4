@@ -59,11 +59,11 @@ done
 # Defaults: 262144 (text, native) and 120000 (--vision), with an explicit capacity so the auto
 # headroom gate never applies. A lighter artifact fits more, a heavier one less; INT8
 # (NINFER_V100X2_SERVE_KV_DTYPE=int8) lowers the ceiling because its KV pool is ~2x larger.
-if [[ "${vision_requested}" -eq 1 ]]; then
-    context_default=120000
-else
-    context_default=262144
-fi
+#if [[ "${vision_requested}" -eq 1 ]]; then
+#    context_default=120000
+#else
+context_default=262144
+#fi
 export NINFER_V100X2_SERVE_MAX_CONTEXT=${NINFER_V100X2_SERVE_MAX_CONTEXT:-${context_default}}
 # Explicit capacity by default (mirrors --max-context) to avoid --kv-capacity auto's 1 GiB gate.
 export NINFER_V100X2_SERVE_KV_CAPACITY=${NINFER_V100X2_SERVE_KV_CAPACITY:-${NINFER_V100X2_SERVE_MAX_CONTEXT}}

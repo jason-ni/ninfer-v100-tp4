@@ -81,6 +81,7 @@ EOF
 }
 
 vision_requested=0
+max_context=262144
 raw_log_path=${NINFER_RAW_OUTPUT_LOG:-}
 forwarded_args=()
 while [[ $# -gt 0 ]]; do
@@ -89,6 +90,22 @@ while [[ $# -gt 0 ]]; do
         --vision)
             vision_requested=1
             forwarded_args+=("${arg}")
+            shift
+            ;;
+        --max-context)
+            if [[ $# -lt 2 ]]; then
+                echo "run-tp4.sh: --max-context requires a value" >&2
+                exit 2
+            fi
+            max_context=$2   
+            shift 2
+            ;;
+        --max-context=*)
+            max_context=${arg#--max-context=}
+            if [[ -z "${max_context}" ]]; then
+                echo "run-tp4.sh: --max-context requires a value" >&2
+                exit 2
+            fi
             shift
             ;;
         --kv-dtype)
@@ -128,6 +145,7 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+export NINFER_V100X2_SERVE_MAX_CONTEXT=${NINFER_V100X2_SERVE_MAX_CONTEXT:-${max_context}}
 export NINFER_V100X2_SERVE_KV_DTYPE="${kv_dtype}"
 if [[ -n "${raw_log_path}" ]]; then
     mkdir -p -- "$(dirname -- "${raw_log_path}")"
