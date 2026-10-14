@@ -4,6 +4,9 @@
 # starts the HTTP server at tensor-parallel width 4 through tools/v100/ninfer-v100x2-serve.sh.
 # See docs/maintainer/tp4-design.md.
 #
+# --kv-dtype bf16|int8|iq4nl selects the KV cache storage type and is consumed here (exported as
+# NINFER_V100X2_SERVE_KV_DTYPE); it overrides the environment value.
+#
 # --raw-log enables the engine's temporary raw-output capture (NINFER_RAW_OUTPUT_LOG) and is
 # consumed here rather than forwarded to ninfer-serve. Optional explicit destination:
 #   ./run-tp4.sh --raw-log              # -> profiles/raw/raw-output.jsonl
@@ -26,10 +29,10 @@ export NINFER_V100X2_SERVE_MAX_CONTEXT=${NINFER_V100X2_SERVE_MAX_CONTEXT:-262144
 # KV pool is provisioned for max-concurrency full sequences, so four lanes share the fixed VRAM
 # budget: auto resolves the largest per-sequence capacity that fits all four.
 export NINFER_V100X2_SERVE_MAX_CONCURRENCY=${NINFER_V100X2_SERVE_MAX_CONCURRENCY:-4}
-# KV cache storage type: int8 (group-64, the acceptance profile) or iq4nl (low-bit growing cache for
-# higher capacity). Override with NINFER_V100X2_SERVE_KV_DTYPE; an explicit --kv-dtype argument still
-# wins because it is appended last.
-export NINFER_V100X2_SERVE_KV_DTYPE=${NINFER_V100X2_SERVE_KV_DTYPE:-int8}
+# KV cache storage type: int8 (group-64, the acceptance profile, default) or iq4nl (low-bit growing
+# cache for higher capacity). Select with the launcher --kv-dtype option (see below) or the
+# NINFER_V100X2_SERVE_KV_DTYPE environment variable; the option overrides the environment.
+kv_dtype=${NINFER_V100X2_SERVE_KV_DTYPE:-int8}
 # Round-trip the model's reasoning in assistant history so prefix reuse resumes at the exact
 # generated frontier (append_frontier) instead of the conservative turn-closure checkpoint.
 export NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS=${NINFER_V100X2_SERVE_CHAT_TEMPLATE_KWARGS:-'{"preserve_thinking": true, "reasoning_effort":"medium"}'}
@@ -52,32 +55,80 @@ host_cache_mib=${NINFER_V100X2_SERVE_HOST_CACHE_MIB:-28192}
 # pin with NINFER_V100X2_SERVE_PRESENCE_PENALTY.
 presence_penalty=${NINFER_V100X2_SERVE_PRESENCE_PENALTY:-1.0}
 
-# Split the launcher-only --raw-log flag from the arguments forwarded to ninfer-serve. A bare
-# --raw-log uses the default destination; --raw-log=PATH overrides it. NINFER_RAW_OUTPUT_LOG set in
-# the environment is preserved unless the flag is given.
+# Split the launcher-only flags (--kv-dtype, --raw-log, --vision) from the arguments forwarded to
+# ninfer-serve. --kv-dtype overrides NINFER_V100X2_SERVE_KV_DTYPE; a bare --raw-log uses the default
+# destination and --raw-log=PATH overrides it; NINFER_RAW_OUTPUT_LOG set in the environment is
+# preserved unless --raw-log is given.
+print_help() {
+    cat <<EOF
+usage: ./run-tp4.sh [launcher options] [ninfer-serve options...]
+
+V100X4 profile: TP4 (devices 0,1,2,3), max-context 262144, max-concurrency 4, hybrid prefix cache
+with the pinned host tier, and MTP3. Every other argument is forwarded to ninfer-serve.
+
+Launcher options:
+  --vision                 enable media/Vision and default the artifact to the Coder390 package
+  --kv-dtype bf16|int8|iq4nl
+                           KV cache storage type (default int8; overrides the environment)
+  --raw-log[=PATH]         capture the engine's raw output (default profiles/raw/raw-output.jsonl)
+  -h, --help               show this help
+
+Environment: NINFER_V100X2_SERVE_KV_DTYPE, NINFER_V100X2_SERVE_MODEL_ID,
+NINFER_V100X2_SERVE_MAX_CONTEXT, NINFER_V100X2_SERVE_HOST_CACHE_MIB,
+NINFER_V100X2_SERVE_PRESENCE_PENALTY, CUDA_VISIBLE_DEVICES, NINFER_V100X2_SERVE_ARTIFACT.
+Run tools/v100/ninfer-v100x2-serve.sh --help for the full ninfer-serve option set.
+EOF
+}
+
 vision_requested=0
 raw_log_path=${NINFER_RAW_OUTPUT_LOG:-}
 forwarded_args=()
-for arg in "$@"; do
+while [[ $# -gt 0 ]]; do
+    arg=$1
     case "${arg}" in
         --vision)
             vision_requested=1
             forwarded_args+=("${arg}")
+            shift
+            ;;
+        --kv-dtype)
+            if [[ $# -lt 2 ]]; then
+                echo "run-tp4.sh: --kv-dtype requires a value (bf16|int8|iq4nl)" >&2
+                exit 2
+            fi
+            kv_dtype=$2
+            shift 2
+            ;;
+        --kv-dtype=*)
+            kv_dtype=${arg#--kv-dtype=}
+            if [[ -z "${kv_dtype}" ]]; then
+                echo "run-tp4.sh: --kv-dtype requires a value (bf16|int8|iq4nl)" >&2
+                exit 2
+            fi
+            shift
             ;;
         --raw-log)
             raw_log_path="${NINFER_V100X2_RAW_LOG:-${script_dir}/profiles/raw/raw-output.jsonl}"
+            shift
             ;;
         --raw-log=*)
             raw_log_path="${arg#--raw-log=}"
             if [[ -z "${raw_log_path}" ]]; then
                 raw_log_path="${NINFER_V100X2_RAW_LOG:-${script_dir}/profiles/raw/raw-output.jsonl}"
             fi
+            shift
+            ;;
+        -h|--help)
+            print_help
+            exit 0
             ;;
         *)
             forwarded_args+=("${arg}")
+            shift
             ;;
     esac
 done
+export NINFER_V100X2_SERVE_KV_DTYPE="${kv_dtype}"
 if [[ -n "${raw_log_path}" ]]; then
     mkdir -p -- "$(dirname -- "${raw_log_path}")"
     export NINFER_RAW_OUTPUT_LOG="${raw_log_path}"
