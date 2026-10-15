@@ -70,9 +70,9 @@ export NINFER_V100X2_SERVE_KV_CAPACITY=${NINFER_V100X2_SERVE_KV_CAPACITY:-${NINF
 
 # Prefer the freshly built V100X2 server, which carries the IQ4_NL-G32 engine support, over the
 # manually deployed dist/ copy. Override with NINFER_V100X2_SERVE_EXECUTABLE.
-if [[ -z "${NINFER_V100X2_SERVE_EXECUTABLE:-}" && -x "${script_dir}/build-v100/apps/ninfer-serve" ]]; then
-    export NINFER_V100X2_SERVE_EXECUTABLE="${script_dir}/build-v100/apps/ninfer-serve"
-fi
+#if [[ -z "${NINFER_V100X2_SERVE_EXECUTABLE:-}" && -x "${script_dir}/build-v100/apps/ninfer-serve" ]]; then
+#    export NINFER_V100X2_SERVE_EXECUTABLE="${script_dir}/build-v100/apps/ninfer-serve"
+#fi
 
 # Pinned host-RAM tier for the hybrid prefix cache, matching the TP4 launcher's default: evicted KV
 # blocks/snapshots are demoted to pinned host RAM instead of dropped, so an evicted conversation can
