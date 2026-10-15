@@ -156,6 +156,12 @@ void HttpServer::log_request_rejected(const RequestRejectionLogContext& context)
 void HttpServer::log_request_done(const RequestLogContext& context,
                                   const GenerationOutcome& outcome) {
     log_line(format_request_done(context, outcome));
+    if (options_.prefix_debug) {
+        const std::string verbose = format_prefix_admission_verbose(
+            context.id, outcome.metrics.prefix_admission, outcome.metrics.prefix_reuse_path,
+            outcome.metrics.prefix_reuse_reason);
+        if (!verbose.empty()) { log_line(verbose); }
+    }
     request_jsonl_.write_request_done(context, outcome);
 }
 

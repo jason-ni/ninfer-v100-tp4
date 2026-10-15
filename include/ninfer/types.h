@@ -488,6 +488,68 @@ struct PrefixDivergence {
     std::array<std::int32_t, kPrefixDivergenceWindow> resident_tokens{};
 };
 
+// Why the content-addressed block walk stopped short of the prompt's eligible blocks.
+enum class PrefixStallCause : std::uint8_t {
+    NotRun = 0, // match not attempted (hybrid cache off, no block hashes, or prompt < 2 blocks)
+    Completed,  // every eligible block matched; the miss is at the snapshot layer, not the walk
+    NoChild,    // the parent has no live child with this block's chained hash
+    HashCollision, // a same-hash child existed but its stored tokens or media extra differ
+};
+
+// Why a found best candidate was rejected when it made it past PrefixIndex::match.
+enum class PrefixSelectionVeto : std::uint8_t {
+    None = 0,       // no candidate survived (or hybrid layer produced nothing)
+    SnapshotGone,   // the chosen snapshot vanished or changed between match and lookup
+    FrontierInvalid,// frontier regressed to 0 or beyond prompt-1
+    TailNonZero,    // only block-aligned (tail_len == 0) snapshots are consumable
+};
+
+// One snapshot seen on the matched block path and the gate that decided its fate (0 = eligible).
+struct PrefixDiagCandidate {
+    std::uint32_t frontier        = 0;
+    std::uint32_t anchor_depth    = 0; // block index of the anchor node
+    std::uint8_t  kind            = 0; // SnapshotKind code; opaque to consumers
+    bool          device_resident = false;
+    bool          host_restorable = false;
+    std::uint8_t  reject          = 0; // 1 superseded/gone, 2 frontier past prompt, 3 tail mismatch,
+                                       // 4 no usable storage on the path, 5 outranked by the best
+};
+
+inline constexpr std::size_t kPrefixDiagCandidates = 8;
+
+// Per-request explanation of the prefix-reuse decision. Filled once at plan time; carried to the
+// done log alongside PrefixReusePath/PrefixReuseReason, which state WHAT happened, while this
+// carries the input facts and the hybrid-cache internals that explain WHY.
+struct PrefixAdmissionDiagnostics {
+    // Input facts, always filled.
+    std::uint32_t prompt_tokens          = 0;
+    std::uint32_t eligible_blocks        = 0; // floor((n-1)/64) full blocks matchable from the root
+    bool allow_prefix_reuse              = true;
+    bool identity_reusable               = true;
+    bool hybrid_enabled                  = false;
+    bool retained_sequence               = false;
+    std::uint32_t retained_frontier      = 0;
+    bool mtp_backend                     = false;
+    std::uint32_t mtp_kv_valid           = 0;
+    bool mtp_cache_present               = false;
+    bool tail_hidden_valid               = false;
+    std::uint32_t snapshot_slots_total   = 0;
+    std::uint32_t snapshot_slots_used    = 0;
+    std::uint32_t max_new_taps           = 0;
+
+    // Hybrid match section; zero when PrefixStallCause::NotRun.
+    PrefixStallCause walk_cause          = PrefixStallCause::NotRun;
+    std::uint32_t matched_blocks         = 0;
+    std::uint32_t stall_sibling_count    = 0; // live children under the stall parent (0 => pristine)
+    PrefixSelectionVeto selection_veto   = PrefixSelectionVeto::None;
+    std::uint32_t candidates_total       = 0;
+    std::array<PrefixDiagCandidate, kPrefixDiagCandidates> candidates{}; // deepest frontier first
+    std::uint32_t candidates_shown   = 0; // filled entries in candidates[]
+
+    // Outcome; reuse_base is the resumed-without-recompute token count.
+    std::uint32_t reuse_base             = 0;
+};
+
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
@@ -499,6 +561,7 @@ struct GenerationResult {
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     PrefixReuseReason prefix_reuse_reason = PrefixReuseReason::None;
     PrefixDivergence prefix_divergence;
+    PrefixAdmissionDiagnostics prefix_admission;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };
@@ -623,12 +686,19 @@ struct HostCacheMetrics {
 };
 
 // Hybrid prefix cache residency. Device snapshot slots are the on-device state images; the host
-// tier carries demoted blocks and state images.
+// tier carries demoted blocks and state images. The cumulative counters record lifetime eviction
+// behavior on rank 0 so "the pool had room" stops being the only explanation available.
 struct PrefixCacheMetrics {
     bool enabled                             = false;
     std::uint32_t device_snapshot_slots      = 0;
     std::uint32_t device_snapshot_slots_used = 0;
     HostCacheMetrics host;
+    // Cumulative, process-lifetime, rank 0.
+    std::uint64_t device_blocks_demoted_total   = 0; // lossless device -> host demotions
+    std::uint64_t subtree_erased_total          = 0; // lossy subtree erasures (devices w/o host copy)
+    std::uint64_t branch_gc_removed_blocks_total = 0; // dead-branch nodes removed by demand-aware GC
+    std::uint64_t snapshots_deleted_by_eviction_total = 0;
+    std::uint64_t retained_lane_evictions_total = 0;
 };
 
 // Live resource metrics for the serving /metrics endpoint: a boundary-consistent snapshot. This is

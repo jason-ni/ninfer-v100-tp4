@@ -714,7 +714,7 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
     }
     const SequenceState& sequence = sequences[lane];
     // Pool invariant: free = page_group_count - entitled - cached. Cache pages held by LRU-linked
-    // nodes are reclaimable through evict_device_lru(), so they count as capacity here.
+    // nodes are reclaimable through evict_one_prefix_node(), so they count as capacity here.
     const std::array<std::uint32_t, ninfer::prefix_cache::kMaxPools> evictable =
         prefix_index != nullptr ? prefix_index->evictable_page_counts()
                                 : std::array<std::uint32_t, ninfer::prefix_cache::kMaxPools>{0U, 0U};
@@ -1293,6 +1293,7 @@ keep_resident_kv = true;
             .mtp_bridge                 = request_plan.mtp_bridge,
             .reuse_reason               = request_plan.reuse_reason,
             .reuse_divergence           = request_plan.reuse_divergence,
+            .reuse_diag                 = request_plan.reuse_diag,
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
@@ -1583,7 +1584,31 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
+    ++retained_lane_evictions_total_;
+    std::fprintf(stderr,
+                 "[prefix-evict] retaining lane %u evicted to make admission room "
+                 "(frontier=%u); its committed prefix remains reachable in the content-addressed "
+                 "cache unless evicted there\n",
+                 lane, sequences[lane].execution_frontier);
     clear_lane(sequences[lane], requests[lane]);
+}
+
+void ProgramImplCore::set_eviction_demand(std::span<const std::uint32_t> demand_nodes) noexcept {
+    eviction_demand_.assign(demand_nodes.begin(), demand_nodes.end());
+}
+
+ninfer::prefix_cache::NodeId ProgramImplCore::evict_one_prefix_node() {
+    if (prefix_index == nullptr) { return ninfer::prefix_cache::kInvalidNode; }
+    // Demand = the admitted plan's matched chain plus every retained lane's committed chain
+    // (their prefixes must survive so the next request on those lanes can reuse them). The demand
+    // persists across the whole admission reservation burst (multiple one-page units).
+    std::vector<ninfer::prefix_cache::NodeId> demand = eviction_demand_;
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (!sequences[lane].retained) { continue; }
+        demand.insert(demand.end(), sequences[lane].prefix_retained_commit_nodes.begin(),
+                      sequences[lane].prefix_retained_commit_nodes.end());
+    }
+    return prefix_index->evict_node(demand);
 }
 
 GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
@@ -1720,8 +1745,7 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
                 std::span<const PagedKVReservation>(reservations.data(), count));
             break;
         } catch (const std::bad_alloc&) {
-            if (prefix_index == nullptr ||
-                prefix_index->evict_device_lru() == ninfer::prefix_cache::kInvalidNode) {
+            if (evict_one_prefix_node() == ninfer::prefix_cache::kInvalidNode) {
                 throw;
             }
         }
@@ -1771,8 +1795,7 @@ void ProgramImplCore::resize_paged_kv_with_eviction(std::span<PagedKVResize> cha
             resize_paged_kv_bundle(changes);
             return;
         } catch (const std::bad_alloc&) {
-            if (prefix_index == nullptr ||
-                prefix_index->evict_device_lru() == ninfer::prefix_cache::kInvalidNode) {
+            if (evict_one_prefix_node() == ninfer::prefix_cache::kInvalidNode) {
                 throw;
             }
         }
@@ -2998,8 +3021,7 @@ ninfer::prefix_cache::PoolPages ProgramImplCore::acquire_cache_bundle() {
         // Evict device-resident cache nodes until the acquire fits. Each eviction returns one
         // page per pool through the sink; stop when nothing is evictable and rethrow.
         for (;;) {
-            if (prefix_index == nullptr ||
-                prefix_index->evict_device_lru() == ninfer::prefix_cache::kInvalidNode) {
+            if (evict_one_prefix_node() == ninfer::prefix_cache::kInvalidNode) {
                 throw;
             }
             try {
@@ -3272,7 +3294,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                                         .reused_prompt_tokens = staged.base,
                                         .prefix_reuse_path    = staged.reuse,
                                         .prefix_reuse_reason  = staged.reuse_reason,
-                                        .prefix_divergence    = staged.reuse_divergence};
+                                        .prefix_divergence    = staged.reuse_divergence,
+                                        .prefix_admission     = staged.reuse_diag};
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
@@ -4632,7 +4655,13 @@ MetricsSnapshot ProgramImplCore::metrics() const noexcept {
         out.prefix_cache.device_snapshot_slots = prefix_index->device_snapshot_slots();
         out.prefix_cache.device_snapshot_slots_used =
             prefix_index->device_snapshot_slots() - prefix_index->device_snapshot_slots_free();
+        const auto counters = prefix_index->eviction_counters();
+        out.prefix_cache.device_blocks_demoted_total   = counters.demoted;
+        out.prefix_cache.subtree_erased_total          = counters.subtree_erased;
+        out.prefix_cache.branch_gc_removed_blocks_total = counters.branch_gc_removed_blocks;
+        out.prefix_cache.snapshots_deleted_by_eviction_total = counters.snapshots_deleted;
     }
+    out.prefix_cache.retained_lane_evictions_total = retained_lane_evictions_total_;
     if (prefix_host_pool != nullptr) {
         HostCacheMetrics& host = out.prefix_cache.host;
         host.enabled           = prefix_host_pool->enabled();

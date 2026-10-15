@@ -200,6 +200,28 @@ struct PrefixMatch {
     // (every node has a device or host copy), or invalid.
     SnapshotId best_host = kInvalidSnapshot;
     std::uint32_t best_host_frontier = 0;
+
+    // --- D1b: miss explanation, filled in the same walk (cheap: bounded per-snapshot work) ---
+    // What happened to the block walk. Completed means every eligible block matched; the miss
+    // (if any) is then at the snapshot layer. NotRun means no walk executed.
+    ninfer::PrefixStallCause walk_cause = ninfer::PrefixStallCause::NotRun;
+    // Live children under the stall parent: 0 => nothing was ever committed below (never cached
+    // or fully evicted); >0 with HashCollision => history genuinely branched here.
+    std::uint32_t stall_sibling_count = 0;
+    // Full count of snapshots seen on the path; `diagnostics` holds the deepest 8 of them.
+    std::uint32_t diagnostics_total = 0;
+    // Every snapshot seen on the matched path and the gate that decided it, sorted by descending
+    // frontier. reject codes: 1 superseded/gone, 2 frontier past prompt, 3 tail mismatch,
+    // 4 no usable storage on the path, 5 outranked by the best.
+    std::vector<ninfer::PrefixDiagCandidate> diagnostics;
+};
+
+// Cumulative lifetime victim statistics of the device-tier eviction policy (see evict_node).
+struct EvictionCounters {
+    std::uint64_t demoted                  = 0; // lossless device -> host demotions
+    std::uint64_t subtree_erased           = 0; // lossy erasures outside the dead-branch GC tier
+    std::uint64_t branch_gc_removed_blocks = 0; // dead-branch nodes removed by demand-aware GC
+    std::uint64_t snapshots_deleted        = 0; // live snapshots lost by an eviction
 };
 
 // Result of begin_host_write: the node and the host slab that will receive its KV data. The
@@ -294,14 +316,26 @@ public:
     void pin_snapshot(SnapshotId id) noexcept;
     void unpin_snapshot(SnapshotId id) noexcept;
 
-    // Evict one unpinned device-resident node from the LRU head (backed first). In this device-only
-    // cut the node loses its last copy, so its subtree and its snapshots are deleted. Returns the
-    // evicted node, or kInvalidNode when nothing is evictable.
-    NodeId evict_device_lru();
+    // Evict one unpinned device-resident node from the LRU set using the demand-aware policy:
+    // tier 1 demotes the deepest non-demand backed node (lossless; keeps warm shared prefixes
+    // device-resident by shedding the tails), tier 2 erases a whole dead branch (the shallowest
+    // non-demand branch root that anchors no live non-superseded snapshot and hides no demand or
+    // pinned data below it), tier 3 only then trims onto the demand set or the unbacked remainder,
+    // deepest leaf first, demote-preferred. `protected_nodes` carries the incoming work's demand
+    // (matched block paths + retained commit paths); their ANCESTORS are protected implicitly.
+    // Returns the topmost evicted node, or kInvalidNode when nothing is evictable.
+    [[nodiscard]] NodeId evict_node(std::span<const NodeId> protected_nodes);
+
+    [[nodiscard]] EvictionCounters eviction_counters() const noexcept {
+        return {demoted_total_, subtree_erased_total_, branch_gc_removed_blocks_total_,
+                snapshots_deleted_by_eviction_total_};
+    }
 
     // Delete `node` and its subtree, releasing pages and deleting anchored snapshots. Pinned nodes
-    // are left untouched.
-    void erase_subtree(NodeId node);
+    // are left untouched. With non-null outputs, the deleted snapshot count and removed node count
+    // are reported back (eviction accounting).
+    void erase_subtree(NodeId node, std::uint32_t* deleted_snapshots = nullptr,
+                       std::uint32_t* removed_nodes = nullptr);
 
     // Set the host slab pool for M2 write-through/restore. Must be called before any
     // commit_block or match that involves host residency.
@@ -351,7 +385,7 @@ public:
     // ok=false returns the slot to the free list.
     void finish_snapshot_restore(SnapshotId id, bool ok) noexcept;
 
-    // Pages the admission check may reclaim by calling evict_device_lru(): one entry per pool,
+    // Pages the admission check may reclaim by calling evict_node(): one entry per pool,
     // counting LRU-linked nodes that own a page in that pool. Eviction returns exactly these pages
     // to the pools (backed nodes demote, unbacked nodes erase), so the counts are a sound credit.
     [[nodiscard]] std::array<std::uint32_t, kMaxPools> evictable_page_counts() const noexcept;
@@ -413,6 +447,14 @@ private:
 
     std::uint64_t tick_            = 0;
     std::uint32_t evictable_pages_ = 0;
+
+    // Demand-aware eviction (evict_node) bookkeeping. Scratch vectors are resized on demand.
+    std::uint64_t demoted_total_                 = 0;
+    std::uint64_t subtree_erased_total_          = 0;
+    std::uint64_t branch_gc_removed_blocks_total_ = 0;
+    std::uint64_t snapshots_deleted_by_eviction_total_ = 0;
+    std::vector<std::uint8_t> evict_protected_;  // protected + ancestors closure
+    std::vector<std::uint8_t> evict_demand_under_;// demand anywhere in the subtree
 };
 
 } // namespace ninfer::prefix_cache

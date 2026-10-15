@@ -425,6 +425,115 @@ int main() {
     input.close();
     std::filesystem::remove(log_path);
 
+    // Prefix-admission explanation: the compact line must be silent on a full hit and name the
+    // deciding gate on every recompute path.
+    auto admission_base = [] {
+        ninfer::PrefixAdmissionDiagnostics diag;
+        diag.prompt_tokens         = 1664;
+        diag.eligible_blocks       = 26;
+        diag.hybrid_enabled        = true;
+        diag.snapshot_slots_total  = 5;
+        diag.snapshot_slots_used   = 5;
+        diag.max_new_taps          = 2;
+        return diag;
+    };
+    bool admission_ok = true;
+    {
+        const auto full_hit = [&](std::uint32_t base) {
+            auto diag = admission_base();
+            diag.reuse_base = base;
+            return format_prefix_admission_compact(diag, ninfer::PrefixReusePath::BlockSnapshot,
+                                                   ninfer::PrefixReuseReason::ReusedBlockSnapshot);
+        };
+        admission_ok = admission_ok && full_hit(1664).empty() && full_hit(99999).empty();
+        failures += check(admission_ok, "full-hit admission record is not silent");
+    }
+    {
+        auto diag = admission_base();
+        diag.allow_prefix_reuse = false;
+        const std::string compact =
+            format_prefix_admission_compact(diag, ninfer::PrefixReusePath::FullReset,
+                                            ninfer::PrefixReuseReason::ReuseDisabled);
+        failures += check(compact.find("gates(allow=0,reusable=1)") != std::string::npos,
+                          "gate-off admission record lost the flag facts");
+    }
+    {
+        auto diag = admission_base();
+        diag.hybrid_enabled = false;
+        const std::string compact =
+            format_prefix_admission_compact(diag, ninfer::PrefixReusePath::FullReset,
+                                            ninfer::PrefixReuseReason::NoRetainedSequence);
+        failures += check(compact.find("hybrid_off") != std::string::npos &&
+                              compact.find("full_reset") != std::string::npos,
+                          "legacy-only admission record lost the path verdict");
+    }
+    {
+        auto diag = admission_base();
+        diag.walk_cause          = ninfer::PrefixStallCause::NoChild;
+        diag.matched_blocks      = 5;
+        diag.stall_sibling_count = 3;
+        const std::string compact =
+            format_prefix_admission_compact(diag, ninfer::PrefixReusePath::FullReset,
+                                            ninfer::PrefixReuseReason::None);
+        failures += check(compact.find("walk_stalled@B5/B26 cause=no_child siblings=3") !=
+                              std::string::npos,
+                          "stalled-walk admission record lost its position and cause");
+    }
+    {
+        auto diag = admission_base();
+        diag.walk_cause       = ninfer::PrefixStallCause::Completed;
+        diag.selection_veto   = ninfer::PrefixSelectionVeto::TailNonZero;
+        const std::string compact =
+            format_prefix_admission_compact(diag, ninfer::PrefixReusePath::FullReset,
+                                            ninfer::PrefixReuseReason::None);
+        failures += check(compact.find("walk_completed veto=tail_nonzero") != std::string::npos,
+                          "vetoed-walk admission record lost its veto");
+    }
+    {
+        auto diag = admission_base();
+        diag.walk_cause   = ninfer::PrefixStallCause::Completed;
+        diag.reuse_base = 512;
+        const std::string compact =
+            format_prefix_admission_compact(diag, ninfer::PrefixReusePath::BlockSnapshot,
+                                             ninfer::PrefixReuseReason::ReusedBlockSnapshot);
+        failures += check(compact.find("block_reused B8/B26 slots=5/5") != std::string::npos,
+                          "partial block reuse record lost its depth");
+    }
+    {
+        auto diag = admission_base();
+        diag.mtp_backend     = true;
+        diag.walk_cause      = ninfer::PrefixStallCause::Completed;
+        diag.tail_hidden_valid = false;
+        const std::string compact =
+            format_prefix_admission_compact(diag, ninfer::PrefixReusePath::FullReset,
+                                            ninfer::PrefixReuseReason::MtpTailHiddenInvalid);
+        failures += check(compact.find("mtp(downgraded)") != std::string::npos,
+                          "MTP-downgrade admission record lost its marker");
+    }
+    {
+        auto diag = admission_base();
+        diag.walk_cause       = ninfer::PrefixStallCause::Completed;
+        diag.candidates_total = 9;
+        diag.candidates_shown = 1;
+        diag.candidates[0]    = ninfer::PrefixDiagCandidate{
+            .frontier   = 512,
+            .anchor_depth = 8,
+            .kind       = 0,
+            .device_resident     = true,
+            .host_restorable     = true,
+            .reject = 5};
+        const std::string verbose =
+            format_prefix_admission_verbose(7, diag, ninfer::PrefixReusePath::FullReset,
+                                            ninfer::PrefixReuseReason::None);
+        const bool shaped = !verbose.empty() &&
+            verbose.find("[inputs]") != std::string::npos &&
+            verbose.find("[hybrid walk]") != std::string::npos &&
+            verbose.find("candidates_seen=9") != std::string::npos;
+        failures += check(shaped && verbose.find("no consumable snapshot survived") !=
+                                   std::string::npos,
+                          "verbose admission explanation lost its sections or verdict");
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

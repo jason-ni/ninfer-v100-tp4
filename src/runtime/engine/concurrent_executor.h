@@ -531,6 +531,7 @@ private:
             result.prefix_reuse_path     = request->begin->prefix_reuse_path;
             result.prefix_reuse_reason   = request->begin->prefix_reuse_reason;
             result.prefix_divergence     = request->begin->prefix_divergence;
+            result.prefix_admission      = request->begin->prefix_admission;
         }
         if (request->lane) {
             result.timings = instance_.program->generation_timings_lane(*request->lane);
@@ -911,6 +912,10 @@ private:
 
         Plan selected_plan = std::move(*request->lane_plans[lane]);
         request->lane_plans[lane].reset();
+        // Protect the admitted plan's matched prefix chain (plus every retained lane's committed
+        // chain, handled program-side) from device-tier cache eviction while its KV pages are
+        // being reserved.
+        instance_.program->set_eviction_demand(selected_plan.block_path());
         if (!erase_pending(request)) { return AdmissionProgress::None; }
         release_planning_state(request);
 

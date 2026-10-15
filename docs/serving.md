@@ -128,8 +128,11 @@ Groups:
 - `main_kv` / `backend_kv` — paged KV page groups: physical `capacity`, sequence-`mapped`,
   prefix-cache-`cached`, and `free` groups, plus `page_bytes` per group. `backend_kv` is zero when
   the backend has no second pool.
-- `prefix_cache` — device snapshot-slot `total`/`used`, and the host tier's `pinned`/`used` bytes
-  and slab counts (`enabled` is 0 when the tier is off or its allocation failed).
+- `prefix_cache` — device snapshot-slot `total`/`used`, the host tier's `pinned`/`used` bytes and
+  slab counts (`enabled` is 0 when the tier is off or its allocation failed), and the cumulative
+  lifetime eviction counters of the demand-aware device tier: `devices_blocks_demoted_total`
+  (lossless demotions), `subtree_erased_total`, `branch_gc_removed_blocks_total`,
+  `snapshots_deleted_by_eviction_total`, and `retained_lane_evictions_total`.
 - `scheduler` — running/prefilling/decode-ready/waiting requests and the monotonic prefill/decode
   counters used to derive throughput.
 
@@ -592,6 +595,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--prefix-cache` | enable the hybrid content-addressed prefix cache (block-granular KV reuse plus GDN state snapshots; device tier, optionally backed by pinned host RAM) | off |
 | `--host-cache-mib N` | pinned host RAM for the prefix-cache pool; only used with `--prefix-cache`; `0` is device-only | `0` |
+| `--prefix-debug` | log a multi-line per-request explanation of every prompt-token recompute (which reuse gate failed, where the block walk stalled, which snapshots existed on the matched path and why each was rejected); emitted on the request-done line plus the stderr detail block | off |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--chat-template-kwargs JSON` | default chat-template options as a JSON object; supported keys are `preserve_thinking` (bool), `enable_thinking` (bool), and `reasoning_effort` (`none`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`, folded onto `low`\|`medium`\|`xhigh` like the request field); it overrides `--no-thinking`/`--preserve-thinking` for the keys it names, and requests can still override each field; a default effort combined with disabled thinking is a startup error | unset |
@@ -637,7 +641,7 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | target/weights identity and artifact, resolved Engine including tensor-parallel width `tp` and the resolved per-rank `devices` list, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `prefix_admission` when the hybrid cache runs (walk cause/stall position, per-snapshot candidate fates, slot occupancy, reuse base), unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
 

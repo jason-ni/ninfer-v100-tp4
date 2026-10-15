@@ -164,6 +164,10 @@ struct ScriptedPlan {
     rt::RequestPlanSummary value;
 
     [[nodiscard]] const rt::RequestPlanSummary& summary() const noexcept { return value; }
+    [[nodiscard]] std::span<const std::uint32_t> block_path() const noexcept {
+        static constexpr std::uint32_t none[] = {};
+        return {none, 0};
+    }
 };
 
 struct GenerationScript {
@@ -338,6 +342,7 @@ public:
 
     [[nodiscard]] bool has_retained_lane(std::uint32_t) const noexcept { return false; }
     void evict_retained_lane(std::uint32_t) noexcept {}
+    void set_eviction_demand(std::span<const std::uint32_t>) noexcept {}
     [[nodiscard]] ninfer::GenerationTimings generation_timings_lane(std::uint32_t) const noexcept {
         return {};
     }

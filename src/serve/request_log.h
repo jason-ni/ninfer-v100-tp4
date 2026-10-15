@@ -99,6 +99,18 @@ std::string format_request_done(const RequestLogContext& context, const Generati
 std::string format_request_error(const RequestLogContext& context, const std::string& message);
 std::string format_throughput(const ThroughputReport& report);
 
+// Prefix-reuse miss analysis (D1c). Both take the engine's diagnostics value plus the effective
+// verdict so they stay pure and testable. `compact` returns "" when the request recomputed
+// nothing; otherwise one short line explaining WHICH gate forced the recompute. `verbose`
+// returns the multi-line gate-by-gate explanation ("" in the same case).
+std::string format_prefix_admission_compact(const ninfer::PrefixAdmissionDiagnostics& diag,
+                                            ninfer::PrefixReusePath verdict_path,
+                                            ninfer::PrefixReuseReason verdict_reason);
+std::string format_prefix_admission_verbose(std::uint64_t request_id,
+                                            const ninfer::PrefixAdmissionDiagnostics& diag,
+                                            ninfer::PrefixReusePath verdict_path,
+                                            ninfer::PrefixReuseReason verdict_reason);
+
 // Pure JSON formatters are public to repository tests. Each return value is one complete JSON
 // object without a trailing newline.
 std::string format_server_start_json(const std::string& server_instance_id,

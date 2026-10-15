@@ -231,7 +231,7 @@ int test_lru_eviction_and_pinning() {
     const SnapshotId snap = add(index, b, 128, {}, {}, SnapshotKind::Tap, 5);
 
     index.pin_node(a);
-    const NodeId evicted = index.evict_device_lru();
+    const NodeId evicted = index.evict_node({});
     failures += check(evicted == b, "LRU did not evict the oldest unpinned node");
     failures += check(index.node(a) != nullptr, "pinned node was evicted");
     failures += check(index.snapshot(snap) == nullptr && index.live_snapshot_count() == 0,
@@ -242,8 +242,130 @@ int test_lru_eviction_and_pinning() {
                       "eviction did not return the block page and snapshot slot");
 
     index.unpin_node(a);
-    failures += check(index.evict_device_lru() == a, "unpinned node was not evictable");
+    failures += check(index.evict_node({}) == a, "unpinned node was not evictable");
     failures += check(index.live_node_count() == 1, "root plus no children expected after eviction");
+    return failures;
+}
+
+int test_match_miss_diagnostics() {
+    int failures = 0;
+    CountingSink sink;
+    PrefixIndex index(PrefixIndexOptions{2, 0}, &sink);
+
+    const auto p1 = tokens(kBlockTokens, 1);
+    const auto p2 = tokens(kBlockTokens, 2);
+    const auto p3 = tokens(kBlockTokens, 3);
+    const std::uint64_t h1 = block_hash(kBlockHashSeed, p1, 0);
+    const std::uint64_t h2 = block_hash(h1, p2, 0);
+    const std::uint64_t h3 = block_hash(h2, p3, 0);
+    const NodeId n1 = commit(index, index.root(), p1, h1, pages(1));
+    const NodeId n2 = commit(index, n1, p2, h2, pages(2));
+    const NodeId n3 = commit(index, n2, p3, h3, pages(3));
+    failures += check(n1 != kInvalidNode && n2 != kInvalidNode && n3 != kInvalidNode,
+                      "diagnostic chain commits failed");
+
+    // The incoming prompt branches at block 1 (the second block differs).
+    const std::vector<TokenId> branch_prompt = [&] {
+        std::vector<TokenId> prompt;
+        for (TokenId value : p1) { prompt.push_back(value); }
+        for (TokenId value : tokens(kBlockTokens, 40)) { prompt.push_back(value); }
+        prompt.push_back(0xACE); // a partial token keeps the second block eligible
+        return prompt;
+    }();
+    const std::array<std::uint64_t, 2> branch_hashes{h1, 0xC0FFEE};
+    const PrefixMatch branch = index.match(branch_prompt, branch_hashes, {});
+    failures += check(branch.matched_blocks == 1, "branch did not walk to the first match");
+    failures += check(branch.walk_cause == ninfer::PrefixStallCause::NoChild,
+                      "branching prompt was not reported as NoChild");
+    failures += check(branch.stall_sibling_count == 1,
+                      "no-child stall should count the sibling child block");
+
+    // Same lookup hash on two committed children and a third token set colliding with both.
+    CountingSink sink2;
+    PrefixIndex collided(PrefixIndexOptions{2, 0}, &sink2);
+    const std::uint64_t forced = 0xDEAD0BAF;
+    const auto a = tokens(kBlockTokens, 10);
+    const auto b = tokens(kBlockTokens, 20);
+    std::vector<TokenId> colliding_prompt;
+    for (TokenId value : tokens(kBlockTokens, 30)) { colliding_prompt.push_back(value); }
+    colliding_prompt.push_back(0xBEEF); // a partial 65th token makes block 0 eligible
+    (void)commit(collided, collided.root(), a, forced, pages(1));
+    (void)commit(collided, collided.root(), b, forced, pages(2));
+    const std::array<std::uint64_t, 1> forced_hashes{forced};
+    const PrefixMatch hit = collided.match(colliding_prompt, forced_hashes, {});
+    failures += check(hit.walk_cause == ninfer::PrefixStallCause::HashCollision,
+                      "same-hash different-token child was not reported as a collision");
+    failures += check(hit.stall_sibling_count == 2, "collision should count both sibling blocks");
+
+    // Completed walk with two eligible taps: the deeper one wins, the shallower is outranked.
+    const SnapshotId tap_shallow = add(index, n2, 2U * kBlockTokens, {});
+    const SnapshotId tap_deep    = add(index, n3, 3U * kBlockTokens, {});
+    std::vector<TokenId> full_prompt;
+    for (TokenId value : p1) { full_prompt.push_back(value); }
+    for (TokenId value : p2) { full_prompt.push_back(value); }
+    for (TokenId value : p3) { full_prompt.push_back(value); }
+    full_prompt.push_back(0xFEED); // one extra token so all three blocks stay eligible
+    const std::array<std::uint64_t, 3> full_hashes{h1, h2, h3};
+    const PrefixMatch complete = index.match(full_prompt, full_hashes, {});
+    failures += check(complete.walk_cause == ninfer::PrefixStallCause::Completed,
+                      "full-chain walk should report completed");
+    failures += check(complete.best_device == tap_deep, "deeper tap was not selected");
+    failures += check(complete.diagnostics_total == 2 && complete.diagnostics.size() == 2,
+                      "both path snapshots should be collected");
+    bool shallow_outranked = false;
+    bool deep_eligible     = false;
+    for (const auto& entry : complete.diagnostics) {
+        if (entry.frontier == 2U * kBlockTokens && entry.reject == 5) { shallow_outranked = true; }
+        if (entry.frontier == 3U * kBlockTokens && entry.reject == 0) { deep_eligible = true; }
+    }
+    failures += check(shallow_outranked && deep_eligible,
+                      "candidate fates were not recorded (shallow outranked / deep eligible)");
+    return failures;
+}
+
+int test_eviction_policy_tiers() {
+    int failures = 0;
+    CountingSink sink;
+    PrefixIndex index(PrefixIndexOptions{2, 0}, &sink);
+
+    const auto xa = tokens(kBlockTokens, 21);
+    const auto ya = tokens(kBlockTokens, 22);
+    const auto za = tokens(kBlockTokens, 23);
+    const std::uint64_t hx = block_hash(kBlockHashSeed, xa, 0);
+    const std::uint64_t hy = block_hash(kBlockHashSeed, ya, 0);
+    const std::uint64_t hz = block_hash(hy, za, 0);
+    const NodeId x = commit(index, index.root(), xa, hx, pages(1));
+    const NodeId y = commit(index, index.root(), ya, hy, pages(2));
+    const SnapshotId snap_y = add(index, y, kBlockTokens, {});
+    failures += check(x != kInvalidNode && y != kInvalidNode && snap_y != kInvalidSnapshot,
+                      "tier-test setup failed");
+
+    // Tier 2: with no lossless move possible, dead-branch GC removes the snapshot-free leaf x and
+    // leaves y (still anchoring a live snapshot) alone.
+    const NodeId evicted_x = index.evict_node({});
+    failures += check(evicted_x == x && index.node(x) == nullptr,
+                      "dead-branch GC did not remove the snapshot-free leaf");
+    failures += check(index.node(y) != nullptr && index.snapshot(snap_y) != nullptr,
+                      "snapshot-anchored branch was removed by GC");
+    failures += check(index.eviction_counters().branch_gc_removed_blocks == 1,
+                      "GC removal was not counted");
+
+    // A newly committed leaf under y is trimmable even though y carries demand: the demand closure
+    // protects y and its ancestors, everything else stays trimmable.
+    const NodeId z = commit(index, y, za, hz, pages(3));
+    failures += check(z != kInvalidNode, "demand-scoped leaf commit failed");
+    const std::array<NodeId, 1> demand{y};
+    const NodeId evicted_z = index.evict_node(demand);
+    failures += check(evicted_z == z && index.node(z) == nullptr,
+                      "demanded branch's un-demanded leaf was not trimmed");
+    failures += check(index.node(y) != nullptr, "demanded node was erased");
+
+    // Final pressure: only y remains under the root with no usable host tier, so tier 3 trims it
+    // lossily and the anchored snapshot dies with it.
+    const NodeId evicted_y = index.evict_node({});
+    failures += check(evicted_y == y && index.node(y) == nullptr, "final tier lost the last candidate");
+    failures += check(index.eviction_counters().snapshots_deleted >= 1,
+                      "eviction-lane snapshot deletion was not counted");
     return failures;
 }
 
@@ -363,6 +485,8 @@ int main() {
     failures += test_live_counts_and_removal();
     failures += test_supersede_and_slot_reuse();
     failures += test_lru_eviction_and_pinning();
+    failures += test_match_miss_diagnostics();
+    failures += test_eviction_policy_tiers();
     failures += test_tap_planner_priority_and_clustering();
     failures += test_tap_planner_vision_and_ladder();
     if (failures == 0) { std::cout << "ok\n"; }

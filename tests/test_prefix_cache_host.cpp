@@ -201,7 +201,7 @@ int test_device_fill_roundtrip() {
     write_block_to_host(index, node);
 
     // Demote the device copy: the node is backed, so eviction keeps it host-only.
-    const pc::NodeId evicted = index.evict_device_lru();
+    const pc::NodeId evicted = index.evict_node({});
     failures += check(evicted == node, "backed node was not demoted");
     const pc::BlockNode* record = index.node(node);
     failures += check(record != nullptr && record->device_state == pc::Residency::Absent &&
@@ -220,7 +220,7 @@ int test_device_fill_roundtrip() {
                       "restore did not make the node device-resident");
 
     // Rollback path: demote again, start a fill, abort it.
-    (void)index.evict_device_lru();
+    (void)index.evict_node({});
     const int releases_before = sink.released_blocks;
     index.begin_device_fill(node, {std::array<std::int32_t, pc::kMaxPools>{201, -1}});
     index.finish_device_fill(node, false);
@@ -248,7 +248,7 @@ int test_evict_demote_vs_erase() {
     // Unbacked subtree: eviction erases the oldest node and everything below it.
     const int releases_before = sink.released_blocks;
     const int slots_before    = sink.released_slots;
-    const pc::NodeId evicted  = index.evict_device_lru();
+    const pc::NodeId evicted  = index.evict_node({});
     failures += check(evicted == a, "LRU did not evict the oldest node");
     failures += check(index.node(a) == nullptr && index.node(b) == nullptr,
                       "unbacked subtree was not erased");
@@ -258,6 +258,51 @@ int test_evict_demote_vs_erase() {
                       "erased nodes did not return their pages");
     failures += check(sink.released_slots == slots_before + 1,
                       "erased snapshot did not return its slot");
+    return failures;
+}
+
+int test_evict_demand_demotes_tail_first() {
+    int failures = 0;
+    TestSink sink;
+    pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
+    pc::HostSlabPool pool = make_test_pool();
+    index.set_host_pool(&pool);
+
+    const pc::NodeId a = commit_block(index, index.root(), 5, 100);
+    const pc::NodeId b = commit_block(index, a, 6, 101);
+    failures += check(a != pc::kInvalidNode && b != pc::kInvalidNode, "block commits failed");
+    write_block_to_host(index, a);
+    write_block_to_host(index, b);
+
+    // With no demand, demotion sheds the deepest host-backed node: the tail block b goes host-only
+    // while the shared prefix block a stays device-resident.
+    const pc::NodeId evicted_b = index.evict_node({});
+    const pc::BlockNode* rb = index.node(b);
+    const pc::BlockNode* ra = index.node(a);
+    failures += check(evicted_b == b, "demotion did not shed the deepest backed node first");
+    failures += check(rb != nullptr && rb->device_state == pc::Residency::Absent &&
+                          rb->host_state == pc::Residency::Host,
+                      "the tail block should be host-only");
+    failures += check(ra != nullptr && ra->device_state == pc::Residency::Resident,
+                      "the shared prefix block lost its device copy");
+    failures += check(index.eviction_counters().demoted >= 1, "demotion was not counted");
+
+    const pc::NodeId evicted_a = index.evict_node({});
+    failures += check(evicted_a == a, "the second pressure round did not shed the prefix block");
+
+    // A request whose matched chain runs through a protects a: after restoring b, the demanded
+    // path is excluded from eviction and b is demoted again before any trimming of a.
+    index.begin_device_fill(b, {std::array<std::int32_t, pc::kMaxPools>{400, -1}});
+    index.finish_device_fill(b, true);
+    failures += check(index.node(b) != nullptr && index.node(b)->device_state ==
+                           pc::Residency::Resident,
+                      "tail block restore failed");
+    const std::array<pc::NodeId, 1> demand{a};
+    const pc::NodeId evicted_b_again = index.evict_node(demand);
+    failures += check(evicted_b_again == b, "demand did not exclude the matched chain");
+    failures += check(index.node(a) != nullptr && index.node(a)->device_state ==
+                           pc::Residency::Resident,
+                      "demanded chain lost its device residency");
     return failures;
 }
 
@@ -296,25 +341,28 @@ int test_slab_eviction_reconciliation() {
     failures += check(nc != nullptr && nc->host_state == pc::Residency::Host,
                       "new write-through did not land");
 
-    // Now demote a (device-only) and force its... a has no host copy; instead demote c's
-    // sibling b: b still owns a slab? No - b's slab was never evicted. Demote b to host-only,
-    // then evict b's slab by writing through a fourth node.
-    (void)index.evict_device_lru(); // demotes the oldest backed node (b or a; a has no host copy)
-    const pc::BlockNode* nb = index.node(b);
-    failures += check(nb != nullptr && nb->host_state == pc::Residency::Host,
-                      "b should be host-backed before slab eviction");
-    if (nb != nullptr && nb->device_state == pc::Residency::Resident) {
-        (void)index.evict_device_lru();
-    }
-    const pc::HostPageId slab_b = index.node(b) != nullptr ? index.node(b)->host_page
-                                                           : pc::kInvalidHostPage;
+    // Demand-aware eviction sheds host-backed unpinned nodes; a/b/c are equal-depth siblings, so the
+    // LRU head (b) goes first, then c. Nothing is demanded here, so only lossless demotions occur.
+    (void)index.evict_node({});
+    const pc::BlockNode* nb_after = index.node(b);
+    failures += check(nb_after != nullptr && nb_after->device_state == pc::Residency::Absent &&
+                          nb_after->host_state == pc::Residency::Host,
+                      "the first backed node (b) should be demoted");
+    (void)index.evict_node({});
+    const pc::BlockNode* nc_after = index.node(c);
+    failures += check(nc_after != nullptr && nc_after->device_state == pc::Residency::Absent &&
+                          nc_after->host_state == pc::Residency::Host,
+                      "c should now be host-only");
+
     const pc::NodeId d = commit_block(index, index.root(), 4, 103);
     failures += check(d != pc::kInvalidNode, "fourth block commit failed");
     write_block_to_host(index, d);
-    // b was host-only; losing its slab leaves it with no data anywhere, so it is deleted.
+    // b's slab is the oldest in the pool, so writing d evicts it. b is device-absent as well, so
+    // losing its last data copy deletes the node.
     failures += check(index.node(b) == nullptr,
                       "host-only node was not deleted when its slab was evicted");
-    (void)slab_b;
+    failures += check(index.node(c) != nullptr && index.node(c)->host_state == pc::Residency::Host,
+                      "newer host slab (c's) must survive pool pressure");
     return failures;
 }
 
@@ -421,7 +469,7 @@ int test_best_host_admission() {
 
     // Demote the block: the path is now host-only, so device admission must fail while host
     // admission still finds the snapshot.
-    (void)index.evict_device_lru();
+    (void)index.evict_node({});
     const pc::BlockNode* record = index.node(a);
     failures += check(record != nullptr && record->host_state == pc::Residency::Host &&
                           record->device_state == pc::Residency::Absent,

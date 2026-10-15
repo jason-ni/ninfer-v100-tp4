@@ -40,6 +40,7 @@ struct GenerationMetrics {
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
     ninfer::PrefixReuseReason prefix_reuse_reason = ninfer::PrefixReuseReason::None;
     ninfer::PrefixDivergence prefix_divergence;
+    ninfer::PrefixAdmissionDiagnostics prefix_admission;
 };
 
 struct GenerationOutcome {

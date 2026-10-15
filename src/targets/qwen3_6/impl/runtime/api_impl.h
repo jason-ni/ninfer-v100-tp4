@@ -115,6 +115,14 @@ const runtime::RequestPlanSummary& RequestPlan<Variant>::summary() const noexcep
 }
 
 template <>
+std::span<const std::uint32_t> RequestPlan<Variant>::block_path() const noexcept {
+    if (impl_ == nullptr) { return {}; }
+    // NodeId is std::uint32_t; expose the matched path without copying.
+    const auto& path = impl_->block_path;
+    return std::span<const std::uint32_t>(path.data(), path.size());
+}
+
+template <>
 Program<Variant>::Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -222,6 +230,11 @@ bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
 template <>
 void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
     impl_->evict_retained_lane(lane);
+}
+
+template <>
+void Program<Variant>::set_eviction_demand(std::span<const std::uint32_t> demand_nodes) noexcept {
+    impl_->set_eviction_demand(demand_nodes);
 }
 
 template <>

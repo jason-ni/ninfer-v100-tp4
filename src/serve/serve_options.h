@@ -57,6 +57,7 @@ struct ServeOptions {
     bool allow_prefix_reuse = true;
     bool prefix_cache_enabled = false; // --prefix-cache: enable hybrid content-addressed prefix cache
     std::uint32_t host_cache_mib = 0;  // --host-cache-mib: pinned host RAM for the prefix pool
+    bool prefix_debug = false;         // --prefix-debug: verbose prefix-reuse diagnostic on done
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;

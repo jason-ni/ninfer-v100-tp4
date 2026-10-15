@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace ninfer::prefix_cache {
 namespace {
@@ -216,7 +217,7 @@ void PrefixIndex::dec_live_below(NodeId node, std::uint32_t count) noexcept {
         // Dead-KV: a node no longer reachable from any snapshot is the lowest-priority host-resident
         // data. Marking it dead only adjusts eviction priority (the pool evicts dead slabs first);
         // the actual cleanup happens lazily when its slab is evicted (reconcile_host_eviction) or
-        // its device copy is evicted (evict_device_lru). No eager structural change here, which keeps
+        // its device copy is evicted (evict_node). No eager structural change here, which keeps
         // this callable from inside snapshot deletion without reentrancy.
         if (record.live_snapshots_below == 0 && host_pool_ != nullptr &&
             record.host_page != kInvalidHostPage) {
@@ -270,7 +271,6 @@ ChildMatch PrefixIndex::find_child(NodeId parent, std::uint64_t lookup_hash,
     }
     return match;
 }
-
 PrefixMatch PrefixIndex::match(std::span<const TokenId> prompt_tokens,
                                std::span<const std::uint64_t> block_hashes,
                                std::span<const std::uint64_t> block_extras) const {
@@ -283,23 +283,51 @@ PrefixMatch PrefixIndex::match(std::span<const TokenId> prompt_tokens,
 
     NodeId current = root_;
     std::size_t block = 0;
+    bool walk_ran     = false;
+    bool stalled      = false;
     for (; block < eligible && block < block_hashes.size(); ++block) {
+        walk_ran = true;
         const std::span<const TokenId> tokens =
             prompt_tokens.subspan(block * kBlockTokens, kBlockTokens);
         const std::uint64_t extra = block < block_extras.size() ? block_extras[block] : 0U;
         const ChildMatch child = find_child(current, block_hashes[block], tokens, extra);
-        if (child.node == kInvalidNode) { break; }
+        if (child.node == kInvalidNode) {
+            stalled                  = true;
+            result.walk_cause        = child.hash_collided ? ninfer::PrefixStallCause::HashCollision
+                                                           : ninfer::PrefixStallCause::NoChild;
+            const BlockNode& parent  = nodes_[current - 1U];
+            std::uint32_t siblings   = 0;
+            for (NodeId child_id : parent.children) {
+                if (nodes_[child_id - 1U].live) { ++siblings; }
+            }
+            result.stall_sibling_count = siblings;
+            break;
+        }
         current = child.node;
         result.path.push_back(current);
     }
     result.matched_blocks = result.path.size() - 1U;
+    if (walk_ran && !stalled) { result.walk_cause = ninfer::PrefixStallCause::Completed; }
 
+    std::vector<std::pair<SnapshotId, ninfer::PrefixDiagCandidate>> considered;
     for (NodeId node_id : result.path) {
         const BlockNode& record = nodes_[node_id - 1U];
         for (SnapshotId snapshot_id : record.snapshots) {
             const Snapshot& candidate = snapshots_[snapshot_id - 1U];
-            if (!candidate.live || candidate.superseded) { continue; }
-            if (candidate.frontier > token_count - 1U) { continue; }
+            ninfer::PrefixDiagCandidate entry{};
+            entry.frontier     = candidate.frontier;
+            entry.anchor_depth = static_cast<std::uint32_t>(nodes_[candidate.anchor - 1U].depth + 1U);
+            entry.kind         = static_cast<std::uint8_t>(candidate.kind);
+            if (!candidate.live || candidate.superseded) {
+                entry.reject = 1;
+                considered.emplace_back(snapshot_id, entry);
+                continue;
+            }
+            if (candidate.frontier > token_count - 1U) {
+                entry.reject = 2;
+                considered.emplace_back(snapshot_id, entry);
+                continue;
+            }
 
             const BlockNode& anchor = nodes_[candidate.anchor - 1U];
             const std::uint32_t tail_begin =
@@ -310,6 +338,8 @@ PrefixMatch PrefixIndex::match(std::span<const TokenId> prompt_tokens,
                 !std::equal(candidate.tail_tokens.begin(),
                             candidate.tail_tokens.begin() + candidate.tail_len,
                             prompt_tokens.begin() + tail_begin)) {
+                entry.reject = 3;
+                considered.emplace_back(snapshot_id, entry);
                 continue;
             }
 
@@ -345,8 +375,14 @@ PrefixMatch PrefixIndex::match(std::span<const TokenId> prompt_tokens,
                 }
             }
 
-            result.candidates.push_back(SnapshotCandidate{snapshot_id, candidate.frontier,
-                                                          device_resident, host_resident});
+            entry.device_resident = device_resident;
+            entry.host_restorable = host_resident;
+            if (!device_resident && !host_resident) { entry.reject = 4; }
+            if (entry.reject == 0) {
+                result.candidates.push_back(SnapshotCandidate{
+                    snapshot_id, candidate.frontier, device_resident, host_resident});
+            }
+            considered.emplace_back(snapshot_id, entry);
             if (device_resident && candidate.frontier >= result.best_device_frontier) {
                 result.best_device          = snapshot_id;
                 result.best_device_frontier = candidate.frontier;
@@ -357,9 +393,21 @@ PrefixMatch PrefixIndex::match(std::span<const TokenId> prompt_tokens,
             }
         }
     }
+
+    // An eligible candidate that lost the frontier race is still worth showing: it exists, it was
+    // restorable, it just shallower than the chosen one.
+    for (auto& [id, entry] : considered) {
+        if (entry.reject != 0) { continue; }
+        if (id != result.best_device && id != result.best_host) { entry.reject = 5; }
+    }
+    std::sort(considered.begin(), considered.end(),
+              [](const auto& a, const auto& b) { return a.second.frontier > b.second.frontier; });
+    result.diagnostics_total = static_cast<std::uint32_t>(considered.size());
+    for (std::size_t i = 0; i < considered.size() && i < ninfer::kPrefixDiagCandidates; ++i) {
+        result.diagnostics.push_back(considered[i].second);
+    }
     return result;
 }
-
 NodeId PrefixIndex::commit_block(const BlockCommit& commit, bool& adopted) {
     adopted = false;
     if (!valid(commit.parent) || commit.tokens.size() != kBlockTokens) { return kInvalidNode; }
@@ -637,38 +685,141 @@ void PrefixIndex::delete_snapshot(SnapshotId id) {
 
 void PrefixIndex::remove_snapshot(SnapshotId id) { delete_snapshot(id); }
 
-NodeId PrefixIndex::evict_device_lru() {
+NodeId PrefixIndex::evict_node(std::span<const NodeId> protected_nodes) {
     if (lru_head_ == kInvalidNode) { return kInvalidNode; }
 
-    // Pass 1: prefer a backed victim (host_state == Host, unpinned). Demote it: release device
-    // pages, unlink from LRU, node stays alive as host-only.
-    NodeId current = lru_head_;
-    while (current != kInvalidNode) {
-        BlockNode& record = nodes_[current - 1U];
-        if (record.active_refs == 0 && record.restore_pins == 0 &&
-            record.host_state == Residency::Host) {
-            if (sink_ != nullptr) { sink_->release_block_pages(record.device_pages); }
-            record.device_state = Residency::Absent;
-            unlink_lru(current);
-            return current;
+    // Demand closure: protected = a demanded node or any of its ancestors. Cutting or demoting a
+    // protected node would break an incoming request's match path.
+    evict_protected_.assign(nodes_.size(), 0);
+    for (NodeId id : protected_nodes) {
+        if (!valid(id)) { continue; }
+        for (NodeId cur = id; cur != kInvalidNode; cur = nodes_[cur - 1U].parent) {
+            evict_protected_[cur - 1U] = 1;
         }
-        current = record.lru_next;
+    }
+    // danger_under[n] holds when n has a descendant on a demand path: erasing n's subtree would
+    // also delete data another request still addresses.
+    evict_demand_under_.assign(nodes_.size(), 0);
+    for (std::size_t i = 1; i < nodes_.size(); ++i) {
+        if (evict_protected_[i] && nodes_[i].live && nodes_[i].parent != kInvalidNode) {
+            evict_demand_under_[nodes_[i].parent - 1U] = 1;
+        }
     }
 
-    // Pass 2: no backed victim. Device eviction never copies (HPC): take the first unpinned
-    // victim and erase its subtree. The data is lost from the cache; if a host copy existed it
-    // would have been found in pass 1.
-    current = lru_head_;
-    while (current != kInvalidNode) {
-        BlockNode& record = nodes_[current - 1U];
-        if (record.active_refs == 0 && record.restore_pins == 0) {
-            erase_subtree(current);
-            return current;
+    const auto depth_of   = [this](NodeId id) { return nodes_[id - 1U].depth; };
+    const auto live_snap  = [this](const BlockNode& n) {
+        for (SnapshotId id : n.snapshots) {
+            const Snapshot& s = snapshots_[id - 1U];
+            if (s.live && !s.superseded) { return true; }
         }
-        current = record.lru_next;
+        return false;
+    };
+    const auto pinned_under = [this](NodeId id) {
+        // Pinned descendants are not LRU-linked but must survive a subtree erase.
+        std::vector<NodeId> stack{id};
+        while (!stack.empty()) {
+            const NodeId cur  = stack.back();
+            stack.pop_back();
+            const BlockNode& record = nodes_[cur - 1U];
+            if (record.active_refs != 0U || record.restore_pins != 0U) { return true; }
+            for (NodeId child : record.children) {
+                if (nodes_[child - 1U].live) { stack.push_back(child); }
+            }
+        }
+        return false;
+    };
+
+    // demand-aware eviction: tier 1 demotes the deepest non-demand backed node (lossless -- keeps
+    // warm shared prefixes device-resident by shedding the tails), tier 2 erases a dead branch
+    // (shallowest non-demand branch root with no demand and no live non-superseded snapshot
+    // anywhere below it, so no resumability investment dies; oldest recency first), tier 3 only
+    // then trims onto the demand set, deepest leaf first, demote-preferred.
+    std::uint32_t tier1     = kInvalidNode;
+    int           tier1_depth = -1;
+    for (NodeId id = lru_head_; id != kInvalidNode; id = nodes_[id - 1U].lru_next) {
+        const BlockNode& record = nodes_[id - 1U];
+        if (evict_protected_[id - 1U] || record.device_state != Residency::Resident ||
+            record.host_state != Residency::Host) {
+            continue;
+        }
+        const int depth = depth_of(id);
+        if (depth > tier1_depth) {
+            tier1       = id;
+            tier1_depth = depth;
+        }
+    }
+    if (tier1 != kInvalidNode) {
+        BlockNode& record = nodes_[tier1 - 1U];
+        if (sink_ != nullptr) { sink_->release_block_pages(record.device_pages); }
+        record.device_state = Residency::Absent;
+        unlink_lru(tier1);
+        ++demoted_total_;
+        return tier1;
     }
 
-    return kInvalidNode;
+    // Tier 2: dead-branch GC. No lossless move remains, so release whole dead branches: their
+    // KV is not addressable by any current and their deepest investiture (a live tap) survives by
+    // skipping branches that still anchor one.
+    std::uint32_t tier2         = kInvalidNode;
+    int           tier2_depth   = 1 << 30;
+    for (NodeId id = lru_head_; id != kInvalidNode; id = nodes_[id - 1U].lru_next) {
+        const BlockNode& record = nodes_[id - 1U];
+        if (evict_protected_[id - 1U] || live_snap(record)) { continue; }
+        const int depth = depth_of(id);
+        if (depth < tier2_depth) {
+            tier2       = id;
+            tier2_depth = depth;
+        }
+    }
+    if (tier2 != kInvalidNode && !pinned_under(tier2)) {
+        std::uint32_t removed    = 0;
+        std::uint32_t lost_snaps = 0;
+        erase_subtree(tier2, &lost_snaps, &removed);
+        branch_gc_removed_blocks_total_ += removed;
+        snapshots_deleted_by_eviction_total_ += lost_snaps;
+        return tier2;
+    }
+
+    // Tier 3: demand pressure really exceeded everything else. Trim onto the demand set or the
+    // remaining candidates, deepest first so the head and inner ladder taps survive longest;
+    // demote before deleting.
+    std::uint32_t trim      = kInvalidNode;
+    int           trim_depth = -1;
+    for (NodeId id = lru_head_; id != kInvalidNode; id = nodes_[id - 1U].lru_next) {
+        const BlockNode& record = nodes_[id - 1U];
+        const bool demoteable   = record.host_state == Residency::Host;
+        const bool erasable     = !demoteable && !evict_demand_under_[id - 1U];
+        if (!demoteable && !erasable) { continue; }
+        const int depth = depth_of(id);
+        if (depth > trim_depth) {
+            trim       = id;
+            trim_depth = depth;
+        }
+    }
+    if (trim == kInvalidNode) {
+        // Last resort: an unbacked node whose subtree still hides pinned or demanded descendants
+        // cannot be erased safely, and no other candidate exists.
+        return kInvalidNode;
+    }
+    const BlockNode& chosen = nodes_[trim - 1U];
+    if (chosen.host_state == Residency::Host) {
+        if (sink_ != nullptr) { sink_->release_block_pages(chosen.device_pages); }
+        nodes_[trim - 1U].device_state = Residency::Absent;
+        unlink_lru(trim);
+        ++demoted_total_;
+        return trim;
+    }
+    if (pinned_under(trim)) {
+        // The deepest erasable-by-marking node has a pinned descendant we must not touch; walking
+        // upward from its pinned side is impossible here, so stop rather than cut around it.
+        return kInvalidNode;
+    }
+    std::uint32_t removed    = 0;
+    std::uint32_t lost_snaps = 0;
+    erase_subtree(trim, &lost_snaps, &removed);
+    ++subtree_erased_total_;
+    snapshots_deleted_by_eviction_total_ += lost_snaps;
+    return trim;
 }
 
 std::array<std::uint32_t, kMaxPools> PrefixIndex::evictable_page_counts() const noexcept {
@@ -681,7 +832,8 @@ std::array<std::uint32_t, kMaxPools> PrefixIndex::evictable_page_counts() const 
     return counts;
 }
 
-void PrefixIndex::erase_subtree(NodeId node) {
+void PrefixIndex::erase_subtree(NodeId node, std::uint32_t* deleted_snapshots,
+                                std::uint32_t* removed_nodes) {
     if (!valid(node) || node == root_) { return; }
 
     std::vector<NodeId> order;
@@ -698,8 +850,16 @@ void PrefixIndex::erase_subtree(NodeId node) {
     for (NodeId current : order) {
         BlockNode& record = nodes_[current - 1U];
         const std::vector<SnapshotId> anchored = record.snapshots;
-        for (SnapshotId id : anchored) { delete_snapshot(id); }
+        for (SnapshotId id : anchored) {
+            const bool live_before =
+                deleted_snapshots != nullptr && id <= snapshots_.size() && snapshots_[id - 1U].live;
+            delete_snapshot(id);
+            if (deleted_snapshots != nullptr && live_before && !snapshots_[id - 1U].live) {
+                ++*deleted_snapshots;
+            }
+        }
     }
+    if (removed_nodes != nullptr) { *removed_nodes = static_cast<std::uint32_t>(order.size()); }
 
     const NodeId parent = nodes_[node - 1U].parent;
     if (valid(parent)) {

@@ -64,6 +64,7 @@ struct BeginSummary {
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     PrefixReuseReason prefix_reuse_reason = PrefixReuseReason::None;
     PrefixDivergence prefix_divergence;
+    PrefixAdmissionDiagnostics prefix_admission;
 };
 
 struct GeneratedRound {

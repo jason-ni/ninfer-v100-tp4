@@ -126,6 +126,10 @@ public:
     RequestPlan& operator=(const RequestPlan&) = delete;
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
+    // The hybrid content-addressed match path for this plan (node ids, index 0 is the tree root);
+    // empty unless this was planned as a BlockSnapshot reuse. Used by the scheduler to protect
+    // the matched chain from admission-time cache eviction.
+    [[nodiscard]] std::span<const std::uint32_t> block_path() const noexcept;
 
 public:
     // Family-private construction/storage seam. This header is repository-internal; exact
@@ -187,6 +191,11 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    // Demand set for admission-time device-tier cache eviction: the selected plan's matched block
+    // path. The program unions it with every retained lane's committed node path; prefixes of those
+    // chains are protected implicitly during the whole admission round. Must be called on the
+    // scheduler thread before the admitted request's begin step.
+    void set_eviction_demand(std::span<const std::uint32_t> demand_nodes) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

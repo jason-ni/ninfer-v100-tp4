@@ -196,6 +196,29 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
+    // D1a: the complete reuse-decision record. Input facts are captured once here -- the only site
+    // that sees every gate (hybrid, legacy retention, speculative demote) before the verdict.
+    PrefixAdmissionDiagnostics& diag       = plan->reuse_diag;
+    const std::uint32_t n_prompt_tokens    = static_cast<std::uint32_t>(prompt.token_ids.size());
+    const std::uint32_t eligible_blocks    = n_prompt_tokens >= 1U ? (n_prompt_tokens - 1U) / 64U : 0U;
+    diag.prompt_tokens                      = n_prompt_tokens;
+    diag.eligible_blocks                    = eligible_blocks;
+    diag.allow_prefix_reuse                 = base.allow_prefix_reuse;
+    diag.identity_reusable                  = prompt.identity.reusable;
+    diag.hybrid_enabled                     = prefix_index != nullptr;
+    diag.retained_sequence                  = sequence.retained;
+    diag.retained_frontier                  = sequence.retained ? sequence.execution_frontier : 0;
+    diag.mtp_backend                        = speculative_backend == SpeculativeBackend::Mtp;
+    diag.mtp_kv_valid                       = sequence.mtp_kv_valid;
+    diag.mtp_cache_present                  = decoder->mtp_cache() != nullptr;
+    diag.tail_hidden_valid                   = sequence.tail_hidden_valid;
+    if (prefix_index != nullptr) {
+        diag.snapshot_slots_total = prefix_index->device_snapshot_slots();
+        diag.snapshot_slots_used  =
+            prefix_index->device_snapshot_slots() - prefix_index->device_snapshot_slots_free();
+        diag.max_new_taps         = prefix_max_new_taps;
+    }
+
     // Hybrid content-addressed admission: take the deepest usable snapshot on the matched block
     // path, preferring device residency on a frontier tie (it needs no restore). Falls through to
     // the legacy owner/checkpoint logic when the index has no usable hit, so the cache is purely
@@ -206,6 +229,15 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
         const ninfer::prefix_cache::PrefixMatch match =
             prefix_index->match(prompt.token_ids, prompt.block_hashes, prompt.block_extras);
+        diag.walk_cause          = match.walk_cause;
+        diag.matched_blocks      = static_cast<std::uint32_t>(match.matched_blocks);
+        diag.stall_sibling_count = match.stall_sibling_count;
+        diag.candidates_total    = match.diagnostics_total;
+        const std::size_t shown   = std::min(match.diagnostics.size(), kPrefixDiagCandidates);
+        for (std::size_t i = 0; i < shown; ++i) {
+            diag.candidates[i] = match.diagnostics[i];
+        }
+        diag.candidates_shown   = static_cast<std::uint32_t>(shown);
         ninfer::prefix_cache::SnapshotId chosen = match.best_device;
         std::uint32_t chosen_frontier           = match.best_device_frontier;
         if (match.best_host != ninfer::prefix_cache::kInvalidSnapshot &&
@@ -216,10 +248,19 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         if (chosen == ninfer::prefix_cache::kInvalidSnapshot) { return false; }
         const ninfer::prefix_cache::Snapshot* snap = prefix_index->snapshot(chosen);
         const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
-        if (snap == nullptr || snap->frontier == 0 || snap->frontier > n - 1 ||
-            snap->tail_len != 0) {
+        if (snap == nullptr) {
+            diag.selection_veto = PrefixSelectionVeto::SnapshotGone;
             return false;
         }
+        if (snap->frontier == 0 || snap->frontier > n - 1) {
+            diag.selection_veto = PrefixSelectionVeto::FrontierInvalid;
+            return false;
+        }
+        if (snap->tail_len != 0) {
+            diag.selection_veto = PrefixSelectionVeto::TailNonZero;
+            return false;
+        }
+        diag.selection_veto = PrefixSelectionVeto::None;
         plan->reuse             = ReusePath::BlockSnapshot;
         plan->reuse_base        = snap->frontier;
         plan->reuse_reason      = PrefixReuseReason::ReusedBlockSnapshot;
@@ -409,6 +450,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         tap_tail_split;
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
+    plan->reuse_diag.reuse_base = plan->reuse_base;
     return RequestPlan(std::move(plan));
 }
 

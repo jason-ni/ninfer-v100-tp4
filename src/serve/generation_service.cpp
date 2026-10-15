@@ -399,6 +399,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
     outcome.metrics.prefix_reuse_reason         = result.prefix_reuse_reason;
     outcome.metrics.prefix_divergence           = result.prefix_divergence;
+    outcome.metrics.prefix_admission          = result.prefix_admission;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;

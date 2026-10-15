@@ -105,6 +105,26 @@ std::string metrics_to_prometheus(const ninfer::MetricsSnapshot& metrics) {
            metrics.prefix_cache.host.block_slab_count);
     sample(out, "ninfer_prefix_cache_host_slabs", labels({{"kind", "snapshot"}}),
            metrics.prefix_cache.host.snapshot_slab_count);
+    header(out, "ninfer_prefix_cache_device_blocks_demoted_total",
+           "Lossless device-to-host demotions by demand-aware eviction.", "counter");
+    sample(out, "ninfer_prefix_cache_device_blocks_demoted_total", "",
+           metrics.prefix_cache.device_blocks_demoted_total);
+    header(out, "ninfer_prefix_cache_subtree_erased_total",
+           "Lossy device subtree erasures (no usable host copy).", "counter");
+    sample(out, "ninfer_prefix_cache_subtree_erased_total", "",
+           metrics.prefix_cache.subtree_erased_total);
+    header(out, "ninfer_prefix_cache_branch_gc_removed_blocks_total",
+           "Dead-branch nodes removed by demand-aware garbage collection.", "counter");
+    sample(out, "ninfer_prefix_cache_branch_gc_removed_blocks_total", "",
+           metrics.prefix_cache.branch_gc_removed_blocks_total);
+    header(out, "ninfer_prefix_cache_snapshots_deleted_by_eviction_total",
+           "Live snapshots lost to an eviction.", "counter");
+    sample(out, "ninfer_prefix_cache_snapshots_deleted_by_eviction_total", "",
+           metrics.prefix_cache.snapshots_deleted_by_eviction_total);
+    header(out, "ninfer_prefix_cache_retained_lane_evictions_total",
+           "Admission evictions performed for retained-lane reserve pressure.", "counter");
+    sample(out, "ninfer_prefix_cache_retained_lane_evictions_total", "",
+           metrics.prefix_cache.retained_lane_evictions_total);
 
     header(out, "ninfer_requests", "Requests by scheduler state.", "gauge");
     sample(out, "ninfer_requests", labels({{"state", "running"}}),
@@ -153,17 +173,26 @@ nlohmann::json metrics_to_json(const ninfer::MetricsSnapshot& metrics) {
         {"devices", std::move(devices)},
         {"main_kv", kv_to_json(metrics.main_kv)},
         {"backend_kv", kv_to_json(metrics.backend_kv)},
-        {"prefix_cache",
-         nlohmann::json{{"enabled", metrics.prefix_cache.enabled},
-                        {"device_snapshot_slots", metrics.prefix_cache.device_snapshot_slots},
-                        {"device_snapshot_slots_used",
-                         metrics.prefix_cache.device_snapshot_slots_used},
-                        {"host",
-                         nlohmann::json{{"enabled", host.enabled},
-                                        {"pinned_bytes", host.pinned_bytes},
-                                        {"used_bytes", host.used_bytes},
-                                        {"block_slab_count", host.block_slab_count},
-                                        {"snapshot_slab_count", host.snapshot_slab_count}}}}}};
+{"prefix_cache",
+          nlohmann::json{{"enabled", metrics.prefix_cache.enabled},
+                         {"device_snapshot_slots", metrics.prefix_cache.device_snapshot_slots},
+                         {"device_snapshot_slots_used",
+                          metrics.prefix_cache.device_snapshot_slots_used},
+                         {"evictions",
+                          nlohmann::json{{"demoted_total", metrics.prefix_cache.device_blocks_demoted_total},
+                                         {"subtree_erased_total", metrics.prefix_cache.subtree_erased_total},
+                                         {"branch_gc_removed_blocks_total",
+                                          metrics.prefix_cache.branch_gc_removed_blocks_total},
+                                         {"snapshots_deleted_total",
+                                          metrics.prefix_cache.snapshots_deleted_by_eviction_total},
+                                         {"retained_lane_evictions_total",
+                                          metrics.prefix_cache.retained_lane_evictions_total}}},
+                         {"host",
+                          nlohmann::json{{"enabled", host.enabled},
+                                         {"pinned_bytes", host.pinned_bytes},
+                                         {"used_bytes", host.used_bytes},
+                                         {"block_slab_count", host.block_slab_count},
+                                         {"snapshot_slab_count", host.snapshot_slab_count}}}}}};
 }
 
 } // namespace ninfer::serve

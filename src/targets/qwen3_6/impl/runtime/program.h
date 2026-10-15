@@ -79,6 +79,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t reuse_base                  = 0;
     PrefixReuseReason reuse_reason            = PrefixReuseReason::None;
     PrefixDivergence reuse_divergence;
+    PrefixAdmissionDiagnostics reuse_diag;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
@@ -242,6 +243,7 @@ struct RequestControl {
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
         PrefixReuseReason reuse_reason   = PrefixReuseReason::None;
         PrefixDivergence reuse_divergence;
+        PrefixAdmissionDiagnostics reuse_diag;
         std::vector<std::uint32_t> prefix_taps;
     };
 
@@ -333,6 +335,10 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    // Demand set (node ids) of the currently admitted plan's matched block path, owned by the
+    // scheduler thread for the duration of that admission round. Merged with every retained
+    // lane's committed node path inside evict_one_prefix_node().
+    void set_eviction_demand(std::span<const std::uint32_t> demand_nodes) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -427,6 +433,9 @@ public:
     std::unique_ptr<PrefixCacheSink> prefix_sink;
     std::unique_ptr<ninfer::prefix_cache::PrefixIndex> prefix_index;
     std::unique_ptr<ninfer::prefix_cache::HostSlabPool> prefix_host_pool; // M2
+    // Eviction demand for the current admission round (see set_eviction_demand).
+    std::vector<ninfer::prefix_cache::NodeId> eviction_demand_;
+    std::uint64_t retained_lane_evictions_total_ = 0;
     std::uint32_t prefix_snapshot_slots = 0;
     std::uint32_t prefix_max_new_taps   = 0;
     std::uint32_t prefix_ladder_tokens  = 0;
@@ -549,6 +558,10 @@ public:
 private:
     // Returns cache-owned pages to every rank's text-KV pool (page ids are identical across ranks).
     void release_cached_pages(const ninfer::prefix_cache::PoolPages& pages) noexcept;
+    // One pressure unit of the two-tier demand-aware device-tier eviction (demand-protected,
+    // dead-branch-first; demote preferred over delete; trim onto the demand set only as a last
+    // resort). Returns the topmost removed node, or kInvalidNode when nothing is evictable.
+    [[nodiscard]] ninfer::prefix_cache::NodeId evict_one_prefix_node();
     // Release a request's prefix-cache state: persist blocks to the host tier (M2), return any
     // unconsumed tap-slot reservations, and drop the request's node/snapshot pins so its committed
     // blocks become evictable. Called when a request completes or its lane is cleared; idempotent.

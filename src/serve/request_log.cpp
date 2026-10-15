@@ -22,6 +22,9 @@ namespace {
 
 using Json = nlohmann::json;
 
+// Must match prefix_cache's kBlockTokens (the content-addressed block size).
+inline constexpr std::uint32_t kDiagBlockTokens = 64U;
+
 std::uint64_t unix_time_ms() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     return static_cast<std::uint64_t>(
@@ -178,6 +181,50 @@ std::string prefix_divergence_str(const ninfer::PrefixDivergence& divergence) {
     out << "]";
     return out.str();
 }
+
+const char* stall_cause_name(ninfer::PrefixStallCause cause) {
+    switch (cause) {
+        case ninfer::PrefixStallCause::NotRun: return "not_run";
+        case ninfer::PrefixStallCause::Completed: return "completed";
+        case ninfer::PrefixStallCause::NoChild: return "no_child";
+        case ninfer::PrefixStallCause::HashCollision: return "hash_collision";
+    }
+    return "unknown";
+}
+
+const char* selection_veto_name(ninfer::PrefixSelectionVeto veto) {
+    switch (veto) {
+        case ninfer::PrefixSelectionVeto::None: return "none";
+        case ninfer::PrefixSelectionVeto::SnapshotGone: return "snapshot_gone";
+        case ninfer::PrefixSelectionVeto::FrontierInvalid: return "frontier_invalid";
+        case ninfer::PrefixSelectionVeto::TailNonZero: return "tail_nonzero";
+    }
+    return "unknown";
+}
+
+const char* candidate_reject_code_name(std::uint8_t reject) {
+    switch (reject) {
+        case 0: return "eligible";
+        case 1: return "superseded_or_gone";
+        case 2: return "frontier_past_prompt";
+        case 3: return "tail_mismatch";
+        case 4: return "no_usable_storage";
+        case 5: return "outranked";
+    }
+    return "unknown";
+}
+
+const char* snapshot_kind_name(std::uint8_t kind) {
+    switch (kind) {
+        case 0: return "tap";
+        case 1: return "endpoint";
+        case 2: return "output_boundary";
+        case 3: return "boundary";
+    }
+    return "unknown";
+}
+
+
 
 Json event_base(const std::string& server_instance_id, std::uint64_t timestamp, const char* event) {
     return Json{{"artifact_type", kRequestLogArtifactType},
@@ -352,8 +399,152 @@ std::string speculative_str(const GenerationMetrics& metrics) {
     }
     return out.str();
 }
-
 } // namespace
+
+std::string format_prefix_admission_compact(const ninfer::PrefixAdmissionDiagnostics& diag,
+                                            ninfer::PrefixReusePath verdict_path,
+                                            ninfer::PrefixReuseReason verdict_reason) {
+    // Silent when nothing was recomputed; the explanation exists to explain recompute.
+    if (diag.reuse_base >= diag.prompt_tokens) { return {}; }
+    std::ostringstream out;
+    out << " prefix_admission=";
+    if (!diag.allow_prefix_reuse || !diag.identity_reusable) {
+        out << "gates(allow=" << (diag.allow_prefix_reuse ? 1 : 0) << ",reusable="
+            << (diag.identity_reusable ? 1 : 0) << ")";
+    } else if (!diag.hybrid_enabled) {
+        out << "hybrid_off path=" << prefix_reuse_path_name(verdict_path);
+        if (diag.retained_sequence) {
+            out << " retained_frontier=F" << diag.retained_frontier;
+        } else {
+            out << " reason=" << prefix_reuse_reason_name(verdict_reason);
+        }
+    } else if (diag.walk_cause != ninfer::PrefixStallCause::Completed) {
+        out << "walk_stalled@B" << diag.matched_blocks << "/B" << diag.eligible_blocks
+            << " cause=" << stall_cause_name(diag.walk_cause);
+        if (diag.stall_sibling_count > 0U) {
+            out << " siblings=" << diag.stall_sibling_count;
+        }
+        if (diag.walk_cause == ninfer::PrefixStallCause::HashCollision) {
+            out << " (tokens or media extra differ)";
+        }
+    } else if (diag.selection_veto != ninfer::PrefixSelectionVeto::None) {
+        out << "walk_completed veto=" << selection_veto_name(diag.selection_veto);
+    } else if (verdict_path == ninfer::PrefixReusePath::BlockSnapshot) {
+        out << "block_reused B" << diag.reuse_base / kDiagBlockTokens << "/B"
+            << diag.eligible_blocks << " slots=" << diag.snapshot_slots_used << '/'
+            << diag.snapshot_slots_total;
+    } else {
+        out << "miss path=" << prefix_reuse_path_name(verdict_path)
+            << " reason=" << prefix_reuse_reason_name(verdict_reason);
+        if (diag.mtp_backend) { out << " mtp(downgraded)"; }
+    }
+    return out.str();
+}
+
+std::string format_prefix_admission_verbose(std::uint64_t request_id,
+                                            const ninfer::PrefixAdmissionDiagnostics& diag,
+                                            ninfer::PrefixReusePath verdict_path,
+                                            ninfer::PrefixReuseReason verdict_reason) {
+    if (!diag.hybrid_enabled) { return {}; }
+    const auto gi = [](std::uint32_t n) {
+        // Rough estimate; assumes an INT8 group-64 KV entry of ~16 bytes per token.
+        std::ostringstream o;
+        o << n << " tok [~" << std::fixed << std::setprecision(2)
+          << static_cast<double>(n) / 16.0 / 1048576.0 << " GiB]";
+        return o.str();
+    };
+    std::ostringstream v;
+    v << "[req " << request_id << "] prefix_recompute="
+      << (diag.prompt_tokens - diag.reuse_base) << " tok explanation:";
+v << "\n  [inputs] prompt=" << diag.prompt_tokens << " eligible_blocks=" << diag.eligible_blocks;
+    if (diag.eligible_blocks > 0) {
+        v << " (block=" << kDiagBlockTokens << " toks, trailing partial block excluded)";
+    }
+    v << " allow_reuse=" << (diag.allow_prefix_reuse ? "yes" : "NO")
+      << " identity_reusable=" << (diag.identity_reusable ? "yes" : "NO");
+    if (diag.retained_sequence) {
+        v << " retained_seq=YES frontier(F)=" << diag.retained_frontier;
+        if (diag.mtp_backend) {
+            const std::uint32_t mtp_valid = diag.mtp_kv_valid >= 1U ? diag.mtp_kv_valid - 1U : 0U;
+            v << " mtp_cache(F-1)valid=" << mtp_valid;
+        } else {
+            v << " mtp_cache=no";
+        }
+    }
+    if (diag.mtp_backend) {
+        v << " mtp_downgrade_gate(kv_valid=" << diag.mtp_kv_valid << (diag.mtp_cache_present ? "" : "(no cache)")
+          << ",tail_hidden_valid=" << (diag.tail_hidden_valid ? "yes" : "no") << ")";
+    }
+    v << "\n  [hybrid walk] eligible=" << diag.eligible_blocks
+      << " matched_blocks(B)=" << diag.matched_blocks << "/" << diag.eligible_blocks
+      << " => " << gi(diag.matched_blocks * kDiagBlockTokens);
+    switch (diag.walk_cause) {
+        case ninfer::PrefixStallCause::NotRun:
+            v << " [skipped] "
+              << (diag.eligible_blocks < 2
+                     ? "prompt < 2 blocks"
+                     : diag.matched_blocks == 0U ? "hash-chain start failed"
+                                                 : "");
+            break;
+        case ninfer::PrefixStallCause::Completed: v << " [OK] every eligible block matched the index."; break;
+        case ninfer::PrefixStallCause::NoChild:
+            v << " [STALLED at block " << diag.matched_blocks + 1U
+              << "] parent of block #" << diag.matched_blocks << ' ';
+            if (diag.stall_sibling_count == 0U) {
+                v << "has no live children: this exact block hash was never committed here "
+                  "(first turn in this thread, or a prior history was evicted).";
+            } else {
+                v << "has "
+                  << (diag.stall_sibling_count + 1U)
+                  << " other child blocks: an earlier request diverged at exactly this position, "
+                    "so the cache continues along that chain instead.";
+            }
+            break;
+        case ninfer::PrefixStallCause::HashCollision:
+            v << " [STALLED at block " << diag.matched_blocks + 1U << "] a same-hash child exists "
+              "but its stored 64 tokens or media extra differ from this prompt's block: an "
+                                   "earlier turn used different content at this position.";
+            break;
+    }
+    v << "\n  [snapshots on matched path] candidates_seen=" << diag.candidates_total
+      << ", showing deepest " << diag.candidates_shown << ":";
+    for (std::uint32_t i = 0; i < diag.candidates_shown; ++i) {
+        const auto& c = diag.candidates[i];
+        const std::uint32_t begin = c.anchor_depth * kDiagBlockTokens;
+        v << "\n    B" << begin / kDiagBlockTokens << " (" << begin << ".."
+          << c.frontier + 1U << ") kind=" << snapshot_kind_name(c.kind);
+        v << (c.device_resident ? " device=yes" : " device=no");
+        v << (c.host_restorable ? " host=yes" : " host=no");
+        v << " -> " << candidate_reject_code_name(c.reject);
+    }
+    if (diag.candidates_total > diag.candidates_shown) {
+        v << "\n    ... and " << diag.candidates_total - diag.candidates_shown
+          << " shallower ones not shown";
+    }
+    v << (diag.selection_veto != ninfer::PrefixSelectionVeto::None
+             ? " selection_veto=" : " selection_veto=none")
+      << selection_veto_name(diag.selection_veto);
+    v << "\n  [slots] device_snapshot_slots_used=" << diag.snapshot_slots_used << '/'
+      << diag.snapshot_slots_total << " max_new_taps_per_req=" << diag.max_new_taps;
+    v << "\n  [verdict] path=" << prefix_reuse_path_name(verdict_path)
+      << " reason=" << prefix_reuse_reason_name(verdict_reason)
+      << " reuse_base=" << diag.reuse_base << " => recomputed "
+      << (diag.prompt_tokens - diag.reuse_base) << ' ';
+    if (verdict_path == ninfer::PrefixReusePath::FullReset) {
+        if (!diag.allow_prefix_reuse || !diag.identity_reusable) {
+            v << "tokens because the prompt is not reusable for the engine (gate above).";
+        } else if (diag.walk_cause != ninfer::PrefixStallCause::Completed) {
+            v << "tokens because the content-addressed walk stalled: no matching chain past "
+               "the stall point exists in the cache.";
+        } else if (diag.selection_veto != ninfer::PrefixSelectionVeto::None) {
+            v << "tokens because the best candidate on the chain was rejected: "
+               << selection_veto_name(diag.selection_veto) << '.';
+        } else {
+            v << "tokens because no consumable snapshot survived on the matched chain.";
+        }
+    }
+    return v.str();
+}
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
@@ -456,6 +647,8 @@ std::string format_request_done(const RequestLogContext& context,
         << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path)
         << " reuse_reason=" << prefix_reuse_reason_name(metrics.prefix_reuse_reason)
         << prefix_divergence_str(metrics.prefix_divergence)
+        << format_prefix_admission_compact(metrics.prefix_admission, metrics.prefix_reuse_path,
+                                           metrics.prefix_reuse_reason)
         << " ttft=" << std::fixed
         << std::setprecision(0) << ttft_ms << "ms"
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
@@ -645,13 +838,52 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
             prompt_window.push_back(divergence.prompt_tokens[k]);
             resident_window.push_back(divergence.resident_tokens[k]);
         }
-        record["result"]["prefix_divergence"] =
-            Json{{"divergence_index", divergence.divergence_index},
-                 {"frontier_index", divergence.frontier_index},
-                 {"tokens_matched", divergence.tokens_matched},
-                 {"window_begin", divergence.window_begin},
-                 {"prompt_tokens", std::move(prompt_window)},
-                 {"resident_tokens", std::move(resident_window)}};
+record["result"]["prefix_divergence"] =
+             Json{{"divergence_index", divergence.divergence_index},
+                  {"frontier_index", divergence.frontier_index},
+                  {"tokens_matched", divergence.tokens_matched},
+                  {"window_begin", divergence.window_begin},
+                  {"prompt_tokens", std::move(prompt_window)},
+                  {"resident_tokens", std::move(resident_window)}};
+    }
+    const ninfer::PrefixAdmissionDiagnostics& admission = outcome.metrics.prefix_admission;
+    if (admission.hybrid_enabled) {
+        Json candidates = Json::array();
+        for (std::uint32_t i = 0; i < admission.candidates_shown; ++i) {
+            const auto& c = admission.candidates[i];
+            candidates.push_back(Json{
+                {"frontier", c.frontier},
+                {"anchor_depth", c.anchor_depth},
+                {"kind", snapshot_kind_name(c.kind)},
+                {"device_resident", c.device_resident},
+                {"host_restorable", c.host_restorable},
+                {"reject", candidate_reject_code_name(c.reject)},
+            });
+        }
+        record["result"]["prefix_admission"] = Json{
+{"reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
+            {"prompt_tokens", admission.prompt_tokens},
+            {"eligible_blocks", admission.eligible_blocks},
+            {"allow_prefix_reuse", admission.allow_prefix_reuse},
+            {"identity_reusable", admission.identity_reusable},
+            {"retained_sequence", admission.retained_sequence},
+            {"retained_frontier", admission.retained_frontier},
+            {"mtp_backend", admission.mtp_backend},
+            {"mtp_kv_valid", admission.mtp_kv_valid},
+            {"mtp_cache_present", admission.mtp_cache_present},
+            {"tail_hidden_valid", admission.tail_hidden_valid},
+            {"snapshot_slots", Json{{"used", admission.snapshot_slots_used},
+                                    {"total", admission.snapshot_slots_total},
+                                    {"max_new_taps_per_request", admission.max_new_taps}}},
+            {"walk",
+             Json{{"cause", stall_cause_name(admission.walk_cause)},
+                  {"matched_blocks", admission.matched_blocks},
+                  {"stall_sibling_count", admission.stall_sibling_count}}},
+            {"selection_veto", selection_veto_name(admission.selection_veto)},
+            {"candidates_total", admission.candidates_total},
+            {"candidates", std::move(candidates)},
+            {"reuse_base", admission.reuse_base},
+        };
     }
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
