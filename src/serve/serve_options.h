@@ -18,6 +18,8 @@ inline constexpr int kDefaultMaxTokens                    = 65536;
 inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
+inline constexpr std::uint32_t kDefaultPersistQueueCapacity = 4096;
+inline constexpr int kDefaultPersistReconnectMs             = 1000;
 
 struct ServeOptions {
     bool help_requested = false;
@@ -27,6 +29,11 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    // Request persistence: ship a copy of each parsed OpenAI request body to a remote
+    // persistence server over a framed TCP binary protocol. Empty endpoint => disabled.
+    std::string persist_endpoint;                 // "host:port"; empty => persistence off
+    std::uint32_t persist_queue_capacity          = kDefaultPersistQueueCapacity;
+    int persist_reconnect_ms                      = kDefaultPersistReconnectMs;
     std::uint32_t max_context              = 8192;
     // Rotary regime, mirroring the CLI. `--rope yarn` raises the ceiling `--max-context` is
     // checked against to `--yarn-origin x --yarn-factor`; Engine performs that check.

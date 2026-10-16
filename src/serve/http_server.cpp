@@ -128,7 +128,8 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
       response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path),
+      persistor_(options_) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
@@ -390,6 +391,17 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     }
 
     const std::uint64_t req_id = ++request_seq_;
+
+    // Copy the request body out of the hot path; the persistor drops when full so this never
+    // blocks or fails serving. Only well-formed requests for the served model are captured.
+    persistor_.enqueue(PersistRecord{
+        .request_id      = req_id,
+        .created_unix_ms = unix_time_now(),
+        .protocol        = "openai_chat_completions",
+        .model           = request.model,
+        .body            = req.body,
+    });
+
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(

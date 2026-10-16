@@ -47,6 +47,27 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     return static_cast<std::uint64_t>(value);
 }
 
+// Validates a "host:port" endpoint (optionally a bracketed IPv6 literal) with port in
+// [1, 65535]. Splitting on the last colon keeps [::1]:9100 valid while rejecting a bare host.
+void validate_persist_endpoint(const std::string& value) {
+    const std::size_t colon = value.rfind(':');
+    if (colon == std::string::npos || colon == 0) {
+        throw std::invalid_argument("--persist-endpoint must be host:port, got: " + value);
+    }
+    const std::string host      = value.substr(0, colon);
+    const std::string port_text = value.substr(colon + 1);
+    if (host.empty() || port_text.empty()) {
+        throw std::invalid_argument(
+            "--persist-endpoint host and port must both be non-empty: " + value);
+    }
+    char* end          = nullptr;
+    const long port    = std::strtol(port_text.c_str(), &end, 10);
+    if (end == port_text.c_str() || *end != '\0' || port < 1 || port > 65535) {
+        throw std::invalid_argument(
+            "--persist-endpoint port must be in [1,65535]: " + value);
+    }
+}
+
 RopeMode parse_rope_mode(const char* text) {
     const std::string value(text);
     if (value == "native") { return RopeMode::Native; }
@@ -175,6 +196,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
+           "[--persist-endpoint HOST:PORT --persist-queue-capacity N --persist-reconnect-ms N] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|iq4nl] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
@@ -193,6 +215,11 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --persist-endpoint HOST:PORT ships a copy of each parsed OpenAI request body\n"
+           "       to a remote persistence server over a framed TCP binary protocol; unset\n"
+           "       disables persistence. --persist-queue-capacity N bounds the in-memory queue\n"
+           "       (default 4096, drops when full so serving never blocks); --persist-reconnect-ms\n"
+           "       N sets the reconnect backoff (default 1000).\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -346,6 +373,23 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
+        } else if (arg == "--persist-endpoint") {
+            options.persist_endpoint = require_value("--persist-endpoint");
+            validate_persist_endpoint(options.persist_endpoint);
+        } else if (arg == "--persist-queue-capacity") {
+            const int capacity = parse_nonnegative_int(require_value("--persist-queue-capacity"),
+                                                       "persist-queue-capacity");
+            if (capacity == 0) {
+                throw std::invalid_argument("--persist-queue-capacity must be positive");
+            }
+            options.persist_queue_capacity = static_cast<std::uint32_t>(capacity);
+        } else if (arg == "--persist-reconnect-ms") {
+            const int reconnect_ms = parse_nonnegative_int(require_value("--persist-reconnect-ms"),
+                                                           "persist-reconnect-ms");
+            if (reconnect_ms == 0) {
+                throw std::invalid_argument("--persist-reconnect-ms must be positive");
+            }
+            options.persist_reconnect_ms = reconnect_ms;
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");

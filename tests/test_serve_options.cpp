@@ -2,6 +2,7 @@
 #include "serve/translate.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -326,6 +327,45 @@ int main() {
     }
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
+
+    // Request persistence options.
+    failures += check(defaults.persist_endpoint.empty(), "persist endpoint is not empty by default");
+    failures += check(defaults.persist_queue_capacity == 4096,
+                      "persist queue capacity default mismatch");
+    failures += check(defaults.persist_reconnect_ms == 1000,
+                      "persist reconnect-ms default mismatch");
+
+    const ServeOptions persisted = parse(
+        {"ninfer-serve", "model.ninfer", "--persist-endpoint", "127.0.0.1:9100",
+         "--persist-queue-capacity", "8", "--persist-reconnect-ms", "50"});
+    failures += check(persisted.persist_endpoint == "127.0.0.1:9100",
+                      "--persist-endpoint did not preserve its value");
+    failures += check(persisted.persist_queue_capacity == 8,
+                      "--persist-queue-capacity did not apply");
+    failures += check(persisted.persist_reconnect_ms == 50,
+                      "--persist-reconnect-ms did not apply");
+    failures += check(serve_usage_text("ninfer-serve").find("--persist-endpoint") != std::string::npos,
+                      "serve help omits --persist-endpoint");
+
+    auto expect_throw = [&](std::vector<std::string> args, const char* message) -> int {
+        bool threw = false;
+        try {
+            parse(std::move(args));
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        return check(threw, message);
+    };
+    failures += expect_throw({"ninfer-serve", "model.ninfer", "--persist-endpoint", "localhost"},
+                             "bare host (no port) was accepted");
+    failures += expect_throw({"ninfer-serve", "model.ninfer", "--persist-endpoint", "h:70000"},
+                             "out-of-range port was accepted");
+    failures += expect_throw({"ninfer-serve", "model.ninfer", "--persist-endpoint", ":9100"},
+                             "empty host was accepted");
+    failures += expect_throw({"ninfer-serve", "model.ninfer", "--persist-queue-capacity", "0"},
+                             "zero persist queue capacity was accepted");
+    failures += expect_throw({"ninfer-serve", "model.ninfer", "--persist-reconnect-ms", "0"},
+                             "zero persist reconnect-ms was accepted");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

@@ -43,6 +43,7 @@ API documentation.
 Runtime and Op references:
 
 - [Small-scale concurrent inference architecture](maintainer/concurrent-inference-architecture.md)
+- [Remote request persistence and the SQLite request log](maintainer/request-persistence.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
 - [IQ4_NL KV cache adoption plan (from the llama.cpp fork)](maintainer/iq4nl-kv-plan.md)
 - [Hybrid content-addressed prefix cache: V100X2 adaptation plan](maintainer/hybrid-prefix-cache-plan.md)

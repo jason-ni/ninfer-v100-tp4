@@ -11,6 +11,13 @@
 # consumed here rather than forwarded to ninfer-serve. Optional explicit destination:
 #   ./run-tp4.sh --raw-log              # -> profiles/raw/raw-output.jsonl
 #   ./run-tp4.sh --raw-log=/tmp/raw.jsonl
+#
+# --remote-req-log ensures the Python request-persistence receiver is running (spawning it
+# detached when its port is not already listening), stores the SQLite DB under
+# /media/optane/reqlogs, and forwards --persist-endpoint to ninfer-serve. Optional explicit
+# endpoint:
+#   ./run-tp4.sh --remote-req-log                    # -> 127.0.0.1:9100
+#   ./run-tp4.sh --remote-req-log=127.0.0.1:9101
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
@@ -54,6 +61,16 @@ host_cache_mib=${NINFER_V100X2_SERVE_HOST_CACHE_MIB:-28192}
 # pin with NINFER_V100X2_SERVE_PRESENCE_PENALTY.
 presence_penalty=${NINFER_V100X2_SERVE_PRESENCE_PENALTY:-1.0}
 
+# Returns 0 when something is accepting connections on the given port.
+port_listening() {
+    local host=$1 port=$2
+    if command -v ss >/dev/null 2>&1; then
+        [[ -n "$(ss -ltnH "sport = :${port}" 2>/dev/null)" ]]
+    else
+        (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null
+    fi
+}
+
 # Split the launcher-only flags (--kv-dtype, --raw-log, --vision) from the arguments forwarded to
 # ninfer-serve. --kv-dtype overrides NINFER_V100X2_SERVE_KV_DTYPE; a bare --raw-log uses the default
 # destination and --raw-log=PATH overrides it; NINFER_RAW_OUTPUT_LOG set in the environment is
@@ -70,11 +87,17 @@ Launcher options:
   --kv-dtype bf16|int8|iq4nl
                            KV cache storage type (default int8; overrides the environment)
   --raw-log[=PATH]         capture the engine's raw output (default profiles/raw/raw-output.jsonl)
+  --remote-req-log[=HOST:PORT]
+                           persist each request body to a SQLite DB under /media/optane/reqlogs
+                           via the Python receiver (default endpoint 127.0.0.1:9100); spawns the
+                           receiver detached when its port is not already listening
   -h, --help               show this help
 
 Environment: NINFER_V100X2_SERVE_KV_DTYPE, NINFER_V100X2_SERVE_MODEL_ID,
 NINFER_V100X2_SERVE_MAX_CONTEXT, NINFER_V100X2_SERVE_HOST_CACHE_MIB,
-NINFER_V100X2_SERVE_PRESENCE_PENALTY, CUDA_VISIBLE_DEVICES, NINFER_V100X2_SERVE_ARTIFACT.
+NINFER_V100X2_SERVE_PRESENCE_PENALTY, CUDA_VISIBLE_DEVICES, NINFER_V100X2_SERVE_ARTIFACT,
+NINFER_REMOTE_REQ_LOG_ENDPOINT, NINFER_REMOTE_REQ_LOG_DIR, NINFER_REMOTE_REQ_LOG_DB,
+NINFER_REMOTE_REQ_LOG_PYTHON.
 Run tools/v100/ninfer-v100x2-serve.sh --help for the full ninfer-serve option set.
 EOF
 }
@@ -82,6 +105,8 @@ EOF
 vision_requested=0
 max_context=262144
 raw_log_path=${NINFER_RAW_OUTPUT_LOG:-}
+remote_req_log=0
+remote_req_log_endpoint=""
 forwarded_args=()
 while [[ $# -gt 0 ]]; do
     arg=$1
@@ -134,6 +159,19 @@ while [[ $# -gt 0 ]]; do
             fi
             shift
             ;;
+        --remote-req-log)
+            remote_req_log=1
+            shift
+            ;;
+        --remote-req-log=*)
+            remote_req_log=1
+            remote_req_log_endpoint=${arg#--remote-req-log=}
+            if [[ -z "${remote_req_log_endpoint}" ]]; then
+                echo "run-tp4.sh: --remote-req-log= requires HOST:PORT" >&2
+                exit 2
+            fi
+            shift
+            ;;
         -h|--help)
             print_help
             exit 0
@@ -157,6 +195,52 @@ if [[ "${vision_requested}" -eq 1 && -z "${NINFER_V100X2_SERVE_ARTIFACT:-}" ]]; 
     #vision_artifact_default=/media/zt/models/orcarouter/coder390-basemtp.ninfer
     #vision_artifact_default=/media/zt/models/orcarouter/Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-MTP-DFlash2.ninfer
     export NINFER_V100X2_SERVE_ARTIFACT="${NINFER_V100X2_SERVE_VISION_ARTIFACT:-${vision_artifact_default}}"
+fi
+
+# --remote-req-log: ensure the Python request-persistence receiver is up, then point ninfer-serve
+# at it. The receiver is a long-lived shared service, so it is spawned detached and left running
+# across serve restarts; if its port is already listening we reuse that instance.
+if [[ "${remote_req_log}" -eq 1 ]]; then
+    req_endpoint=${remote_req_log_endpoint:-${NINFER_REMOTE_REQ_LOG_ENDPOINT:-127.0.0.1:9100}}
+    req_host=${req_endpoint%:*}
+    req_port=${req_endpoint##*:}
+    req_host=${req_host#[}
+    req_host=${req_host%]}
+    if [[ -z "${req_host}" || -z "${req_port}" || "${req_port}" == "${req_endpoint}" ]]; then
+        echo "run-tp4.sh: --remote-req-log endpoint must be HOST:PORT, got: ${req_endpoint}" >&2
+        exit 2
+    fi
+    req_db_dir=${NINFER_REMOTE_REQ_LOG_DIR:-/media/optane/reqlogs}
+    req_db=${NINFER_REMOTE_REQ_LOG_DB:-${req_db_dir}/request_persist.sqlite}
+    req_log_file=${NINFER_REMOTE_REQ_LOG_FILE:-${req_db_dir}/request_persist_server.log}
+    req_python=${NINFER_REMOTE_REQ_LOG_PYTHON:-python3}
+    req_server=${script_dir}/tools/request_persist/request_persist_server.py
+
+    if [[ ! -f "${req_server}" ]]; then
+        echo "run-tp4.sh: request-persistence receiver is missing: ${req_server}" >&2
+        exit 2
+    fi
+    mkdir -p -- "${req_db_dir}"
+
+    if port_listening "${req_host}" "${req_port}"; then
+        echo "remote req log: reusing receiver on ${req_host}:${req_port}" >&2
+    else
+        echo "remote req log: starting receiver on ${req_host}:${req_port} -> ${req_db}" >&2
+        nohup "${req_python}" "${req_server}" \
+            --host "${req_host}" --port "${req_port}" --db "${req_db}" \
+            >>"${req_log_file}" 2>&1 &
+        disown 2>/dev/null || true
+        # Wait briefly for the listener; the persistor also reconnects, so this only avoids an
+        # obviously broken spawn. Warn (do not abort) since persistence must never block serving.
+        for _ in $(seq 1 30); do
+            port_listening "${req_host}" "${req_port}" && break
+            sleep 0.1
+        done
+        if ! port_listening "${req_host}" "${req_port}"; then
+            echo "run-tp4.sh: receiver did not come up on ${req_host}:${req_port}; see ${req_log_file}" >&2
+        fi
+    fi
+    forwarded_args+=(--persist-endpoint "${req_endpoint}")
 fi
 
 exec "${script_dir}/tools/v100/ninfer-v100x2-serve.sh" \

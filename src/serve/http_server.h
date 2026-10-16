@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/request_persist.h"
 #include "serve/response_store.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
@@ -68,6 +69,7 @@ private:
     std::string public_model_id_;
     ResponseStore response_store_;
     JsonlRequestLog request_jsonl_;
+    RequestPersistor persistor_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;
