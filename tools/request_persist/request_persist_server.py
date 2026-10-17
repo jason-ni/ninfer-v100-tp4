@@ -589,7 +589,7 @@ class PersistServer:
                   db_path: str = "out/request_persist.sqlite",
                   logger: Optional[logging.Logger] = None,
                   http_host: str = "127.0.0.1", http_port: int = 9101,
-                  enable_http: bool = True, max_body_kb: int = 1024):
+                  enable_http: bool = True, max_body_kb: int = 0):
         self.host = host
         self.port = port
         self.db_path = db_path
@@ -726,7 +726,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="REST admin port; 0 binds an ephemeral port")
     parser.add_argument("--no-http", action="store_true",
                         help="disable the REST admin interface entirely")
-    parser.add_argument("--max-body-kb", type=int, default=1024,
+    parser.add_argument("--max-body-kb", type=int, default=0,
                         help="truncate stored request bodies above this size in KiB (0 disables)")
     return parser.parse_args(argv)
 
