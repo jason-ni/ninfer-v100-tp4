@@ -22,9 +22,9 @@ The transport is split into two owning components:
   reconnect backoff — plus the pure, transport-agnostic wire codec
   (`encode_persist_frame` / `decode_persist_frame`).
 - Python (`tools/request_persist/request_persist_server.py`): an asyncio TCP server with a frame
-  reader and a single-writer SQLite path (per-record commit, graceful shutdown), plus a stdlib
-  `http.server` REST admin interface on a separate port for querying and deleting stored records,
-  and a self-contained single-page web UI served at `GET /` on that same port.
+  reader and a single-writer, content-addressed SQLite path (per-record commit, graceful shutdown),
+  plus a stdlib `http.server` REST admin interface on a separate port for querying and deleting
+  stored records, and a self-contained single-page web UI served at `GET /` on that same port.
 
 The length prefix and the envelope are handled separately so the codec stays unit-testable on both
 sides. A golden-byte vector pins the exact encoding and is asserted identically by the C++ and
@@ -55,46 +55,61 @@ Envelope   = version(1) flags(1)
 
 ## Storage schema (SQLite)
 
+Bodies are stored **content-addressed**, not verbatim. Agent traffic resends the whole chat history
+(and the full `tools` schema) on every turn, so the same bytes recur across requests and across
+branches. A body is split into exact byte spans; each span is interned once in `chunks`; a request
+row references them, and a body is reconstructed byte-for-byte on read.
+
 ```sql
+CREATE TABLE chunks (               -- content-addressed byte spans (sha256)
+  id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  hash   BLOB    NOT NULL UNIQUE,   -- sha256(raw), the content address
+  raw    BLOB    NOT NULL,          -- exact byte span (framing or one message)
+  nbytes INTEGER NOT NULL,
+  refs   INTEGER NOT NULL DEFAULT 0 -- live request references, for GC
+);
 CREATE TABLE requests (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   request_id      INTEGER NOT NULL,   -- serve-side per-process seq
   created_unix_ms INTEGER NOT NULL,   -- serve enqueue time
   protocol        TEXT    NOT NULL,
   model           TEXT    NOT NULL,
-  body_json       TEXT    NOT NULL,   -- raw JSON body (source of truth)
   message_count   INTEGER,            -- extracted len(body["messages"]) if present
   stream          INTEGER,            -- extracted body["stream"] (0/1) if present
   received_at     TEXT    NOT NULL,   -- ISO8601 UTC receiver time
-  body_truncated  INTEGER NOT NULL DEFAULT 0,  -- 1 when body_json was cut by the size cap
-  body_orig_bytes INTEGER             -- original pre-truncation body size in bytes
+  head_id         INTEGER NOT NULL,   -- chunks: bytes up to and incl. the messages '['
+  tail_id         INTEGER NOT NULL,   -- chunks: bytes from the last element's end
+  msg_ids         BLOB    NOT NULL,   -- varint-packed ordered message chunk ids
+  body_len        INTEGER NOT NULL    -- reconstructed body size in bytes
 );
 CREATE INDEX idx_requests_model   ON requests(model);
 CREATE INDEX idx_requests_created ON requests(created_unix_ms);
 ```
 
-The full `body_json` is retained so the message history can later be modeled as a branching
-tree/DAG (append = new node; branch = pointer to an earlier node). That modeling is not implemented;
-this feature ships only the transport and storage plumbing.
+A body `{"model":...,"tools":[...],"messages":[m0,m1,...]}` splits into `head` (everything through
+the `[`, which carries the repeated `tools` block), one span per message (each carrying its leading
+separator, so appending a message never rewrites an earlier span), and `tail` (whitespace + `]` +
+the rest). Interning is by content hash, so a shared system prompt, `tools` schema, or earlier
+message is stored once no matter how many requests (or retries, or sessions) reference it — branches
+and cross-session overlap dedup with no parent-pointer bookkeeping. A body without a top-level
+`messages` array is stored whole as `head`.
 
-## Ingest size cap
+Deletion decrements each referenced chunk's `refs` and drops chunks that reach zero, so removing one
+request never deletes history still referenced by another.
 
-Persisting every body verbatim is what makes the log grow fast (bodies here average ~2 MB, dominated
-by base64 media). The receiver bounds the stored body size with `--max-body-kb` (default `1024` KiB;
-`0` disables):
+## Deduplication
 
-- On insert, `message_count`/`stream` are extracted from the **full** body first, then the stored
-  `body_json` is cut to at most that many bytes on a UTF-8 boundary when it exceeds the cap.
-- Oversized rows are flagged `body_truncated = 1` and carry their true original size in
-  `body_orig_bytes`, so you still know how big the request actually was. Both are surfaced on every
-  row and aggregated as `truncated_rows` in `GET /stats`.
-- Existing databases are migrated in place at startup (`ALTER TABLE ... ADD COLUMN`, a schema-only
-  change); old rows read as `body_truncated = 0`, `body_orig_bytes = NULL`.
+For the agent workload the store is proportional to *unique* content, not to request count. In a
+representative `qwen3.8-27b` log, 309 requests (~99 MB of bodies) collapse to ~1.9 MB of chunks
+(651 unique spans, ~43× smaller): the `tools` schema is identical across nearly all requests, and
+almost every message reappears on the next turn. `GET /stats` reports `unique_chunks` and
+`chunk_bytes`; compare against `body_chars.total` for the ratio. Because content is shared,
+`DELETE ...&vacuum` and `POST /vacuum` also reclaim any chunks whose reference count has dropped to
+zero.
 
-At the default 1 MiB cap, ordinary text requests stay intact while the largest base64-media requests
-are reduced by an order of magnitude. Tighten the cap with `NINFER_REMOTE_REQ_LOG_MAX_BODY_KB`
-(`run-tp4.sh`) or `--max-body-kb` (direct launch); pair with `DELETE ...&vacuum` to reclaim
-already-stored space.
+A legacy database written by the previous verbatim (`body_json`) schema is rebuilt into chunks and
+`VACUUM`-compacted automatically on first open (one-time); legacy bodies that were truncated by the
+removed ingest cap are retained as-is (their lost tail cannot be recovered).
 
 ## REST admin API
 
@@ -135,7 +150,7 @@ above (`/health`, `/stats`, `/requests`, `DELETE /requests`, `/vacuum`), so it a
 
 It provides:
 
-- a live stats strip (rows, DB file size, created range + stored unit, per-model/protocol counts, truncated count);
+- a live stats strip (rows, DB file size, created range + stored unit, per-model/protocol counts, unique chunks + stored bytes);
 - the same AND-combined filters as the REST API (model, protocol, stream, message range, body-size range,
   `id`/`ids`, `before`/`after`/age) with pagination and newest/oldest ordering;
 - a click-to-open record viewer that fetches one row and pretty-prints its full body, with Copy/Download;
@@ -161,8 +176,9 @@ already in the stored unit) or an ISO-8601 date/datetime (naive ⇒ UTC; `Z`/off
 
 ### Cleanup workflow
 
-Because bodies are retained verbatim (avg ~2.4 MB here, some >13 MB, mostly base64 media), the DB
-grows fast and deletion alone does not shrink the file — pair deletes with `vacuum`:
+Because bodies are deduplicated by content, the DB grows with unique content rather than with
+request count. Deletion still leaves free pages behind, so pair deletes with `vacuum` (which also
+GCs unreferenced chunks):
 
 ```bash
 BASE=http://127.0.0.1:9101
@@ -196,7 +212,7 @@ cleanup action.
   (loopback by default); the REST admin + web UI bind to `0.0.0.0` by default so they are reachable
   from other hosts, on port `9101`. Overridable with `NINFER_REMOTE_REQ_LOG_ENDPOINT`,
   `NINFER_REMOTE_REQ_LOG_HTTP_HOST`, `NINFER_REMOTE_REQ_LOG_HTTP_PORT`,
-  `NINFER_REMOTE_REQ_LOG_MAX_BODY_KB`, `NINFER_REMOTE_REQ_LOG_DIR`, `NINFER_REMOTE_REQ_LOG_DB`,
+  `NINFER_REMOTE_REQ_LOG_DIR`, `NINFER_REMOTE_REQ_LOG_DB`,
   and `NINFER_REMOTE_REQ_LOG_PYTHON`.
 
 `receiver (tools/request_persist/request_persist_server.py)`:
@@ -205,7 +221,6 @@ cleanup action.
   (`0` = ephemeral port), while `run-tp4.sh` passes `0.0.0.0` so the API and UI are reachable off-box.
   The TCP ingest listener is bound separately via `--host` and is not exposed by this setting.
 - `--no-http` — disable the REST admin interface (TCP ingest still runs).
-- `--max-body-kb N` — truncate stored request bodies above `N` KiB (default `1024`; `0` disables).
 
 ## Shutdown
 
@@ -252,14 +267,16 @@ trusted network.
 
 - `ninfer_request_persist_test`: codec golden bytes, round-trip, and reject cases — ok.
 - `ninfer_serve_options_test`: new-flag defaults, parsing, invalid values, and usage — ok.
-- Python `pytest tests/test_request_persist.py`: 30 passed — golden bytes matching the C++ vector,
-  decode/round-trip, frame reader, field extraction, DB insert/query, a real TCP loopback end-to-end
-  into SQLite, REST unit coverage (filter builder, ISO/epoch/unit parsing, flag semantics), ingest
-  size-cap truncation (oversized / multibyte-boundary / pre-cap-schema migration), web-UI serving
-  (`GET /` and `/index.html` return `text/html` with the page marker over a live ephemeral-port server),
-  and a full
-  TCP+REST end-to-end (insert with a truncated body → stats/list/get → delete by age, dry-run,
-  all+vacuum) over real sockets.
+- Python `pytest tests/test_request_persist.py`: 33 passed — golden bytes matching the C++ vector,
+  decode/round-trip, frame reader, field extraction, byte-exact body split (including irregular
+  whitespace, empty/absent `messages`, and multibyte text), append-stability of message spans,
+  varint id round-trip, content-addressed dedup (growing history collapses to a handful of chunks),
+  lossless reconstruction through insert/get/query, reference-count GC on delete, legacy
+  `body_json`-schema migration, a real TCP loopback end-to-end into SQLite, REST unit coverage
+  (filter builder, ISO/epoch/unit parsing, flag semantics), web-UI serving (`GET /` and `/index.html`
+  return `text/html` with the page marker over a live ephemeral-port server), and a full TCP+REST
+  end-to-end (insert large bodies → stats/list/get → delete by age, dry-run, all+vacuum) over real
+  sockets.
 - GPU end-to-end (real engine, qwen3.8-27b, TP2): two `/v1/chat/completions` requests (1-message and
   3-message history) completed; both rows landed in SQLite with the exact raw bodies
   (`message_count` 1 then 3); SIGTERM flushed the persistor and the receiver logged

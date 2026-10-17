@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NInfer request log</title>
 <!-- Request-persist admin UI (self-contained; no external assets). Marker for tests: -->
-<!-- ninfer-request-persist-ui v2 -->
+<!-- ninfer-request-persist-ui v3 -->
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --panel2:#1c2333; --border:#30363d;
@@ -57,7 +57,6 @@ table{border-collapse:collapse;width:100%;table-layout:fixed;font-size:19.5px}
   .num{text-align:right;font-variant-numeric:tabular-nums}
   .tag{display:inline-block;background:var(--chip);border-radius:5px;padding:1px 7px;font-size:16.5px;color:var(--muted)}
   .tag.stream{color:var(--accent)}
-  .tag.trunc{color:var(--warn)}
   .pager{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:10px 14px;
          background:var(--panel);border-radius:0 0 12px 12px;font-size:19.5px}
   .pager .pg{display:flex;gap:8px;align-items:center}
@@ -65,8 +64,6 @@ table{border-collapse:collapse;width:100%;table-layout:fixed;font-size:19.5px}
   .msg.err{display:block;background:#3a1512;color:var(--err)}
   .msg.info{display:block;background:#10233a;color:var(--accent)}
   .empty{padding:24px;text-align:center;color:var(--muted)}
-  .recovery-note{background:#2a2410;border-left:3px solid var(--warn);color:var(--fg);
-    padding:9px 13px;border-radius:6px;margin:0 0 14px;font-size:16.5px;line-height:1.5}
   /* ---- modal ---- */
   .overlay{position:fixed;inset:0;background:rgba(1,4,9,.78);display:none;align-items:flex-start;justify-content:center;padding:28px 16px;z-index:20;backdrop-filter:blur(2px)}
   .overlay.open{display:flex}
@@ -240,14 +237,13 @@ table{border-collapse:collapse;width:100%;table-layout:fixed;font-size:19.5px}
       <colgroup>
         <col style="width:5%"><col style="width:6%"><col style="width:16%">
         <col style="width:16%"><col style="width:14%"><col style="width:12%">
-        <col style="width:5%"><col style="width:7%"><col style="width:9%">
-        <col style="width:14%">
+        <col style="width:5%"><col style="width:7%"><col style="width:14%">
       </colgroup>
       <thead>
         <tr>
           <th>id</th><th>request_id</th><th>created</th><th>received</th>
           <th>protocol</th><th>model</th><th class="num">msgs</th><th>stream</th>
-          <th class="num">body</th><th>flags</th>
+          <th class="num">body</th>
         </tr>
       </thead>
       <tbody id="rows"></tbody>
@@ -731,100 +727,6 @@ table{border-collapse:collapse;width:100%;table-layout:fixed;font-size:19.5px}
       esc(JSON.stringify(m, null, 2)) + "</pre></div></div>";
   }
 
-  /* ---- optimistic JSON recovery for bodies truncated at ingest ----
-     A body cut mid-stream is a valid JSON prefix plus a broken tail. We keep
-     every *complete* message object and drop only the one(s) that were cut, so
-     a heavily-truncated conversation still renders instead of "not a JSON". */
-  function jsonScan(s, i) {
-    function ws(j) { while (j < s.length && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n' || s[j] === '\r')) j++; return j; }
-    function str(j) {
-      j++; var out = '';
-      while (j < s.length) {
-        var c = s[j];
-        if (c === '"') return { v: out, i: j + 1 };
-        if (c === '\\') {
-          var e = s[j + 1]; if (e === undefined) return { err: 'short' };
-          var ch;
-          if (e === '"') ch = '"'; else if (e === '\\') ch = '\\'; else if (e === '/') ch = '/';
-          else if (e === 'n') ch = '\n'; else if (e === 't') ch = '\t'; else if (e === 'r') ch = '\r';
-          else if (e === 'b') ch = '\b'; else if (e === 'f') ch = '\f';
-          else if (e === 'u') { var hex = s.substr(j + 2, 4); if (hex.length < 4) return { err: 'short' }; ch = String.fromCharCode(parseInt(hex, 16)); j += 4; }
-          else ch = e;
-          out += ch; j += 2;
-        } else { out += c; j++; }
-      }
-      return { err: 'short' };
-    }
-    function num(j) {
-      var k = j; while (k < s.length && /[0-9+\-.eE]/.test(s[k])) k++;
-      if (k === j) return { err: 'bad' };
-      var v = Number(s.slice(j, k)); if (isNaN(v)) return { err: 'bad' };
-      return { v: v, i: k };
-    }
-    function lit(j, w) { if (s.substr(j, w.length) === w) return { v: w === 'true' ? true : (w === 'false' ? false : null), i: j + w.length }; return { err: 'bad' }; }
-    function obj(j) {
-      j++; var o = {}; j = ws(j);
-      if (s[j] === '}') return { v: o, i: j + 1 };
-      for (;;) {
-        j = ws(j); if (s[j] !== '"') return { err: 'bad' };
-        var kr = str(j); if (kr.err) return { err: kr.err };
-        var key = kr.v; j = ws(kr.i);
-        if (s[j] !== ':') return { err: 'bad' };
-        var vr = val(j + 1); if (vr.err) return { err: vr.err };
-        o[key] = vr.v; j = ws(vr.i);
-        if (s[j] === ',') { j++; continue; }
-        if (s[j] === '}') return { v: o, i: j + 1 };
-        return { err: 'bad' };
-      }
-    }
-    function arr(j) {
-      j++; var a = []; j = ws(j);
-      if (s[j] === ']') return { v: a, i: j + 1 };
-      for (;;) {
-        j = ws(j);
-        var vr = val(j); if (vr.err) return { err: vr.err };
-        a.push(vr.v); j = ws(vr.i);
-        if (s[j] === ',') { j++; continue; }
-        if (s[j] === ']') return { v: a, i: j + 1 };
-        return { err: 'bad' };
-      }
-    }
-    function val(j) {
-      j = ws(j); var c = s[j];
-      if (c === '{') return obj(j);
-      if (c === '[') return arr(j);
-      if (c === '"') return str(j);
-      if (c === 't') return lit(j, 'true');
-      if (c === 'f') return lit(j, 'false');
-      if (c === 'n') return lit(j, 'null');
-      if (c === '-' || (c >= '0' && c <= '9')) return num(j);
-      return { err: 'bad' };
-    }
-    return val(i);
-  }
-
-  function recoverBody(raw) {
-    var m = /"messages"\s*:\s*\[/.exec(raw);
-    if (!m) return null;
-    var i = m.index + m[0].length, msgs = [];
-    for (;;) {
-      while (i < raw.length && (raw[i] === ' ' || raw[i] === '\t' || raw[i] === '\n' || raw[i] === '\r')) i++;
-      if (i >= raw.length || raw[i] === ']') break;
-      var r = jsonScan(raw, i);
-      if (r.err) break;
-      msgs.push(r.v); i = r.i;
-      while (i < raw.length && (raw[i] === ' ' || raw[i] === '\t' || raw[i] === '\n' || raw[i] === '\r')) i++;
-      if (i < raw.length && raw[i] === ',') i++; else break;
-    }
-    if (!msgs.length) return null;
-    var out = { messages: msgs, __recovered: true, __recoveredCount: msgs.length };
-    var mm = /"model"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(raw); if (mm) out.model = mm[1];
-    var ms = /"stream"\s*:\s*(true|false)/.exec(raw); if (ms) out.stream = ms[1] === 'true';
-    var mt = /"temperature"\s*:\s*(-?\d+(?:\.\d+)?)/.exec(raw); if (mt) out.temperature = Number(mt[1]);
-    var mk = /"max_tokens"\s*:\s*(-?\d+)/.exec(raw); if (mk) out.max_tokens = Number(mk[1]);
-    return out;
-  }
-
   function renderConversation(obj) {
     var msgs = (obj && Array.isArray(obj.messages)) ? obj.messages : null;
     if (!msgs) return '<div class="empty">No "messages" array found in this body. Use the Raw JSON tab.</div>';
@@ -900,7 +802,7 @@ table{border-collapse:collapse;width:100%;table-layout:fixed;font-size:19.5px}
       ["protocols", Object.keys(s.by_protocol || {}).map(function (m) {
         return '<span class="tag">' + esc(m) + "</span>";
       }).join(" ") || "—"],
-      ["truncated", s.truncated_rows + ' <small>rows</small>']
+      ["unique chunks", s.unique_chunks + ' <small>' + bytes(s.chunk_bytes) + '</small>']
     ];
     el.innerHTML = cells.map(function (x) {
       return '<div class="stat"><div class="k">' + x[0] + '</div><div class="v">' + x[1] + "</div></div>";
@@ -928,11 +830,6 @@ table{border-collapse:collapse;width:100%;table-layout:fixed;font-size:19.5px}
     $("rows").innerHTML = rows.map(function (r) {
       var streamTag = r.stream === 1 ? '<span class="tag stream">stream</span>'
                  : (r.stream === 0 ? '<span class="tag">non-stream</span>' : '');
-      var truncTag = r.body_truncated
-        ? '<span class="tag trunc">trunc' + (r.body_orig_bytes != null
-          ? ' orig ' + bytes(r.body_orig_bytes) : '') + '</span>' : '';
-      var flagText = r.body_truncated
-        ? ('trunc' + (r.body_orig_bytes != null ? ' orig ' + bytes(r.body_orig_bytes) : '')) : '';
       return '<tr data-id="' + r.id + '" class="' + (delset[r.id] ? "row-del" : "") + '">'
         + '<td class="num mono">' + r.id + '</td>'
         + '<td class="mono" title="' + esc(r.request_id) + '">' + esc(r.request_id) + '</td>'
@@ -943,7 +840,6 @@ table{border-collapse:collapse;width:100%;table-layout:fixed;font-size:19.5px}
         + '<td class="num">' + (r.message_count == null ? "—" : r.message_count) + "</td>"
         + '<td>' + (r.stream == null ? "—" : streamTag) + "</td>"
         + '<td class="num">' + bytes(r.body_bytes) + "</td>"
-        + '<td' + (flagText ? ' title="' + esc(flagText) + '"' : '') + '>' + truncTag + "</td>"
         + "</tr>";
     }).join("");
     $("empty").style.display = rows.length ? "none" : "block";
@@ -1006,32 +902,18 @@ table{border-collapse:collapse;width:100%;table-layout:fixed;font-size:19.5px}
       var flags = [];
       if (o.stream === 1) flags.push("stream"); else if (o.stream === 0) flags.push("non-stream");
       if (o.message_count != null) flags.push(o.message_count + " msgs");
-      if (o.body_truncated) flags.push("truncated");
       $("m-flags").textContent = flags.join(" · ");
-      $("m-meta-line").textContent = ts(o.created_unix_ms) + " · " + bytes(o.body_bytes) +
-        (o.body_orig_bytes != null && o.body_truncated ? " (orig " + bytes(o.body_orig_bytes) + ")" : "");
-      var parsed = null, recovered = null;
+      $("m-meta-line").textContent = ts(o.created_unix_ms) + " · " + bytes(o.body_bytes);
+      var parsed = null;
       try { parsed = JSON.parse(currentRaw); } catch (e) { parsed = null; }
-      if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.messages)) {
-        var rec = recoverBody(currentRaw);
-        if (rec && rec.messages && rec.messages.length) { parsed = rec; recovered = rec; }
-      }
       if (parsed && typeof parsed === "object" && Array.isArray(parsed.messages)) {
         $("m-params").innerHTML = metaParamsHtml(parsed);
-        var banner = "";
-        if (recovered) {
-          var total = (typeof o.message_count === "number") ? o.message_count : null;
-          banner = '<div class="recovery-note">⚠ Body was truncated at ingest — incrementally recovered ' +
-            recovered.messages.length + (total != null ? " of " + total : "") +
-            ' messages. The final message(s) may be incomplete or missing.</div>';
-        }
-        $("m-chat").innerHTML = banner + renderConversation(parsed);
+        $("m-chat").innerHTML = renderConversation(parsed);
       } else {
         $("m-params").innerHTML = "";
-        $("m-chat").innerHTML = '<div class="empty">Body could not be parsed even incrementally. See the Raw JSON tab.</div>';
+        $("m-chat").innerHTML = '<div class="empty">No "messages" array in this body. See the Raw JSON tab.</div>';
       }
       $("m-raw").textContent = prettify(currentRaw);
-      if (o.body_truncated) $("m-note").textContent = "Stored body was cut at ingest (max-body-kb).";
     }).catch(function (e) { $("m-chat").innerHTML = '<div class="empty">Error: ' + esc(e.message) + "</div>"; });
   }
 
@@ -1136,8 +1018,7 @@ table{border-collapse:collapse;width:100%;table-layout:fixed;font-size:19.5px}
 
   /* Expose pure renderers for headless testing (harmless in the browser). */
   window.__RP_UI__ = { renderMarkdown: renderMarkdown, renderConversation: renderConversation,
-    highlightCode: highlightCode, inlineMd: inlineMd, metaParamsHtml: metaParamsHtml, esc: esc,
-    recoverBody: recoverBody, jsonScan: jsonScan };
+    highlightCode: highlightCode, inlineMd: inlineMd, metaParamsHtml: metaParamsHtml, esc: esc };
 })();
 </script>
 </body>

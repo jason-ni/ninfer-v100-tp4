@@ -96,12 +96,13 @@ def test_db_insert_and_query() -> None:
                                '{"messages":[{"role":"user","content":"hi"}],"stream":true}')
         rps.insert_record(conn, rec)
         conn.commit()
-        row = conn.execute(
-            "SELECT request_id, created_unix_ms, protocol, model, body_json,"
-            " message_count, stream FROM requests").fetchone()
+        got = rps.get_request(conn, 1)
         conn.close()
-    assert row == (7, 123, "openai_chat_completions", "model-x",
-                   '{"messages":[{"role":"user","content":"hi"}],"stream":true}', 1, 1)
+    assert got["request_id"] == 7 and got["created_unix_ms"] == 123
+    assert got["protocol"] == "openai_chat_completions" and got["model"] == "model-x"
+    assert got["body"] == rec.body          # reconstructed byte-for-byte
+    assert got["message_count"] == 1 and got["stream"] == 1
+    assert got["body_bytes"] == len(rec.body)
 
 
 def test_end_to_end_loopback() -> None:
@@ -131,12 +132,11 @@ def test_end_to_end_loopback() -> None:
         asyncio.run(go())
 
         conn = sqlite3.connect(db)
-        rows = conn.execute(
-            "SELECT request_id, model, body_json FROM requests ORDER BY request_id").fetchall()
+        rows = rps.query_requests(conn, {"order": "asc", "limit": "10"})["rows"]
         conn.close()
-    assert [r[0] for r in rows] == [100, 101]
-    assert rows[0][2] == '{"messages":[{"role":"user"}]}'
-    assert rows[1][2] == '{"messages":[{"role":"a"}]}'
+    assert [r["request_id"] for r in rows] == [100, 101]
+    assert rows[0]["body"] == '{"messages":[{"role":"user"}]}'
+    assert rows[1]["body"] == '{"messages":[{"role":"a"}]}'
 
 
 # --- REST admin API --------------------------------------------------------
@@ -359,7 +359,7 @@ def test_rest_end_to_end(tmp_path) -> None:
                                 '{"messages":[{"role":"user","content":"hi"}]}')
 
     recs = [mk(1, 30), mk(2, 10), mk(3, 1)]
-    # rec 3 carries a >1 KiB body so the ingest size cap (max_body_kb=1) truncates it.
+    # rec 3 carries a large (>1 KiB) unique body: it must round-trip losslessly.
     recs[2] = rps.ParsedRecord(
         1, 3, now - 86400, "openai_chat_completions", "qwen3.8-27b",
         '{"messages":[{"role":"user","content":"' + "y" * 2000 + '"}]}')
@@ -367,7 +367,7 @@ def test_rest_end_to_end(tmp_path) -> None:
 
     async def go():
         server = rps.PersistServer(host="127.0.0.1", port=0, db_path=db,
-                                   http_host="127.0.0.1", http_port=0, max_body_kb=1)
+                                   http_host="127.0.0.1", http_port=0)
         await server.start()
         base = f"http://127.0.0.1:{server.http_bound_port}"
         try:
@@ -413,64 +413,124 @@ def test_rest_end_to_end(tmp_path) -> None:
     assert out["stats_after"][1]["rows"] == 1
     assert out["vacuum"][0] == 200 and out["vacuum"][1]["vacuumed"] is True
 
-    # ingest size cap: rec 3's >1 KiB body was truncated on insert, metadata preserved
+    # Bodies are stored losslessly: the >1 KiB unique body reconstructs byte-for-byte and its
+    # reconstructed size is reported as body_bytes.
     big_row = next(r for r in out["list"][1]["rows"] if r["request_id"] == 3)
-    assert big_row["body_truncated"] is True and big_row["body_orig_bytes"] > 1024
-    assert big_row["body_bytes"] <= 1024 and big_row["message_count"] == 1
-    assert all("body_truncated" in r and "body_orig_bytes" in r
-               for r in out["list"][1]["rows"])
-    assert out["stats"][1]["truncated_rows"] >= 1
+    assert big_row["message_count"] == 1 and big_row["body_bytes"] > 1024
+    assert out["stats"][1]["unique_chunks"] >= 1 and out["stats"][1]["chunk_bytes"] > 0
 
     conn = sqlite3.connect(db)
     assert conn.execute("select count(*) from requests").fetchone()[0] == 1
     conn.close()
 
 
-def test_insert_truncates_oversized_body(tmp_path) -> None:
-    db = str(tmp_path / "t.sqlite")
+def test_split_body_is_byte_exact() -> None:
+    bodies = [
+        '{"model":"m","messages":[{"role":"user","content":"hi"}]}',
+        '{"messages":[]}',
+        '{"a":1}',                                    # no messages key -> whole body is head
+        'not json',                                   # unparsable -> opaque
+        '{"messages":[{"role":"system","content":"中"},{"role":"user","content":"hi 世界"}]}',
+        '{"model":"m","temperature":0.5,"messages": [ {"role":"user","content":"x"} ,'
+        ' {"role":"assistant","content":"y"} ], "stream":true}',  # irregular whitespace
+        '{"messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b"},'
+        '{"role":"user","content":"c"}]}',
+    ]
+    for body in bodies:
+        head, parts, tail = rps.split_body(body)
+        assert head + b"".join(parts) + tail == body.encode("utf-8")
+
+
+def test_split_body_appends_do_not_rewrite_earlier_parts() -> None:
+    # Appending a message must leave every earlier span (and the tail) byte-identical, which is
+    # what makes an agent's growing history dedup to a handful of chunks.
+    def body(nmsgs):
+        msgs = "".join('{"role":"user","content":"m%d"},' % i for i in range(nmsgs))
+        msgs = msgs.rstrip(",")
+        return '{"model":"m","messages":[' + msgs + "]}"
+
+    prev_parts = None
+    for n in range(1, 6):
+        head, parts, tail = rps.split_body(body(n))
+        if prev_parts is not None:
+            assert parts[:len(prev_parts)] == prev_parts
+        prev_parts = parts
+
+
+def test_pack_unpack_ids_roundtrip() -> None:
+    for ids in ([], [0], [1, 2, 3], [127, 128, 300, 2 ** 40], list(range(500))):
+        assert rps.unpack_ids(rps.pack_ids(ids)) == list(ids)
+
+
+def test_content_addressing_dedups_shared_history(tmp_path) -> None:
+    db = str(tmp_path / "cas.sqlite")
     conn = rps.init_db(db)
-    big = '{"model":"m","messages":[{"role":"user","content":"' + "x" * 5000 + '"}]}'
-    rps.insert_record(conn, rps.ParsedRecord(1, 1, 10, "p", "m", big), max_body_bytes=1024)
-    small = '{"model":"m","messages":[{"role":"user","content":"hi"}]}'
-    rps.insert_record(conn, rps.ParsedRecord(1, 2, 20, "p", "m", small), max_body_bytes=1024)
+    def mk(rid, msgs):
+        return rps.ParsedRecord(1, rid, 1000 + rid, "openai_chat_completions", "m",
+                                json.dumps({"model": "m", "tools": [{"x": 1}], "messages": msgs}))
+    recs = [
+        mk(1, [{"role": "system", "content": "sys"}]),
+        mk(2, [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]),
+        mk(3, [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"},
+               {"role": "assistant", "content": "yo"}]),
+    ]
+    for rec in recs:
+        rps.insert_record(conn, rec)
     conn.commit()
-    big_row = conn.execute(
-        "SELECT body_json, body_truncated, body_orig_bytes, message_count FROM requests"
-        " WHERE request_id=1").fetchone()
-    small_row = conn.execute(
-        "SELECT body_json, body_truncated, body_orig_bytes FROM requests"
-        " WHERE request_id=2").fetchone()
+    # head (tools framing), tail, and the three distinct messages -> 5 unique chunks, not 15.
+    assert conn.execute("select count(*) from chunks").fetchone()[0] == 5
+    for rec in recs:
+        got = rps.get_request(conn, rec.request_id)
+        assert got["body"] == rec.body
     conn.close()
-    assert len(big_row[0].encode("utf-8")) <= 1024
-    assert big_row[1] == 1 and big_row[2] == len(big.encode("utf-8"))
-    assert big_row[3] == 1  # message_count extracted from the full pre-truncation body
-    assert small_row[0] == small and small_row[1] == 0 \
-        and small_row[2] == len(small.encode("utf-8"))
 
 
-def test_insert_multibyte_boundary_safe(tmp_path) -> None:
-    db = str(tmp_path / "mb.sqlite")
+def test_delete_refcounts_and_gcs_orphan_chunks(tmp_path) -> None:
+    db = str(tmp_path / "gc.sqlite")
     conn = rps.init_db(db)
-    body = "中文" * 1000  # 3-byte UTF-8 chars; 6000 bytes total
-    rps.insert_record(conn, rps.ParsedRecord(1, 1, 10, "p", "m", body), max_body_bytes=1000)
+    def mk(rid, msgs):
+        return rps.ParsedRecord(1, rid, 1000 + rid, "p", "m",
+                                json.dumps({"messages": msgs}))
+    rps.insert_record(conn, mk(1, [{"role": "system", "content": "s"}]))
+    rps.insert_record(conn, mk(2, [{"role": "system", "content": "s"},
+                                   {"role": "user", "content": "u"}]))
     conn.commit()
-    (stored,) = conn.execute("SELECT body_json FROM requests WHERE request_id=1").fetchone()
+    total = conn.execute("select count(*) from chunks").fetchone()[0]
     conn.close()
-    assert len(stored.encode("utf-8")) <= 1000  # cut on a UTF-8 boundary, no crash
+    # Deleting request 2 frees only its unique "u" chunk; the shared system/framing chunks stay.
+    with rps._open_db(db) as c:
+        out = rps.delete_requests(c, db, {"ids": "2"}, False, False)
+    assert out["deleted"] == 1
+    conn = sqlite3.connect(db)
+    left = conn.execute("select count(*) from chunks").fetchone()[0]
+    bodies = rps.query_requests(conn, {"order": "asc"})["rows"]
+    conn.close()
+    assert left == total - 1
+    assert bodies[0]["body"] == mk(1, [{"role": "system", "content": "s"}]).body
 
 
-def test_init_db_migrates_pre_cap_schema(tmp_path) -> None:
-    # A database created before the cap existed must gain the columns in place on open.
-    db = str(tmp_path / "old.sqlite")
+def test_init_db_migrates_legacy_body_json_schema(tmp_path) -> None:
+    # A database created by the previous verbatim-body schema must be rebuilt into chunks on open,
+    # reconstructing the original bodies.
+    db = str(tmp_path / "legacy.sqlite")
+    body = '{"model":"m","messages":[{"role":"user","content":"hi"}]}'
     conn = sqlite3.connect(db)
     conn.executescript(
         "CREATE TABLE requests (id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " request_id INTEGER NOT NULL, created_unix_ms INTEGER NOT NULL,"
         " protocol TEXT NOT NULL, model TEXT NOT NULL, body_json TEXT NOT NULL,"
-        " message_count INTEGER, stream INTEGER, received_at TEXT NOT NULL)")
+        " message_count INTEGER, stream INTEGER, received_at TEXT NOT NULL,"
+        " body_truncated INTEGER NOT NULL DEFAULT 0, body_orig_bytes INTEGER);")
+    conn.execute("INSERT INTO requests (request_id, created_unix_ms, protocol, model,"
+                 " body_json, message_count, stream, received_at) VALUES (7, 42, 'p', 'm', ?,"
+                 " 1, 1, '2026-01-01T00:00:00+00:00')", (body,))
     conn.commit()
     conn.close()
     conn = rps.init_db(db)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(requests)")}
+    got = rps.get_request(conn, 1)
     conn.close()
-    assert {"body_truncated", "body_orig_bytes"} <= cols
+    assert "body_json" not in cols and {"head_id", "tail_id", "msg_ids"} <= cols
+    assert got["request_id"] == 7 and got["created_unix_ms"] == 42
+    # message_count/stream are re-derived from the body (the body here has no "stream").
+    assert got["body"] == body and got["message_count"] == 1 and got["stream"] is None

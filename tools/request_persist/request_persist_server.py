@@ -6,6 +6,13 @@ those frames, extracts the JSON body, and stores each record in SQLite. A stdlib
 ``http.server`` REST admin interface on a separate port exposes query/delete/vacuum over the stored
 records (``GET /health``/``/stats``/``/requests``, ``DELETE /requests``, ``POST /vacuum``).
 
+Agent traffic resends the whole chat history on every turn, so storing each body verbatim is almost
+entirely duplicated (a repeated ``tools`` schema and every earlier message). The receiver instead
+stores bodies **content-addressed**: the head/tail framing around the ``messages`` array and each
+message element become deduplicated ``chunks``, and a request row references them by id, so identical
+content is stored once regardless of how many requests (or branches) reference it. A body is
+reconstructed byte-for-byte on read.
+
 The wire codec (``encode_envelope`` / ``decode_envelope``) is transport-agnostic and
 is asserted against the same golden byte vector as the C++ sender's unit test, so the
 cross-language contract is pinned on both sides.
@@ -14,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -23,6 +31,7 @@ import sqlite3
 import struct
 import threading
 import time
+from collections import Counter
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -109,34 +118,62 @@ async def read_frame(reader: asyncio.StreamReader) -> Optional[ParsedRecord]:
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS chunks (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash   BLOB    NOT NULL UNIQUE,   -- sha256(raw); the content address
+    raw    BLOB    NOT NULL,          -- exact byte span (framing or one message)
+    nbytes INTEGER NOT NULL,
+    refs   INTEGER NOT NULL DEFAULT 0 -- live request references, for GC
+);
 CREATE TABLE IF NOT EXISTS requests (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id      INTEGER NOT NULL,
     created_unix_ms INTEGER NOT NULL,
     protocol        TEXT    NOT NULL,
     model           TEXT    NOT NULL,
-    body_json       TEXT    NOT NULL,
     message_count   INTEGER,
     stream          INTEGER,
     received_at     TEXT    NOT NULL,
-    body_truncated  INTEGER NOT NULL DEFAULT 0,
-    body_orig_bytes INTEGER
+    head_id         INTEGER NOT NULL,  -- chunks: bytes up to and incl. messages '['
+    tail_id         INTEGER NOT NULL,  -- chunks: bytes from the last element's end
+    msg_ids         BLOB    NOT NULL,  -- varint-packed, ordered message chunk ids
+    body_len        INTEGER NOT NULL   -- reconstructed body size in bytes
 );
 CREATE INDEX IF NOT EXISTS idx_requests_model   ON requests(model);
 CREATE INDEX IF NOT EXISTS idx_requests_created ON requests(created_unix_ms);
 """
 
+# Full request-row column list; the fixed order is relied on by row_to_dict and the
+# reconstruction helpers (indices 8/9/10 are head_id/tail_id/msg_ids).
+_REQUEST_COLS = ("id, request_id, created_unix_ms, protocol, model, message_count,"
+                 " stream, received_at, head_id, tail_id, msg_ids, body_len")
 
-def _ensure_columns(conn: sqlite3.Connection) -> None:
-    """Add the truncation-tracking columns to databases created before they existed.
 
-    ``ADD COLUMN`` is a schema-only change in SQLite (no row rewrite), so this is cheap even on a
-    large existing database and runs idempotently on every startup."""
+def _migrate_legacy(conn: sqlite3.Connection) -> None:
+    """Rebuild a pre-content-addressed database (a ``requests`` table with a ``body_json``
+    column) into the chunked schema.
+
+    Each legacy body is split and re-inserted through the same path new traffic uses, so the
+    chunk store is populated correctly. Legacy bodies that were truncated by the removed ingest
+    cap are stored as-is (the lost tail cannot be recovered)."""
     have = {row[1] for row in conn.execute("PRAGMA table_info(requests)")}
-    if "body_truncated" not in have:
-        conn.execute("ALTER TABLE requests ADD COLUMN body_truncated INTEGER NOT NULL DEFAULT 0")
-    if "body_orig_bytes" not in have:
-        conn.execute("ALTER TABLE requests ADD COLUMN body_orig_bytes INTEGER")
+    if "body_json" not in have:
+        return
+    conn.executescript(SCHEMA)
+    legacy = conn.execute(
+        "SELECT request_id, created_unix_ms, protocol, model, body_json, received_at"
+        " FROM requests ORDER BY id").fetchall()
+    conn.execute("DROP TABLE requests")
+    conn.executescript(SCHEMA)
+    for request_id, created, protocol, model, body, received_at in legacy:
+        rec = ParsedRecord(version=PROTOCOL_VERSION, request_id=request_id,
+                           created_unix_ms=created, protocol=protocol, model=model,
+                           body=body or "")
+        insert_record(conn, rec, received_at=received_at)
+    conn.commit()
+    # One-time reclaim: the rebuild frees the old verbatim pages but leaves them in the file until
+    # a VACUUM rewrites it. Run it here so the disk saving is realized without a manual step.
+    conn.execute("VACUUM")
 
 
 def init_db(path: str) -> sqlite3.Connection:
@@ -148,8 +185,8 @@ def init_db(path: str) -> sqlite3.Connection:
     # REST read/delete contends with the single serial insert writer (per-record commits). The
     # DB keeps its existing journal mode (rollback); VACUUM reclaims space by rewriting the main
     # file, which is what the "freed bytes" reporting measures.
+    _migrate_legacy(conn)
     conn.executescript(SCHEMA)
-    _ensure_columns(conn)
     conn.commit()
     return conn
 
@@ -170,28 +207,178 @@ def extract_fields(body: str):
     return message_count, stream
 
 
-def insert_record(conn: sqlite3.Connection, rec: ParsedRecord,
-                  max_body_bytes: int = 0) -> None:
-    """Insert one record. ``message_count``/``stream`` are extracted from the full body first;
-    then, when ``max_body_bytes`` > 0 and the body is larger, the stored body is cut to that many
-    bytes on a UTF-8 boundary and flagged (body_truncated=1). The original size is always recorded
-    in body_orig_bytes."""
-    message_count, stream = extract_fields(rec.body)
-    received_at = datetime.now(timezone.utc).isoformat()
-    raw = rec.body.encode("utf-8") if isinstance(rec.body, str) else bytes(rec.body)
-    orig_bytes = len(raw)
-    if max_body_bytes > 0 and orig_bytes > max_body_bytes:
-        stored = raw[:max_body_bytes].decode("utf-8", "ignore")
-        truncated = 1
+# ---------------------------------------------------------------------------
+# Content-addressed body storage. A body is split into exact byte spans so it can
+# be reconstructed byte-for-byte: `head` up to the messages '[' , one span per
+# array element (each carrying its leading separator), and `tail`. Appending a
+# message therefore never rewrites an existing span, which is exactly the agent
+# traffic pattern; repeated `tools` framing and repeated messages collapse to one
+# stored chunk irrespective of how many requests (or branches) reference them.
+# ---------------------------------------------------------------------------
+
+_DECODER = json.JSONDecoder()
+
+
+def _skip_ws(text: str, i: int) -> int:
+    while i < len(text) and text[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+def _locate_messages_array(text: str):
+    """Index of the '[' opening the top-level "messages" array, or None."""
+    n = len(text)
+    i = _skip_ws(text, 0)
+    if i >= n or text[i] != "{":
+        return None
+    i += 1
+    while True:
+        i = _skip_ws(text, i)
+        if i >= n or text[i] == "}":
+            return None
+        try:
+            key, i = _DECODER.raw_decode(text, i)
+            i = _skip_ws(text, i)
+            if i >= n or text[i] != ":":
+                return None
+            i = _skip_ws(text, i + 1)
+            if key == "messages":
+                return i
+            _, i = _DECODER.raw_decode(text, i)
+        except ValueError:
+            return None
+        i = _skip_ws(text, i)
+        if i < n and text[i] == ",":
+            i += 1
+
+
+def split_body(body) -> tuple[bytes, list[bytes], bytes]:
+    """Split a body into ``(head, parts, tail)`` byte spans with
+    ``head + b"".join(parts) + tail == body`` exactly.
+
+    A body without a top-level ``messages`` array is returned whole as ``head``.
+    """
+    if isinstance(body, str):
+        text = body
     else:
-        stored = rec.body if isinstance(rec.body, str) else raw.decode("utf-8", "replace")
-        truncated = 0
+        text = bytes(body).decode("utf-8")
+    j = _locate_messages_array(text)
+    if j is None or j >= len(text) or text[j] != "[":
+        return (text.encode("utf-8"), [], b"")
+    n = len(text)
+    if _skip_ws(text, j + 1) < n and text[_skip_ws(text, j + 1)] == "]":
+        return (text[:j + 1].encode("utf-8"), [], text[j + 1:].encode("utf-8"))
+    parts: list[str] = []
+    prev = j + 1
+    k = _skip_ws(text, j + 1)
+    while True:
+        try:
+            _, end = _DECODER.raw_decode(text, k)
+        except ValueError:  # malformed array: keep the whole body as one opaque chunk
+            return (text.encode("utf-8"), [], b"")
+        parts.append(text[prev:end])
+        prev = end
+        m = _skip_ws(text, end)
+        if m < n and text[m] == ",":
+            k = _skip_ws(text, m + 1)
+            continue
+        # Everything from the last element's end (whitespace, ']', and the rest of the object).
+        return (text[:j + 1].encode("utf-8"),
+                [p.encode("utf-8") for p in parts],
+                text[end:].encode("utf-8"))
+
+
+def pack_ids(ids) -> bytes:
+    """Pack a sequence of non-negative ids as unsigned LEB128 varints."""
+    out = bytearray()
+    for v in ids:
+        while True:
+            b = v & 0x7F
+            v >>= 7
+            out.append(b | 0x80 if v else b)
+            if not v:
+                break
+    return bytes(out)
+
+
+def unpack_ids(blob: bytes) -> list[int]:
+    out: list[int] = []
+    v = shift = 0
+    for b in blob:
+        v |= (b & 0x7F) << shift
+        if b & 0x80:
+            shift += 7
+        else:
+            out.append(v)
+            v = shift = 0
+    return out
+
+
+def _chunk_id(conn: sqlite3.Connection, raw: bytes) -> int:
+    """Intern one byte span, returning its chunk id and bumping its reference count."""
+    h = hashlib.sha256(raw).digest()
+    row = conn.execute("SELECT id FROM chunks WHERE hash = ?", (h,)).fetchone()
+    if row is not None:
+        conn.execute("UPDATE chunks SET refs = refs + 1 WHERE id = ?", (row[0],))
+        return row[0]
+    cur = conn.execute(
+        "INSERT INTO chunks (hash, raw, nbytes, refs) VALUES (?, ?, ?, 1)",
+        (h, raw, len(raw)))
+    assert cur.lastrowid is not None
+    return cur.lastrowid
+
+
+def _chunk_map(conn: sqlite3.Connection, ids) -> dict:
+    ids = list(ids)
+    out: dict[int, bytes] = {}
+    for i in range(0, len(ids), 900):  # stay under SQLite's bound-parameter limit
+        batch = ids[i:i + 900]
+        placeholders = ",".join("?" * len(batch))
+        for cid, raw in conn.execute(
+                f"SELECT id, raw FROM chunks WHERE id IN ({placeholders})", batch):
+            out[cid] = raw
+    return out
+
+
+def _bodies_for(conn: sqlite3.Connection, rows) -> list[str]:
+    """Reconstruct the decoded body for each ``(head_id, tail_id, msg_ids)`` reference."""
+    refs = [(h, t, unpack_ids(m)) for (h, t, m) in rows]
+    needed = set()
+    for h, t, mids in refs:
+        needed.add(h)
+        needed.add(t)
+        needed.update(mids)
+    cmap = _chunk_map(conn, needed)
+    bodies = []
+    for h, t, mids in refs:
+        raw = b"".join([cmap[h], *(cmap[m] for m in mids), cmap[t]])
+        bodies.append(raw.decode("utf-8", "replace"))
+    return bodies
+
+
+def insert_record(conn: sqlite3.Connection, rec: ParsedRecord,
+                  received_at: Optional[str] = None) -> None:
+    """Store one request content-addressed: split the body, intern its chunks, and insert a
+    row that references them. ``message_count``/``stream`` come from the body; ``received_at``
+    defaults to now (callers migrating legacy rows pass the original)."""
+    body = rec.body if isinstance(rec.body, str) else bytes(rec.body).decode("utf-8", "replace")
+    message_count, stream = extract_fields(body)
+    raw = body.encode("utf-8")
+    try:
+        head, parts, tail = split_body(body)
+    except UnicodeDecodeError:
+        head, parts, tail = raw, [], b""
+    head_id = _chunk_id(conn, head)
+    tail_id = _chunk_id(conn, tail)
+    msg_ids = pack_ids([_chunk_id(conn, p) for p in parts])
+    if received_at is None:
+        received_at = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO requests (request_id, created_unix_ms, protocol, model,"
-        " body_json, message_count, stream, received_at, body_truncated, body_orig_bytes)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (rec.request_id, rec.created_unix_ms, rec.protocol, rec.model, stored,
-         message_count, stream, received_at, truncated, orig_bytes),
+        " message_count, stream, received_at, head_id, tail_id, msg_ids, body_len)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (rec.request_id, rec.created_unix_ms, rec.protocol, rec.model,
+         message_count, stream, received_at, head_id, tail_id, msg_ids, len(raw)),
     )
 
 
@@ -289,9 +476,9 @@ def build_request_filter(params: dict, unit: str):
         add("message_count IS NOT NULL AND message_count <= ?",
             int(params["max_messages"]))
     if params.get("min_body_kb"):
-        add("length(body_json) >= ?", int(float(params["min_body_kb"]) * 1024))
+        add("body_len >= ?", int(float(params["min_body_kb"]) * 1024))
     if params.get("max_body_kb"):
-        add("length(body_json) <= ?", int(float(params["max_body_kb"]) * 1024))
+        add("body_len <= ?", int(float(params["max_body_kb"]) * 1024))
     if params.get("id"):
         add("id = ?", int(params["id"]))
     if params.get("ids"):
@@ -325,9 +512,9 @@ def _db_file_bytes(db_path: str) -> int:
     return os.path.getsize(db_path) if os.path.exists(db_path) else 0
 
 
-def row_to_dict(row, include_body: bool) -> dict:
-    (rec_id, request_id, created, protocol, model, body, message_count, stream,
-     received_at, body_len, body_truncated, body_orig_bytes) = row
+def row_to_dict(row, body: Optional[str] = None) -> dict:
+    (rec_id, request_id, created, protocol, model, message_count, stream,
+     received_at, _head_id, _tail_id, _msg_ids, body_len) = row
     d = {
         "id": rec_id,
         "request_id": request_id,
@@ -337,13 +524,10 @@ def row_to_dict(row, include_body: bool) -> dict:
         "message_count": message_count,
         "stream": stream,
         "received_at": received_at,
-        # SQLite length() is a character count; for the ASCII/base64 chat bodies this
-        # store it equals the byte length, which is what drives the on-disk size.
+        # Reconstructed body size in bytes; drives the on-disk size accounting.
         "body_bytes": body_len,
-        "body_truncated": bool(body_truncated),
-        "body_orig_bytes": body_orig_bytes,
     }
-    if include_body and body is not None:
+    if body is not None:
         d["body"] = body
     return d
 
@@ -367,23 +551,21 @@ def query_requests(conn: sqlite3.Connection, params: dict) -> dict:
     offset = max(0, int(params.get("offset", "0")))
     order = "id ASC" if params.get("order", "desc").strip().lower() == "asc" else "id DESC"
     total = conn.execute("SELECT COUNT(*) FROM requests" + where, args).fetchone()[0]
-    body_col = "body_json" if include_body else "NULL"
-    sql = ("SELECT id, request_id, created_unix_ms, protocol, model, "
-           f"{body_col} AS body, message_count, stream, received_at, "
-           f"length(body_json) AS body_len, body_truncated, body_orig_bytes "
-           f"FROM requests{where} ORDER BY {order} LIMIT ? OFFSET ?")
-    rows = conn.execute(sql, args + [limit, offset]).fetchall()
+    rows = conn.execute(
+        f"SELECT {_REQUEST_COLS} FROM requests{where} ORDER BY {order} LIMIT ? OFFSET ?",
+        args + [limit, offset]).fetchall()
+    bodies = _bodies_for(conn, [(r[8], r[9], r[10]) for r in rows]) if include_body \
+        else [None] * len(rows)
     return {"total": total, "offset": offset, "limit": limit, "order": order,
-            "rows": [row_to_dict(r, include_body) for r in rows]}
+            "rows": [row_to_dict(r, bodies[i]) for i, r in enumerate(rows)]}
 
 
 def get_request(conn: sqlite3.Connection, row_id: int):
-    row = conn.execute(
-        "SELECT id, request_id, created_unix_ms, protocol, model, body_json,"
-        " message_count, stream, received_at, length(body_json),"
-        " body_truncated, body_orig_bytes FROM requests WHERE id = ?",
-        (row_id,)).fetchone()
-    return None if row is None else row_to_dict(row, True)
+    row = conn.execute(f"SELECT {_REQUEST_COLS} FROM requests WHERE id = ?",
+                       (row_id,)).fetchone()
+    if row is None:
+        return None
+    return row_to_dict(row, _bodies_for(conn, [(row[8], row[9], row[10])])[0])
 
 
 def delete_requests(conn: sqlite3.Connection, db_path: str, params: dict,
@@ -398,7 +580,19 @@ def delete_requests(conn: sqlite3.Connection, db_path: str, params: dict,
         n = conn.execute("SELECT COUNT(*) FROM requests" + where, args).fetchone()[0]
         return {"deleted": 0, "would_delete": n, "dry_run": True, "vacuumed": False}
     bytes_before = _db_file_bytes(db_path)
+    # Each request holds one reference to every chunk it uses; release them, then drop any chunk
+    # whose reference count reaches zero so shared history is never deleted out from under a
+    # surviving request.
+    refs = Counter()
+    for head_id, tail_id, msg_ids in conn.execute(
+            f"SELECT head_id, tail_id, msg_ids FROM requests{where}", args).fetchall():
+        refs[head_id] += 1
+        refs[tail_id] += 1
+        refs.update(unpack_ids(msg_ids))
     cur = conn.execute("DELETE FROM requests" + where, args)
+    for cid, count in refs.items():
+        conn.execute("UPDATE chunks SET refs = refs - ? WHERE id = ?", (count, cid))
+    conn.execute("DELETE FROM chunks WHERE refs <= 0")
     conn.commit()
     result = {"deleted": cur.rowcount, "dry_run": False}
     if vacuum:
@@ -413,6 +607,8 @@ def delete_requests(conn: sqlite3.Connection, db_path: str, params: dict,
 
 def vacuum_only(conn: sqlite3.Connection, db_path: str) -> dict:
     bytes_before = _db_file_bytes(db_path)
+    conn.execute("DELETE FROM chunks WHERE refs <= 0")
+    conn.commit()  # VACUUM cannot run inside a transaction
     conn.execute("VACUUM")
     bytes_after = _db_file_bytes(db_path)
     return {"vacuumed": True, "bytes_before": bytes_before,
@@ -426,10 +622,10 @@ def db_stats(conn: sqlite3.Connection, db_path: str) -> dict:
     rmin, rmax = conn.execute(
         "SELECT MIN(received_at), MAX(received_at) FROM requests").fetchone()
     bl = conn.execute(
-        "SELECT MIN(length(body_json)), AVG(length(body_json)),"
-        " MAX(length(body_json)), SUM(length(body_json)) FROM requests").fetchone()
-    trunc = conn.execute(
-        "SELECT SUM(COALESCE(body_truncated, 0)) FROM requests").fetchone()[0]
+        "SELECT MIN(body_len), AVG(body_len), MAX(body_len), SUM(body_len)"
+        " FROM requests").fetchone()
+    nchunks, chunk_bytes = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(nbytes), 0) FROM chunks").fetchone()
     by_model = dict(conn.execute(
         "SELECT model, COUNT(*) FROM requests GROUP BY model ORDER BY COUNT(*) DESC")
         .fetchall())
@@ -438,7 +634,8 @@ def db_stats(conn: sqlite3.Connection, db_path: str) -> dict:
         " ORDER BY COUNT(*) DESC").fetchall())
     return {
         "rows": rows,
-        "truncated_rows": int(trunc or 0),
+        "unique_chunks": nchunks,
+        "chunk_bytes": chunk_bytes,
         "db_file_bytes": _db_file_bytes(db_path),
         "created_unix_ms": {"min": cmin, "max": cmax, "unit": infer_time_unit(cmax)},
         "received_at": {"min": rmin, "max": rmax},
@@ -589,7 +786,7 @@ class PersistServer:
                   db_path: str = "out/request_persist.sqlite",
                   logger: Optional[logging.Logger] = None,
                   http_host: str = "127.0.0.1", http_port: int = 9101,
-                  enable_http: bool = True, max_body_kb: int = 0):
+                  enable_http: bool = True):
         self.host = host
         self.port = port
         self.db_path = db_path
@@ -597,8 +794,6 @@ class PersistServer:
         # http_port: a positive value binds that port; 0 binds an OS-chosen ephemeral port.
         self.http_port = http_port
         self.enable_http = enable_http
-        # Stored request bodies are truncated above this many bytes (0 disables truncation).
-        self.max_body_bytes = int(max_body_kb) * 1024
         # Bundled admin UI page, loaded once at construction. A missing asset only disables
         # ``GET /``; it never affects TCP ingest or the JSON API.
         self._ui_bytes = _load_ui_bytes()
@@ -683,7 +878,7 @@ class PersistServer:
             try:
                 if rec is _SHUTDOWN:
                     break
-                insert_record(self._conn, rec, self.max_body_bytes)
+                insert_record(self._conn, rec)
                 self._conn.commit()
             finally:
                 self._write_queue.task_done()
@@ -726,8 +921,6 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="REST admin port; 0 binds an ephemeral port")
     parser.add_argument("--no-http", action="store_true",
                         help="disable the REST admin interface entirely")
-    parser.add_argument("--max-body-kb", type=int, default=0,
-                        help="truncate stored request bodies above this size in KiB (0 disables)")
     return parser.parse_args(argv)
 
 
@@ -739,7 +932,7 @@ def main(argv=None) -> None:
     log = logging.getLogger("request_persist")
     server = PersistServer(host=args.host, port=args.port, db_path=args.db, logger=log,
                             http_host=args.http_host, http_port=args.http_port,
-                            enable_http=not args.no_http, max_body_kb=args.max_body_kb)
+                            enable_http=not args.no_http)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
