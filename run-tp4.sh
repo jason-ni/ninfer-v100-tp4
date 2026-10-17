@@ -242,6 +242,8 @@ if [[ "${remote_req_log}" -eq 1 ]]; then
     req_db_dir=${NINFER_REMOTE_REQ_LOG_DIR:-/media/optane/reqlogs}
     req_db=${NINFER_REMOTE_REQ_LOG_DB:-${req_db_dir}/request_persist.sqlite}
     req_log_file=${NINFER_REMOTE_REQ_LOG_FILE:-${req_db_dir}/request_persist_server.log}
+    req_http_port=${NINFER_REMOTE_REQ_LOG_HTTP_PORT:-9101}
+    req_max_body_kb=${NINFER_REMOTE_REQ_LOG_MAX_BODY_KB:-1024}
     req_python=${NINFER_REMOTE_REQ_LOG_PYTHON:-python3}
     req_server=${script_dir}/tools/request_persist/request_persist_server.py
 
@@ -252,11 +254,13 @@ if [[ "${remote_req_log}" -eq 1 ]]; then
     mkdir -p -- "${req_db_dir}"
 
     if port_listening "${req_host}" "${req_port}"; then
-        echo "remote req log: reusing receiver on ${req_host}:${req_port}" >&2
+        echo "remote req log: reusing receiver on ${req_host}:${req_port} (rest :${req_http_port})" >&2
     else
-        echo "remote req log: starting receiver on ${req_host}:${req_port} -> ${req_db}" >&2
+        echo "remote req log: starting receiver on ${req_host}:${req_port} (rest :${req_http_port}) -> ${req_db}" >&2
         nohup "${req_python}" "${req_server}" \
             --host "${req_host}" --port "${req_port}" --db "${req_db}" \
+            --http-host "${req_host}" --http-port "${req_http_port}" \
+            --max-body-kb "${req_max_body_kb}" \
             >>"${req_log_file}" 2>&1 &
         disown 2>/dev/null || true
         # Wait briefly for the listener; the persistor also reconnects, so this only avoids an

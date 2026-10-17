@@ -22,7 +22,8 @@ The transport is split into two owning components:
   reconnect backoff — plus the pure, transport-agnostic wire codec
   (`encode_persist_frame` / `decode_persist_frame`).
 - Python (`tools/request_persist/request_persist_server.py`): an asyncio TCP server with a frame
-  reader and a single-writer SQLite path (per-record commit, graceful shutdown).
+  reader and a single-writer SQLite path (per-record commit, graceful shutdown), plus a stdlib
+  `http.server` REST admin interface on a separate port for querying and deleting stored records.
 
 The length prefix and the envelope are handled separately so the codec stays unit-testable on both
 sides. A golden-byte vector pins the exact encoding and is asserted identically by the C++ and
@@ -63,7 +64,9 @@ CREATE TABLE requests (
   body_json       TEXT    NOT NULL,   -- raw JSON body (source of truth)
   message_count   INTEGER,            -- extracted len(body["messages"]) if present
   stream          INTEGER,            -- extracted body["stream"] (0/1) if present
-  received_at     TEXT    NOT NULL    -- ISO8601 UTC receiver time
+  received_at     TEXT    NOT NULL,   -- ISO8601 UTC receiver time
+  body_truncated  INTEGER NOT NULL DEFAULT 0,  -- 1 when body_json was cut by the size cap
+  body_orig_bytes INTEGER             -- original pre-truncation body size in bytes
 );
 CREATE INDEX idx_requests_model   ON requests(model);
 CREATE INDEX idx_requests_created ON requests(created_unix_ms);
@@ -72,6 +75,88 @@ CREATE INDEX idx_requests_created ON requests(created_unix_ms);
 The full `body_json` is retained so the message history can later be modeled as a branching
 tree/DAG (append = new node; branch = pointer to an earlier node). That modeling is not implemented;
 this feature ships only the transport and storage plumbing.
+
+## Ingest size cap
+
+Persisting every body verbatim is what makes the log grow fast (bodies here average ~2 MB, dominated
+by base64 media). The receiver bounds the stored body size with `--max-body-kb` (default `1024` KiB;
+`0` disables):
+
+- On insert, `message_count`/`stream` are extracted from the **full** body first, then the stored
+  `body_json` is cut to at most that many bytes on a UTF-8 boundary when it exceeds the cap.
+- Oversized rows are flagged `body_truncated = 1` and carry their true original size in
+  `body_orig_bytes`, so you still know how big the request actually was. Both are surfaced on every
+  row and aggregated as `truncated_rows` in `GET /stats`.
+- Existing databases are migrated in place at startup (`ALTER TABLE ... ADD COLUMN`, a schema-only
+  change); old rows read as `body_truncated = 0`, `body_orig_bytes = NULL`.
+
+At the default 1 MiB cap, ordinary text requests stay intact while the largest base64-media requests
+are reduced by an order of magnitude. Tighten the cap with `NINFER_REMOTE_REQ_LOG_MAX_BODY_KB`
+(`run-tp4.sh`) or `--max-body-kb` (direct launch); pair with `DELETE ...&vacuum` to reclaim
+already-stored space.
+
+## REST admin API
+
+The receiver also serves a small JSON REST interface (stdlib `http.server`, threaded) on a separate
+port — default `127.0.0.1:9101` (`--http-host` / `--http-port`; `--http-port 0` binds an ephemeral
+port, `--no-http` disables it). Each request opens its own short-lived SQLite connection; the connect
+timeout doubles as the busy timeout that absorbs the brief lock wait when a read/delete contends with
+the single serial insert writer. The DB keeps its existing rollback journal mode, so `VACUUM`
+reclaims space by rewriting the main file — which is exactly what the `*_bytes` fields report.
+
+Responses are `application/json`. Errors are `{"error": "<msg>"}` with `400` (bad parameters),
+`404` (unknown route or missing id), or `500` (database error).
+
+| method & path | purpose |
+|---|---|
+| `GET /health` | liveness; returns db path, ports, protocol version |
+| `GET /stats` | row count, db file size, created/received ranges (+ inferred unit), per-model/protocol counts, body-size stats |
+| `GET /requests` | list/search with filters, pagination, ordering |
+| `GET /requests/{id}` | fetch one record by autoincrement `id` |
+| `DELETE /requests` | delete by criteria; optional `dry_run` and `vacuum` |
+| `POST /vacuum` | reclaim disk space with `VACUUM` without deleting |
+
+Filters for `GET /requests` and `DELETE /requests` (AND-combined, single value each): `model`,
+`protocol`, `stream` (`0`/`1`), `min_messages`/`max_messages`, `min_body_kb`/`max_body_kb`, `id`,
+`ids` (comma-separated), and time bounds `before`/`after` plus `older_than_days`/`newer_than_days`.
+`GET /requests` additionally takes `limit` (default 50, max 1000), `offset`, `order`
+(`asc`/`desc`, default newest-first) and `include_body` (default `true`; set `false` to browse many
+rows without shipping the large bodies). Every row carries `body_bytes` (its stored size) so
+oversized records can be targeted directly. `DELETE` with no criterion and no `all=true` returns `400`.
+
+### Time bounds and the units trap
+
+`created_unix_ms` is compared against its **stored unit**, which the API infers from the column's
+maximum value: values below `1e12` are treated as whole seconds, at/above it as milliseconds. This
+matters because the C++ producer currently writes **seconds** into the field despite the
+milliseconds-oriented name. Age filters (`older_than_days` etc.) compute their cutoff in the inferred
+unit, so they behave correctly either way. `before`/`after` accept either a bare integer (assumed
+already in the stored unit) or an ISO-8601 date/datetime (naive ⇒ UTC; `Z`/offset honored).
+
+> Follow-up (not part of this API): the wire field `created_unix_ms` and its `openai_schema.cpp::
+> unix_time_now()` source produce whole **seconds**, not milliseconds. Aligning the producer to true
+> milliseconds is a change to the shared wire contract (golden byte vector + both C++/Python test
+> suites) and is tracked separately; the REST layer stays correct today via unit inference.
+
+### Cleanup workflow
+
+Because bodies are retained verbatim (avg ~2.4 MB here, some >13 MB, mostly base64 media), the DB
+grows fast and deletion alone does not shrink the file — pair deletes with `vacuum`:
+
+```bash
+BASE=http://127.0.0.1:9101
+curl -s "$BASE/stats"                                        # rows, file size, ranges, per-model
+curl -s "$BASE/requests?older_than_days=7&limit=5&include_body=false"   # preview recent matches
+curl -s -X DELETE "$BASE/requests?older_than_days=7&dry_run"           # would-delete count, no change
+curl -s -X DELETE "$BASE/requests?older_than_days=30&vacuum"           # delete + reclaim in one step
+curl -s -X DELETE "$BASE/requests?min_body_kb=5120&vacuum"             # drop only the oversized rows
+curl -s -X POST "$BASE/vacuum"                                        # standalone space reclamation
+```
+
+`DELETE ...&vacuum` returns `{deleted, dry_run, vacuumed, bytes_before, bytes_after, bytes_freed}`.
+A long `VACUUM` on a large file briefly holds the write lock, so any concurrent ingest pauses until
+it finishes (records are dropped only if the bounded queue fills); that is expected for a manual
+cleanup action.
 
 ## CLI surface
 
@@ -86,9 +171,16 @@ this feature ships only the transport and storage plumbing.
 
 - `--remote-req-log[=HOST:PORT]` — ensure the Python receiver is running (spawning it detached when
   its port is not already listening), store the DB under `/media/optane/reqlogs`, and forward
-  `--persist-endpoint` to `ninfer-serve`. Default endpoint `127.0.0.1:9100`. Overridable with
-  `NINFER_REMOTE_REQ_LOG_ENDPOINT`, `NINFER_REMOTE_REQ_LOG_DIR`, `NINFER_REMOTE_REQ_LOG_DB`, and
-  `NINFER_REMOTE_REQ_LOG_PYTHON`.
+  `--persist-endpoint` to `ninfer-serve`. The REST admin port follows the same host; default `9101`.
+  Overridable with `NINFER_REMOTE_REQ_LOG_ENDPOINT`, `NINFER_REMOTE_REQ_LOG_DIR`,
+  `NINFER_REMOTE_REQ_LOG_DB`, `NINFER_REMOTE_REQ_LOG_HTTP_PORT`, `NINFER_REMOTE_REQ_LOG_MAX_BODY_KB`,
+  and `NINFER_REMOTE_REQ_LOG_PYTHON`.
+
+`receiver (tools/request_persist/request_persist_server.py)`:
+
+- `--http-host ADDR` / `--http-port N` — REST admin bind; default `127.0.0.1:9101`, `0` = ephemeral.
+- `--no-http` — disable the REST admin interface (TCP ingest still runs).
+- `--max-body-kb N` — truncate stored request bodies above `N` KiB (default `1024`; `0` disables).
 
 ## Shutdown
 
@@ -129,9 +221,12 @@ On the V100X4 launcher the whole receiver setup is one flag:
 
 - `ninfer_request_persist_test`: codec golden bytes, round-trip, and reject cases — ok.
 - `ninfer_serve_options_test`: new-flag defaults, parsing, invalid values, and usage — ok.
-- Python `pytest tests/test_request_persist.py`: 9 passed — golden bytes matching the C++ vector,
-  decode/round-trip, frame reader, field extraction, DB insert/query, and a real TCP loopback
-  end-to-end into SQLite.
+- Python `pytest tests/test_request_persist.py`: 29 passed — golden bytes matching the C++ vector,
+  decode/round-trip, frame reader, field extraction, DB insert/query, a real TCP loopback end-to-end
+  into SQLite, REST unit coverage (filter builder, ISO/epoch/unit parsing, flag semantics), ingest
+  size-cap truncation (oversized / multibyte-boundary / pre-cap-schema migration), and a full
+  TCP+REST end-to-end (insert with a truncated body → stats/list/get → delete by age, dry-run,
+  all+vacuum) over real sockets.
 - GPU end-to-end (real engine, qwen3.8-27b, TP2): two `/v1/chat/completions` requests (1-message and
   3-message history) completed; both rows landed in SQLite with the exact raw bodies
   (`message_count` 1 then 3); SIGTERM flushed the persistor and the receiver logged
