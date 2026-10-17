@@ -450,6 +450,19 @@ def db_stats(conn: sqlite3.Connection, db_path: str) -> dict:
     }
 
 
+_UI_ASSET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "request_persist_ui.html")
+
+
+def _load_ui_bytes() -> Optional[bytes]:
+    """Load the bundled admin UI page, or None when the asset is absent. A missing asset only
+    disables the web page (``GET /``); TCP ingest and the JSON API are unaffected."""
+    try:
+        with open(_UI_ASSET, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
 class RequestPersistHttpHandler(BaseHTTPRequestHandler):
     """JSON REST admin interface over the persisted-requests database."""
 
@@ -469,6 +482,14 @@ class RequestPersistHttpHandler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> None:
         self._send_json({"error": message}, status)
 
+    def _send_bytes(self, data: bytes, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _split(self):
         parsed = urlparse(self.path)
         qs = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=True).items()}
@@ -477,6 +498,11 @@ class RequestPersistHttpHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path, qs = self._split()
         try:
+            if path in ("/", "/index.html"):
+                ui = self.server.ui_bytes
+                if ui is None:
+                    return self._error(503, "admin UI asset not found (request_persist_ui.html)")
+                return self._send_bytes(ui, "text/html; charset=utf-8")
             if path == "/health":
                 return self._send_json({
                     "ok": True, "db": self.server.db_path,
@@ -545,6 +571,7 @@ class _ThreadingHTTPServer(ThreadingHTTPServer):
     db_path: str
     tcp_port: int
     http_port: int
+    ui_bytes: Optional[bytes]
     log: logging.Logger
 
 
@@ -572,6 +599,9 @@ class PersistServer:
         self.enable_http = enable_http
         # Stored request bodies are truncated above this many bytes (0 disables truncation).
         self.max_body_bytes = int(max_body_kb) * 1024
+        # Bundled admin UI page, loaded once at construction. A missing asset only disables
+        # ``GET /``; it never affects TCP ingest or the JSON API.
+        self._ui_bytes = _load_ui_bytes()
         self.log = logger or logging.getLogger("request_persist")
         self._server: Optional[asyncio.AbstractServer] = None
         self._conn: Optional[sqlite3.Connection] = None
@@ -605,12 +635,14 @@ class PersistServer:
             self._http.db_path = self.db_path
             self._http.tcp_port = self.bound_port
             self._http.http_port = self._http.server_address[1]
+            self._http.ui_bytes = self._ui_bytes
             self._http.log = self.log
             self._http_thread = threading.Thread(
                 target=self._http.serve_forever, name="rp-rest", daemon=True)
             self._http_thread.start()
-            self.log.info("rest api on http://%s:%d (/health /stats /requests)",
-                          self.http_host, self._http.http_port)
+            ui_note = " + web UI at /" if self._ui_bytes else " (web UI asset missing)"
+            self.log.info("rest api on http://%s:%d%s (/health /stats /requests)",
+                          self.http_host, self._http.http_port, ui_note)
         self._running = True
         self.log.info("listening on %s:%d -> %s", self.host, self.bound_port, self.db_path)
 

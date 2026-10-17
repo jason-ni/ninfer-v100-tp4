@@ -107,7 +107,8 @@ Environment: NINFER_V100X2_SERVE_KV_DTYPE, NINFER_V100X2_SERVE_MODEL_ID,
 NINFER_V100X2_SERVE_MAX_CONTEXT, NINFER_V100X2_SERVE_MAX_CONCURRENCY,
 NINFER_V100X2_SERVE_HOST_CACHE_MIB,
 NINFER_V100X2_SERVE_PRESENCE_PENALTY, CUDA_VISIBLE_DEVICES, NINFER_V100X2_SERVE_ARTIFACT,
-NINFER_REMOTE_REQ_LOG_ENDPOINT, NINFER_REMOTE_REQ_LOG_DIR, NINFER_REMOTE_REQ_LOG_DB,
+NINFER_REMOTE_REQ_LOG_ENDPOINT, NINFER_REMOTE_REQ_LOG_HTTP_HOST, NINFER_REMOTE_REQ_LOG_HTTP_PORT,
+NINFER_REMOTE_REQ_LOG_MAX_BODY_KB, NINFER_REMOTE_REQ_LOG_DIR, NINFER_REMOTE_REQ_LOG_DB,
 NINFER_REMOTE_REQ_LOG_PYTHON.
 Run tools/v100/ninfer-v100x2-serve.sh --help for the full ninfer-serve option set.
 EOF
@@ -243,6 +244,9 @@ if [[ "${remote_req_log}" -eq 1 ]]; then
     req_db=${NINFER_REMOTE_REQ_LOG_DB:-${req_db_dir}/request_persist.sqlite}
     req_log_file=${NINFER_REMOTE_REQ_LOG_FILE:-${req_db_dir}/request_persist_server.log}
     req_http_port=${NINFER_REMOTE_REQ_LOG_HTTP_PORT:-9101}
+    # The REST admin + web UI bind address; 0.0.0.0 so it is reachable from other hosts. The TCP
+    # ingest listener stays bound to the endpoint host (loopback by default) and is not exposed.
+    req_http_host=${NINFER_REMOTE_REQ_LOG_HTTP_HOST:-0.0.0.0}
     req_max_body_kb=${NINFER_REMOTE_REQ_LOG_MAX_BODY_KB:-1024}
     req_python=${NINFER_REMOTE_REQ_LOG_PYTHON:-python3}
     req_server=${script_dir}/tools/request_persist/request_persist_server.py
@@ -254,12 +258,12 @@ if [[ "${remote_req_log}" -eq 1 ]]; then
     mkdir -p -- "${req_db_dir}"
 
     if port_listening "${req_host}" "${req_port}"; then
-        echo "remote req log: reusing receiver on ${req_host}:${req_port} (rest :${req_http_port})" >&2
+        echo "remote req log: reusing receiver on ${req_host}:${req_port} (rest ${req_http_host}:${req_http_port})" >&2
     else
-        echo "remote req log: starting receiver on ${req_host}:${req_port} (rest :${req_http_port}) -> ${req_db}" >&2
+        echo "remote req log: starting receiver on ${req_host}:${req_port} (rest ${req_http_host}:${req_http_port}) -> ${req_db}" >&2
         nohup "${req_python}" "${req_server}" \
             --host "${req_host}" --port "${req_port}" --db "${req_db}" \
-            --http-host "${req_host}" --http-port "${req_http_port}" \
+            --http-host "${req_http_host}" --http-port "${req_http_port}" \
             --max-body-kb "${req_max_body_kb}" \
             >>"${req_log_file}" 2>&1 &
         disown 2>/dev/null || true

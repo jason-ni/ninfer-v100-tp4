@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NInfer request log</title>
+<!-- Request-persist admin UI (self-contained; no external assets). Marker for tests: -->
+<!-- ninfer-request-persist-ui v1 -->
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2333; --border:#30363d;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --accent2:#3fb950;
+    --warn:#d29922; --err:#f85149; --chip:#21262d;
+    font-size:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--fg);
+       font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  code,pre,.mono,input,select{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:12px;
+         padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--border)}
+  header h1{font-size:15px;margin:0;font-weight:600}
+  .badge{font-size:11px;color:var(--muted);background:var(--chip);padding:2px 8px;border-radius:20px}
+  .spacer{flex:1}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--err);margin-right:6px;vertical-align:middle}
+  .dot.ok{background:var(--accent2)}
+  button{background:var(--panel2);color:var(--fg);border:1px solid var(--border);border-radius:6px;
+         padding:6px 11px;font:inherit;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);color:#04121f;border-color:var(--accent);font-weight:600}
+  button.danger{background:transparent;color:var(--err);border-color:var(--err)}
+  button.ghost{background:transparent}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  main{padding:14px 16px;max-width:1500px;margin:0 auto}
+  .stats{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+  .stat{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 12px;min-width:120px}
+  .stat .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .stat .v{font-size:16px;font-weight:600;margin-top:2px}
+  .stat .v small{font-size:11px;color:var(--muted);font-weight:400}
+  .filters{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px 10px;align-items:end}
+  .field label{display:block;font-size:11px;color:var(--muted);margin-bottom:3px}
+  input,select{width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--border);
+               border-radius:6px;padding:6px 8px;font-size:13px}
+  input:focus,select:focus{outline:none;border-color:var(--accent)}
+  .factions{display:flex;gap:8px;align-items:end;margin-top:10px}
+  .tablewrap{border:1px solid var(--border);border-radius:10px;overflow:auto;background:var(--panel)}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  thead th{position:sticky;top:0;background:var(--panel2);text-align:left;font-size:11px;
+           color:var(--muted);text-transform:uppercase;letter-spacing:.03em;padding:8px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+  tbody td{padding:7px 10px;border-bottom:1px solid #21262d;white-space:nowrap}
+  tbody tr{cursor:pointer}
+  tbody tr:hover{background:var(--panel2)}
+  tr.row-del td{color:var(--muted);text-decoration:line-through}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  .tag{display:inline-block;background:var(--chip);border-radius:5px;padding:1px 6px;font-size:11px;color:var(--muted)}
+  .tag.stream{color:var(--accent);border:1px solid var(--accent)}
+  .tag.trunc{color:var(--warn);border:1px solid var(--warn)}
+  .pager{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:10px 12px;
+         background:var(--panel);border:1px solid var(--border);border-top:none;border-radius:0 0 10px 10px;font-size:13px}
+  .pager .pg{display:flex;gap:8px;align-items:center}
+  .msg{font-size:13px;padding:8px 12px;border-radius:8px;margin:0 0 12px;display:none}
+  .msg.err{display:block;background:#3a1512;color:var(--err);border:1px solid var(--err)}
+  .msg.info{display:block;background:#10233a;color:var(--accent);border:1px solid var(--accent)}
+  .empty{padding:34px;text-align:center;color:var(--muted)}
+  /* modal */
+  .overlay{position:fixed;inset:0;background:rgba(1,4,9,.72);display:none;align-items:flex-start;justify-content:center;padding:40px 16px;z-index:20}
+  .overlay.open{display:flex}
+  .modal{background:var(--panel);border:1px solid var(--border);border-radius:12px;width:100%;
+         max-width:920px;max-height:calc(100vh - 80px);display:flex;flex-direction:column;overflow:hidden}
+  .modal .head{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--border)}
+  .modal .head h2{font-size:15px;margin:0}
+  .modal .body{padding:12px 14px;overflow:auto}
+  .kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:6px 14px;margin-bottom:12px}
+  .kv div{font-size:13px}
+  .kv span{color:var(--muted);display:block;font-size:11px;text-transform:uppercase;letter-spacing:.03em}
+  pre{margin:0;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;
+      overflow:auto;max-height:52vh;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+  .foot{padding:10px 14px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end}
+  a{color:var(--accent);text-decoration:none}
+  .hint{color:var(--muted);font-size:12px;margin:6px 0 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>NInfer request log</h1>
+  <span id="health"><span class="dot"></span>connecting&hellip;</span>
+  <span class="badge" id="ep">…</span>
+  <div class="spacer"></div>
+  <button class="ghost" id="btn-refresh">&#x21bb; Refresh</button>
+</header>
+
+<main>
+  <div id="banner" class="msg err"></div>
+
+  <section class="stats" id="stats"></section>
+
+  <section class="filters">
+    <div class="grid">
+      <div class="field"><label>model</label><input id="f-model" placeholder="exact"></div>
+      <div class="field"><label>protocol</label><input id="f-protocol" placeholder="exact"></div>
+      <div class="field"><label>stream</label>
+        <select id="f-stream">
+          <option value="">any</option><option value="1">1 (true)</option><option value="0">0 (false)</option>
+        </select></div>
+      <div class="field"><label>min messages</label><input id="f-minmsg" type="number" min="0"></div>
+      <div class="field"><label>max messages</label><input id="f-maxmsg" type="number" min="0"></div>
+      <div class="field"><label>min body (KiB)</label><input id="f-minkb" type="number" min="0"></div>
+      <div class="field"><label>max body (KiB)</label><input id="f-maxkb" type="number" min="0"></div>
+      <div class="field"><label>id</label><input id="f-id" placeholder="rowid"></div>
+      <div class="field"><label>ids (comma list)</label><input id="f-ids" placeholder="12,13"></div>
+      <div class="field"><label>created after</label><input id="f-after" placeholder="ISO-8601 or epoch"></div>
+      <div class="field"><label>created before</label><input id="f-before" placeholder="ISO-8601 or epoch"></div>
+      <div class="field"><label>newer than (days)</label><input id="f-newer" type="number" min="0" step="0.1"></div>
+      <div class="field"><label>older than (days)</label><input id="f-older" type="number" min="0" step="0.1"></div>
+      <div class="field"><label>order</label>
+        <select id="f-order"><option value="desc">newest first</option><option value="asc">oldest first</option></select></div>
+      <div class="field"><label>page size</label><input id="f-limit" type="number" min="1" max="1000" value="50"></div>
+    </div>
+    <div class="factions">
+      <button class="primary" id="btn-apply">Apply filters</button>
+      <button class="ghost" id="btn-clear">Clear</button>
+      <div class="spacer"></div>
+      <button class="danger" id="btn-delete">Delete matching</button>
+      <button class="ghost" id="btn-vacuum">Vacuum</button>
+    </div>
+    <p class="hint">Filters match the REST API (AND-combined). <code>Delete matching</code> previews with a dry-run before it commits and reclaims space. No criterion &rarr; deletes nothing.</p>
+  </section>
+
+  <section class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th>id</th><th>request_id</th><th>created</th><th>received</th>
+          <th>protocol</th><th>model</th><th class="num">msgs</th><th>stream</th>
+          <th class="num">body</th><th>flags</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="empty" class="empty" style="display:none">No records match. Adjust the filters or refresh.</div>
+  </section>
+  <div class="pager">
+    <div id="pginfo" class="mono">—</div>
+    <div class="pg">
+      <button id="pg-first">&laquo;</button>
+      <button id="pg-prev">&larr; Prev</button>
+      <button id="pg-next">Next &rarr;</button>
+      <button id="pg-last">&raquo;</button>
+    </div>
+  </div>
+</main>
+
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <div class="head">
+      <h2 id="m-title">Record</h2>
+      <div class="spacer"></div>
+      <button class="ghost" id="m-close">Close &times;</button>
+    </div>
+    <div class="body">
+      <div class="kv" id="m-kv"></div>
+      <div id="m-note" class="hint"></div>
+      <pre id="m-body"></pre>
+    </div>
+    <div class="foot">
+      <button class="ghost" id="m-copy">Copy JSON</button>
+      <button class="ghost" id="m-download">Download .json</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var state = { unit: "s", lastTotal: 0, lastLimit: 50 };
+  var reqSeq = 0;
+
+  function $(id) { return document.getElementById(id); }
+  function esc(v) {
+    if (v === null || v === undefined) return "";
+    return String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function bytes(n) {
+    if (n === null || n === undefined) return "—";
+    if (n < 1024) return n + " B";
+    var u = ["KiB", "MiB", "GiB"], i = -1, x = n;
+    do { x /= 1024; i++; } while (x >= 1024 && i < u.length - 1);
+    return x.toFixed(x < 10 ? 2 : 1) + " " + u[i];
+  }
+  function ts(v) {
+    if (v === null || v === undefined || isNaN(v)) return "—";
+    var d = new Date(state.unit === "ms" ? v : v * 1000);
+    if (isNaN(d.getTime())) return String(v);
+    return d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+  }
+  function banner(msg, kind) {
+    var el = $("banner");
+    el.textContent = msg || "";
+    el.className = "msg " + (kind || "");
+  }
+  function api(url, opts) {
+    return fetch(url, opts).then(function (r) {
+      return r.text().then(function (t) {
+        var j; try { j = t ? JSON.parse(t) : null; } catch (e) { j = { raw: t }; }
+        return { ok: r.ok, status: r.status, json: j };
+      });
+    });
+  }
+
+  var FIELDS = ["model","protocol","stream","minmsg","maxkb","maxmsg","minkb","id","ids","after","before","newer","older"];
+  function paramFor(key) {
+    switch (key) {
+      case "model": return "model"; case "protocol": return "protocol";
+      case "stream": return "stream"; case "minmsg": return "min_messages";
+      case "maxmsg": return "max_messages"; case "minkb": return "min_body_kb";
+      case "maxkb": return "max_body_kb"; case "id": return "id"; case "ids": return "ids";
+      case "after": return "after"; case "before": return "before";
+      case "newer": return "newer_than_days"; case "older": return "older_than_days";
+      default: return key;
+    }
+  }
+  function readParams(withPaging, includeBody) {
+    var p = {};
+    FIELDS.forEach(function (k) { var v = $("f-" + k).value.trim(); if (v !== "") p[paramFor(k)] = v; });
+    if (withPaging) {
+      p.order = $("f-order").value;
+      p.limit = String(Math.max(1, parseInt($("f-limit").value, 10) || 50));
+      p.offset = String(Math.max(0, state.offset || 0));
+    }
+    if (!includeBody) p.include_body = "false";
+    return p;
+  }
+  function qs(p) { return Object.keys(p).map(function (k) { return k + "=" + encodeURIComponent(p[k]); }).join("&"); }
+  function hasCriteria() { return FIELDS.some(function (k) { return $("f-" + k).value.trim() !== ""; }); }
+
+  function renderStats(s) {
+    var el = $("stats"), c = s.created_unix_ms || {};
+    var cells = [
+      ["rows", s.rows],
+      ["db file", bytes(s.db_file_bytes)],
+      ["created", ts(c.min) + "<br>" + ts(c.max) + ' <small>(' + esc(c.unit) + ')</small>'],
+      ["models", Object.keys(s.by_model || {}).map(function (m) {
+        return esc(m) + " <small>(" + (s.by_model[m]) + ")</small>";
+      }).join(", ") || "—"],
+      ["protocols", Object.keys(s.by_protocol || {}).map(function (m) {
+        return '<span class="tag">' + esc(m) + "</span>";
+      }).join(" ") || "—"],
+      ["truncated", s.truncated_rows + ' <small>rows</small>']
+    ];
+    el.innerHTML = cells.map(function (x) {
+      return '<div class="stat"><div class="k">' + x[0] + '</div><div class="v">' + x[1] + "</div></div>";
+    }).join("");
+  }
+  function loadStats() {
+    return api("/stats").then(function (r) {
+      if (r.ok) { renderStats(r.json); state.unit = (r.json.created_unix_ms || {}).unit || "s"; }
+      else throw new Error("/stats " + r.status);
+    });
+  }
+  function health() {
+    return api("/health").then(function (r) {
+      var el = $("health");
+      if (r.ok) {
+        $("ep").textContent = "db " + r.json.db;
+        el.innerHTML = '<span class="dot ok"></span>online · ' + esc(r.json.db);
+      } else { el.innerHTML = '<span class="dot"></span>offline'; }
+    }).catch(function () { $("health").innerHTML = '<span class="dot"></span>offline'; });
+  }
+
+  var lastDelIds = [];
+  function renderRows(rows) {
+    var delset = {}; lastDelIds.forEach(function (i) { delset[i] = 1; });
+    $("rows").innerHTML = rows.map(function (r) {
+      var flags = r.stream === 1 ? '<span class="tag stream">stream</span>'
+                : (r.stream === 0 ? '<span class="tag">non-stream</span>' : '');
+      if (r.body_truncated) {
+        flags += ' <span class="tag trunc">trunc' + (r.body_orig_bytes != null
+          ? ' orig ' + bytes(r.body_orig_bytes) : '') + '</span>';
+      }
+      return '<tr data-id="' + r.id + '" class="' + (delset[r.id] ? "row-del" : "") + '">'
+        + '<td class="num mono">' + r.id + '</td>'
+        + '<td class="mono">' + esc(r.request_id) + '</td>'
+        + '<td class="mono" title="' + ts(r.created_unix_ms) + '">' + ts(r.created_unix_ms) + '</td>'
+        + '<td class="mono">' + esc(r.received_at) + '</td>'
+        + '<td><span class="tag">' + esc(r.protocol) + "</span></td>"
+        + '<td>' + esc(r.model) + "</td>"
+        + '<td class="num">' + (r.message_count == null ? "—" : r.message_count) + "</td>"
+        + '<td>' + (r.stream == null ? "—" : esc(flags)) + "</td>"
+        + '<td class="num">' + bytes(r.body_bytes) + "</td>"
+        + '<td>' + (r.body_truncated ? flags : "") + "</td>"
+        + "</tr>";
+    }).join("");
+    $("empty").style.display = rows.length ? "none" : "block";
+  }
+  function renderPager(total) {
+    var lim = state.lastLimit, off = state.offset || 0;
+    $("pginfo").textContent = "total " + total + " · showing " + off + "–" + Math.min(off + lim, total);
+    var last = Math.max(0, Math.ceil(total / lim) - 1);
+    var pg = state.page = Math.floor(off / lim);
+    $("pg-first").disabled = $("pg-prev").disabled = pg <= 0;
+    $("pg-next").disabled = $("pg-last").disabled = pg >= last;
+  }
+  function goPage(delta) {
+    var lim = state.lastLimit;
+    var pg = Math.floor((state.offset || 0) / lim) + delta;
+    state.offset = Math.max(0, pg * lim);
+    state.page = pg;
+    loadList();
+  }
+  var listSeq = 0;
+  function loadList() {
+    if (!state.unit) state.unit = "s";
+    var my = ++listSeq;
+    var url = "/requests?" + qs(readParams(true, false));
+    return api(url).then(function (r) {
+      if (!r.ok) throw new Error(r.json && r.json.error ? r.json.error : ("GET /requests " + r.status));
+      if (my !== listSeq) return;
+      state.lastTotal = r.json.total; state.lastLimit = r.json.limit;
+      state.offset = r.json.offset; state.lastDelIds = lastDelIds;
+      renderRows(r.json.rows); renderPager(r.json.total);
+      banner("");
+    });
+  }
+
+  function openRecord(id) {
+    $("m-title").textContent = "Record #" + id;
+    $("m-body").textContent = "Loading…"; $("m-kv").innerHTML = ""; $("m-note").textContent = "";
+    showOverlay(true);
+    api("/requests/" + id).then(function (r) {
+      if (!r.ok) { $("m-body").textContent = "Error: " + (r.json && r.json.error || r.status); return; }
+      var o = r.json;
+      $("m-kv").innerHTML = [
+        ["id", o.id], ["request_id", o.request_id],
+        ["created", ts(o.created_unix_ms)], ["received", o.received_at],
+        ["protocol", o.protocol], ["model", o.model],
+        ["messages", o.message_count == null ? "—" : o.message_count],
+        ["stream", o.stream == null ? "—" : (o.stream ? "true" : "false")],
+        ["stored body", bytes(o.body_bytes) + (o.body_truncated ? " (truncated)" : "")],
+        ["original size", o.body_orig_bytes == null ? "—" : bytes(o.body_orig_bytes)]
+      ].map(function (x) {
+        return "<div><span>" + x[0] + "</span>" + esc(typeof x[1] === "number" ? x[1] : x[1]) + "</div>";
+      }).join("");
+      var note = "";
+      if (o.body_truncated) note = "Stored body was cut at ingest; " + note;
+      $("m-note").textContent = note;
+      $("m-body").dataset.raw = o.body;
+      $("m-body").textContent = prettify(o.body);
+    }).catch(function (e) { $("m-body").textContent = "Error: " + e.message; });
+  }
+  function prettify(raw) {
+    if (!raw) return "";
+    try { return JSON.stringify(JSON.parse(raw), null, 2); } catch (e) { return raw; }
+  }
+  var overlayOpen = false;
+  function showOverlay(v) { $("overlay").classList.toggle("open", v); overlayOpen = v; }
+
+  function runDelete(commit) {
+    var p = readParams(false, false);
+    var url = "/requests?" + qs(p) + (commit ? "&vacuum" : "&dry_run");
+    if (!hasCriteria()) { banner("Nothing to delete — set at least one filter (or see REST all=true).", "err"); return Promise.resolve(); }
+    return api(url, { method: "DELETE" }).then(function (r) {
+      if (!r.ok) throw new Error(r.json && r.json.error ? r.json.error : ("DELETE " + r.status));
+      var j = r.json;
+      if (!commit) {
+        banner("Dry run: would delete " + j.would_delete + " record(s). Click again to apply.", "info");
+      } else {
+        var freed = j.bytes_freed != null ? ", freed " + bytes(j.bytes_freed) : "";
+        lastDelIds = []; banner("Deleted " + j.deleted + " record(s)" + freed + ". Listing refreshed.", "info");
+        return Promise.all([loadStats(), loadList()]);
+      }
+    }).catch(function (e) { banner(e.message, "err"); });
+  }
+  function runVacuum() {
+    return api("/vacuum", { method: "POST" }).then(function (r) {
+      if (!r.ok) throw new Error(r.json && r.json.error ? r.json.error : ("POST /vacuum " + r.status));
+      var j = r.json;
+      banner("Vacuum: freed " + bytes(j.bytes_freed) + " (" + bytes(j.bytes_before) + " → " + bytes(j.bytes_after) + ").", "info");
+      loadStats();
+    }).catch(function (e) { banner(e.message, "err"); });
+  }
+
+  // ---- wiring ----
+  function onReady() {
+    $("btn-refresh").onclick = function () { health(); loadStats().then(loadList); };
+    $("btn-apply").onclick = function () { state.offset = 0; state.page = 0; loadList(); };
+    $("btn-clear").onclick = function () {
+      FIELDS.forEach(function (k) { $("f-" + k).value = ""; });
+      state.offset = 0; state.page = 0; loadList();
+    };
+    $("btn-delete").onclick = function () {
+      runDelete(false).then(function () {
+        if (confirm("Dry-run shown above. Delete these records now and run VACUUM?")) runDelete(true);
+      });
+    };
+    $("btn-vacuum").onclick = function () {
+      if (confirm("Run VACUUM now? It rewrites the whole DB file (briefly pauses ingest).")) runVacuum();
+    };
+    $("pg-first").onclick = function () { state.offset = 0; state.page = 0; loadList(); };
+    $("pg-prev").onclick = function () { goPage(-1); };
+    $("pg-next").onclick = function () { goPage(1); };
+    $("pg-last").onclick = function () {
+      var last = Math.max(0, Math.ceil(state.lastTotal / state.lastLimit) - 1);
+      state.offset = last * state.lastLimit; state.page = last; loadList();
+    };
+    $("rows").addEventListener("click", function (e) {
+      var tr = e.target.closest("tr[data-id]"); if (tr) openRecord(tr.getAttribute("data-id"));
+    });
+    document.querySelectorAll("#filters input").forEach(function (i) {
+      i.addEventListener("keydown", function (e) { if (e.key === "Enter") { state.offset = 0; state.page = 0; loadList(); } });
+    });
+    $("m-close").onclick = function () { showOverlay(false); };
+    $("overlay").addEventListener("click", function (e) { if (e.target === $("overlay")) showOverlay(false); });
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape" && overlayOpen) showOverlay(false); });
+    $("m-copy").onclick = function () {
+      var t = $("m-body").dataset.raw || "";
+      if (navigator.clipboard) navigator.clipboard.writeText(t);
+    };
+    $("m-download").onclick = function () {
+      var t = $("m-body").dataset.raw || "{}";
+      var blob = new Blob([t], { type: "application/json" });
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "request-" + $("m-title").textContent.replace(/[^0-9]/g, "") + ".json";
+      a.click(); URL.revokeObjectURL(a.href);
+    };
+  }
+
+  function init() {
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", onReady);
+    else onReady();
+    health();
+    loadStats().then(loadList).catch(function (e) { banner("Failed to load: " + e.message, "err"); });
+  }
+  init();
+})();
+</script>
+</body>
+</html>

@@ -320,6 +320,35 @@ def test_stats_shape(tmp_path) -> None:
     assert s["db_file_bytes"] > 0
 
 
+def test_rest_serves_ui(tmp_path) -> None:
+    db = str(tmp_path / "ui.sqlite")
+    out = {}
+
+    async def go():
+        server = rps.PersistServer(host="127.0.0.1", port=0, db_path=db,
+                                   http_host="127.0.0.1", http_port=0)
+        await server.start()
+        base = f"http://127.0.0.1:{server.http_bound_port}"
+        try:
+            for path in ("/", "/index.html"):
+                with urllib.request.urlopen(base + path, timeout=5.0) as resp:
+                    out[path] = (resp.status, resp.headers.get("Content-Type"),
+                                 resp.read().decode("utf-8"))
+        finally:
+            await server.stop()
+
+    asyncio.run(go())
+
+    for path in ("/", "/index.html"):
+        status, ctype, text = out[path]
+        assert status == 200
+        assert (ctype or "").startswith("text/html")
+        # Self-contained page marker plus the fetch-driven client and the routes it calls.
+        assert "ninfer-request-persist-ui" in text
+        assert "fetch(" in text
+        assert "/requests" in text
+
+
 def test_rest_end_to_end(tmp_path) -> None:
     db = str(tmp_path / "rest.sqlite")
     now = int(time.time())

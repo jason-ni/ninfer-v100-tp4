@@ -23,7 +23,8 @@ The transport is split into two owning components:
   (`encode_persist_frame` / `decode_persist_frame`).
 - Python (`tools/request_persist/request_persist_server.py`): an asyncio TCP server with a frame
   reader and a single-writer SQLite path (per-record commit, graceful shutdown), plus a stdlib
-  `http.server` REST admin interface on a separate port for querying and deleting stored records.
+  `http.server` REST admin interface on a separate port for querying and deleting stored records,
+  and a self-contained single-page web UI served at `GET /` on that same port.
 
 The length prefix and the envelope are handled separately so the codec stays unit-testable on both
 sides. A golden-byte vector pins the exact encoding and is asserted identically by the C++ and
@@ -124,6 +125,26 @@ Filters for `GET /requests` and `DELETE /requests` (AND-combined, single value e
 rows without shipping the large bodies). Every row carries `body_bytes` (its stored size) so
 oversized records can be targeted directly. `DELETE` with no criterion and no `all=true` returns `400`.
 
+### Web UI (SPA)
+
+The receiver also serves a small single-page app at `GET /` (and `/index.html`) on the **same** admin
+port — e.g. `http://127.0.0.1:9101/`. It is a self-contained `tools/request_persist/request_persist_ui.html`
+(vanilla HTML/CSS/JS, no CDN, no build step, no extra process) read once at startup; if the file is absent
+`GET /` returns `503` while TCP ingest and the JSON API keep working. The page calls the exact JSON endpoints
+above (`/health`, `/stats`, `/requests`, `DELETE /requests`, `/vacuum`), so it adds no second data path.
+
+It provides:
+
+- a live stats strip (rows, DB file size, created range + stored unit, per-model/protocol counts, truncated count);
+- the same AND-combined filters as the REST API (model, protocol, stream, message range, body-size range,
+  `id`/`ids`, `before`/`after`/age) with pagination and newest/oldest ordering;
+- a click-to-open record viewer that fetches one row and pretty-prints its full body, with Copy/Download;
+- **delete-with-preview** (always runs a dry-run and shows the would-delete count before you confirm the real
+  delete + `VACUUM`) and a standalone vacuum.
+
+Listing uses `include_body=false` for speed; bodies are fetched only when a record is opened. `--no-http`
+disables both the JSON API and the web UI.
+
 ### Time bounds and the units trap
 
 `created_unix_ms` is compared against its **stored unit**, which the API infers from the column's
@@ -171,14 +192,18 @@ cleanup action.
 
 - `--remote-req-log[=HOST:PORT]` — ensure the Python receiver is running (spawning it detached when
   its port is not already listening), store the DB under `/media/optane/reqlogs`, and forward
-  `--persist-endpoint` to `ninfer-serve`. The REST admin port follows the same host; default `9101`.
-  Overridable with `NINFER_REMOTE_REQ_LOG_ENDPOINT`, `NINFER_REMOTE_REQ_LOG_DIR`,
-  `NINFER_REMOTE_REQ_LOG_DB`, `NINFER_REMOTE_REQ_LOG_HTTP_PORT`, `NINFER_REMOTE_REQ_LOG_MAX_BODY_KB`,
+  `--persist-endpoint` to `ninfer-serve`. The TCP ingest listener is bound to the endpoint `HOST`
+  (loopback by default); the REST admin + web UI bind to `0.0.0.0` by default so they are reachable
+  from other hosts, on port `9101`. Overridable with `NINFER_REMOTE_REQ_LOG_ENDPOINT`,
+  `NINFER_REMOTE_REQ_LOG_HTTP_HOST`, `NINFER_REMOTE_REQ_LOG_HTTP_PORT`,
+  `NINFER_REMOTE_REQ_LOG_MAX_BODY_KB`, `NINFER_REMOTE_REQ_LOG_DIR`, `NINFER_REMOTE_REQ_LOG_DB`,
   and `NINFER_REMOTE_REQ_LOG_PYTHON`.
 
 `receiver (tools/request_persist/request_persist_server.py)`:
 
-- `--http-host ADDR` / `--http-port N` — REST admin bind; default `127.0.0.1:9101`, `0` = ephemeral.
+- `--http-host ADDR` / `--http-port N` — REST admin + web UI bind; the flag defaults to `127.0.0.1:9101`
+  (`0` = ephemeral port), while `run-tp4.sh` passes `0.0.0.0` so the API and UI are reachable off-box.
+  The TCP ingest listener is bound separately via `--host` and is not exposed by this setting.
 - `--no-http` — disable the REST admin interface (TCP ingest still runs).
 - `--max-body-kb N` — truncate stored request bodies above `N` KiB (default `1024`; `0` disables).
 
@@ -217,14 +242,22 @@ On the V100X4 launcher the whole receiver setup is one flag:
 ./run-tp4.sh --remote-req-log
 ```
 
+Once the receiver is up, open the web UI at `http://127.0.0.1:9101/` in a browser to browse, filter,
+inspect, and clean up stored requests without `curl`. The admin port binds `0.0.0.0` (via `run-tp4.sh`),
+so it is also reachable from other hosts at the machine's LAN address — e.g. `http://<host-ip>:9101/`
+(see `hostname -I`). The admin port is unauthenticated and supports delete/vacuum, so keep it to a
+trusted network.
+
 ## Verification
 
 - `ninfer_request_persist_test`: codec golden bytes, round-trip, and reject cases — ok.
 - `ninfer_serve_options_test`: new-flag defaults, parsing, invalid values, and usage — ok.
-- Python `pytest tests/test_request_persist.py`: 29 passed — golden bytes matching the C++ vector,
+- Python `pytest tests/test_request_persist.py`: 30 passed — golden bytes matching the C++ vector,
   decode/round-trip, frame reader, field extraction, DB insert/query, a real TCP loopback end-to-end
   into SQLite, REST unit coverage (filter builder, ISO/epoch/unit parsing, flag semantics), ingest
-  size-cap truncation (oversized / multibyte-boundary / pre-cap-schema migration), and a full
+  size-cap truncation (oversized / multibyte-boundary / pre-cap-schema migration), web-UI serving
+  (`GET /` and `/index.html` return `text/html` with the page marker over a live ephemeral-port server),
+  and a full
   TCP+REST end-to-end (insert with a truncated body → stats/list/get → delete by age, dry-run,
   all+vacuum) over real sockets.
 - GPU end-to-end (real engine, qwen3.8-27b, TP2): two `/v1/chat/completions` requests (1-message and
