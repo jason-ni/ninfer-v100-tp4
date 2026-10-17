@@ -77,6 +77,36 @@ int test_malformed_falls_back_to_text() {
     return failures;
 }
 
+int test_truncated_tool_call_is_dropped() {
+    const std::string text = "Now I'll write the file.\n\n"
+                             "<tool_call>\n"
+                             "<function=write>\n"
+                             "<parameter=filePath>\n/tmp/x.html\n</parameter>\n"
+                             "<parameter=content>\n<!doctype html>\n<html";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64, /*drop_unterminated=*/true);
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response, "truncated call is not a tool response");
+    failures += check(parsed.unterminated_tool_call, "truncated call is flagged unterminated");
+    failures += check(parsed.content == "Now I'll write the file.",
+                      "truncated call content keeps only the text before <tool_call>");
+    failures += check(parsed.tool_calls.empty(), "truncated call yields no calls");
+    return failures;
+}
+
+int test_truncated_tail_after_complete_call_is_dropped() {
+    const std::string text = "<tool_call>\n<function=first>\n</function>\n</tool_call>\n"
+                             "<tool_call>\n<function=second>\n<parameter=a>\nv\n</parameter>\n";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64, /*drop_unterminated=*/true);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "complete leading call survives");
+    failures += check(parsed.tool_calls.size() == 1, "exactly the complete call is kept");
+    failures += check(parsed.tool_calls[0].name == "first", "kept call is the leading one");
+    failures += check(parsed.unterminated_tool_call, "dangling tail is flagged unterminated");
+    return failures;
+}
+
 int test_suffix_after_tool_falls_back_to_text() {
     const std::string text = "<tool_call>\n"
                              "<function=get_weather>\n"
@@ -122,7 +152,7 @@ int test_incremental_filter_valid_tool() {
     visible += filter.feed("Calling weather.  \n<tool_");
     visible += filter.feed("call>\n<function=get_weather>");
     visible += filter.feed("\n</function>\n</tool_call>");
-    visible += filter.finish(true);
+    visible += filter.finish(ninfer::serve::ToolCallTerminal::Drop);
     int failures = 0;
     failures += check(visible == "Calling weather.",
                       "valid tool filter did not stream the trimmed content prefix");
@@ -137,17 +167,32 @@ int test_incremental_filter_fallback() {
     std::string restored;
     restored += malformed.feed(original.substr(0, 10));
     restored += malformed.feed(original.substr(10));
-    restored += malformed.finish(false);
+    restored += malformed.finish(ninfer::serve::ToolCallTerminal::Flush);
 
     ninfer::serve::ToolCallStreamFilter normal;
     std::string ordinary;
     ordinary += normal.feed("ordinary text  ");
-    ordinary += normal.finish(false);
+    ordinary += normal.finish(ninfer::serve::ToolCallTerminal::Flush);
 
     int failures = 0;
     failures += check(restored == original, "malformed tool filter fallback lost raw bytes");
     failures +=
         check(ordinary == "ordinary text  ", "ordinary filtered output lost trailing whitespace");
+    return failures;
+}
+
+int test_incremental_filter_drops_truncated_call() {
+    ninfer::serve::ToolCallStreamFilter filter;
+    std::string visible;
+    visible += filter.feed("Now I'll write the file.\n\n<tool_call>\n<function=write>");
+    visible += filter.feed("\n<parameter=content>\n<!doctype html>");
+    visible += filter.finish(ninfer::serve::ToolCallTerminal::Drop);
+
+    int failures = 0;
+    failures += check(visible == "Now I'll write the file.",
+                      "truncated call filter dropped the dangling tool region");
+    failures += check(filter.emitted_bytes() == visible.size(),
+                      "truncated call filter byte count mismatch");
     return failures;
 }
 
@@ -158,10 +203,13 @@ int main() {
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
     failures += test_malformed_falls_back_to_text();
+    failures += test_truncated_tool_call_is_dropped();
+    failures += test_truncated_tail_after_complete_call_is_dropped();
     failures += test_suffix_after_tool_falls_back_to_text();
     failures += test_configured_name_limit();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();
+    failures += test_incremental_filter_drops_truncated_call();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

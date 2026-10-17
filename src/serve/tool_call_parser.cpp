@@ -125,7 +125,8 @@ ParsedToolCallOutput fallback(const std::string& text) {
 } // namespace
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
-                                                 std::size_t max_tool_name_length) {
+                                                 std::size_t max_tool_name_length,
+                                                 bool drop_unterminated) {
     constexpr std::string_view kToolOpen  = "<tool_call>";
     constexpr std::string_view kToolClose = "</tool_call>";
 
@@ -142,7 +143,15 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
         const std::size_t inner_begin = pos + kToolOpen.size();
         const std::size_t close       = text.find(kToolClose, inner_begin);
-        if (close == std::string::npos) { return fallback(text); }
+        if (close == std::string::npos) {
+            // The opening tag is never closed: the generation was cut off inside the call. A
+            // truncated call is not a complete response, so it cannot be parsed; report it and
+            // keep only the text that precedes it when the caller asked to drop it.
+            if (!drop_unterminated) { return fallback(text); }
+            out.unterminated_tool_call = true;
+            out.is_tool_call_response  = !out.tool_calls.empty();
+            return out;
+        }
         ToolCall call;
         if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
                                  max_tool_name_length, call)) {
@@ -193,10 +202,10 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
     return visible;
 }
 
-std::string ToolCallStreamFilter::finish(bool is_tool_call_response) {
+std::string ToolCallStreamFilter::finish(ToolCallTerminal terminal) {
     if (finished_) { throw std::logic_error("tool-call stream filter is already finished"); }
     finished_ = true;
-    if (is_tool_call_response) {
+    if (terminal == ToolCallTerminal::Drop) {
         pending_.clear();
         tool_region_.clear();
         return {};

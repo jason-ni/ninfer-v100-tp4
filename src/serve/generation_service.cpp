@@ -203,8 +203,8 @@ public:
         }
     }
 
-    std::size_t finish(bool is_tool_call_response) {
-        if (filter_tool_calls_) { publish_content(tool_filter_.finish(is_tool_call_response)); }
+    std::size_t finish(ToolCallTerminal terminal) {
+        if (filter_tool_calls_) { publish_content(tool_filter_.finish(terminal)); }
         return content_bytes_;
     }
 
@@ -412,15 +412,25 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         std::move(result.speculative.accepted_per_position);
 
     bool is_tool_call_response = false;
+    bool truncated_tool_call   = false;
     if (prepared.tool_capable) {
+        // An output/context-limit finish can cut the generation off inside a <tool_call>. That
+        // dangling call is not a usable response and must not leak its raw syntax into content,
+        // so it is dropped rather than flushed back as ordinary text.
+        const bool truncated = outcome.finish_reason == ninfer::FinishReason::OutputLimit ||
+                               outcome.finish_reason == ninfer::FinishReason::ContextCapacity;
         ParsedToolCallOutput parsed =
-            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length);
+            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length, truncated);
         outcome.text          = std::move(parsed.content);
         is_tool_call_response = parsed.is_tool_call_response;
+        truncated_tool_call   = parsed.unterminated_tool_call;
         if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
     }
     if (output_sink) {
-        outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);
+        const ToolCallTerminal terminal = (is_tool_call_response || truncated_tool_call)
+                                              ? ToolCallTerminal::Drop
+                                              : ToolCallTerminal::Flush;
+        outcome.streamed_content_bytes  = output_sink->finish(terminal);
     }
     return outcome;
 }

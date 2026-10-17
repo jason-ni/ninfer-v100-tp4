@@ -446,7 +446,10 @@ Function arguments use `response.function_call_arguments.delta` and `.done`. IDs
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
-Malformed tool markup is flushed back as ordinary text without losing bytes.
+Malformed tool markup is flushed back as ordinary text without losing bytes, except that a
+`<tool_call>` left unclosed by an output-limit or context-capacity finish is withheld from
+`content` instead: its dangling syntax is discarded, the finish reason stays `length`, and the
+text preceding the call is returned normally.
 
 ### Local response state and resources
 
