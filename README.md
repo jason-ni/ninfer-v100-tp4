@@ -24,17 +24,19 @@ carries the text weights as **4-bit FP4 (W4A4)** NVFP4 for the wide prefill GEMM
 attention KV, the native **MTP route** (≤3-draft window), and the optional five-layer
 **DFlash2** draft package.
 
-All vision-tower weights — patch projection, per-block qkv/o_proj/fc1/fc2, and the merger
-fc1/fc2 — are materialized in **native FP16** by casting from the official BF16 vision
-safetensors. All other scales, biases (including `vision/patch_embedding_bias`, which stays
-BF16), MTP matrices and front-end resources are preserved byte-for-byte from the published
-container. The re-exported working artifact (`coder390-basemtp.ninfer`) is what the engine
-loads.
+The Vision tower in this published container is the publisher's **grouped-integer** recipe —
+grouped Q4/Q5/Q6 `F16S` GEMM matrices (patch, per-block qkv/o_proj, and mlp fc1/fc2) plus a W8
+merger — with biases, norms, the position embedding, and `vision/patch_embedding_bias` kept BF16.
+It binds as the registered identity `qwen3.8-27b-coder390/nvfp4-qvis`, so the engine reads the
+published single-file container **directly**; no conversion or re-export is required. All other
+scales, the MTP/DFlash2 matrices, and front-end resources are preserved byte-for-byte. As with the
+FP16 tower, every Vision shard is host-staged (streamed to the device once per media encode), so
+steady-state device Vision residency is ~0 and text-only requests pay no Vision cost.
 
-The FP16-vision working `.ninfer` is **not yet published** separately; the published HF file is
-the raw NVFP4 container directly from the Hugging Face repo. To reproduce the served weights,
-have the AI convert from the original vision safetensors: read each vision linear matrix, cast
-BF16→FP16, and write it into the artifact as a `FP16` object before re-exporting the container.
+A **native-FP16** Vision re-export (casting the official BF16 Vision safetensors to FP16) is an
+optional alternative tower. It is not separately published; to build it, read each Vision linear
+matrix, cast BF16→FP16, and write it into the artifact as an `FP16` object before re-exporting the
+container.
 
 ## Concurrent serving
 

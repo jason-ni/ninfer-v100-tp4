@@ -21,14 +21,16 @@ https://huggingface.co/nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6A
 容器内文本权重为 **4-bit FP4 (W4A4)** NVFP4（宽 prefill GEMM 路径），注意力 KV 为 **W8A8 INT8**，
 原生 **MTP** 路径（≤3 token 草稿窗口），以及可选的五层 **DFlash2** 草稿包。
 
-所有 vision-tower 权重——patch 投影、每层 block 的 qkv/o_proj/fc1/fc2，以及 merger 的 fc1/fc2——
-均以**原生 FP16** 形式写入，由官方 BF16 vision safetensors 直接转换而来。其余所有 scale、bias
-（包括 `vision/patch_embedding_bias` 保留为 BF16）、MTP 矩阵和前端资源均逐字节原样保留。
-引擎实际加载的是重新导出的工作 artifact（`coder390-basemtp.ninfer`）。
+该发布容器中的 Vision tower 采用发布方的**分组整型** recipe——分组 Q4/Q5/Q6 `F16S` GEMM 矩阵
+（patch、每层 block 的 qkv/o_proj、mlp fc1/fc2）外加 W8 merger——bias、norm、位置嵌入与
+`vision/patch_embedding_bias` 保持 BF16。它按注册身份 `qwen3.8-27b-coder390/nvfp4-qvis` 绑定，
+引擎因此**直接读取**这个单文件发布容器，无需转换或重新导出。其余所有 scale、MTP/DFlash2 矩阵与
+前端资源均逐字节原样保留。与 FP16 tower 相同，每个 Vision 分片走 host-staged（每次媒体编码一次性
+流到 device），稳态 device 上的 Vision 常驻约为 0，纯文本请求不产生 Vision 开销。
 
-FP16-vision 工作版 `.ninfer` **目前未单独发布**；HF 上的原始 NVFP4 容器是下载后直接使用的形式。
-要复现已交付权重，需要由 AI 从原始 BF16 vision safetensors 转换：读取每个 vision linear
-权重矩阵，BF16→FP16 cast，写入 artifact 为 `FP16` 对象，再重新导出容器。
+**原生 FP16** Vision 的重新导出版本（把官方 BF16 Vision safetensors cast 成 FP16）是可替换的
+另一种 tower；它未单独发布，需本地构建：读取每个 Vision linear 权重矩阵，BF16→FP16 cast，写为
+`FP16` 对象后重新导出容器。
 
 ## 并发推理
 
