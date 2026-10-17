@@ -31,13 +31,10 @@ export NINFER_V100X2_SERVE_TP=4
 export NINFER_V100X2_SERVE_DEVICES=${NINFER_V100X2_SERVE_DEVICES:-0,1,2,3}
 # Four-way weight sharding frees ~5 GiB/GPU, so default to the model's full native 262144-token
 # ceiling (the shared serve default of 140000 is the conservative two-card budget).
-# Four concurrent request lanes (bounded FIFO ingress, no preemption). With --kv-capacity auto the
-# KV pool is provisioned for max-concurrency full sequences, so four lanes share the fixed VRAM
-# budget: auto resolves the largest per-sequence capacity that fits all four.
-export NINFER_V100X2_SERVE_MAX_CONCURRENCY=${NINFER_V100X2_SERVE_MAX_CONCURRENCY:-4}
 # KV cache storage type: int8 (group-64, the acceptance profile, default) or iq4nl (low-bit growing
 # cache for higher capacity). Select with the launcher --kv-dtype option (see below) or the
-# NINFER_V100X2_SERVE_KV_DTYPE environment variable; the option overrides the environment.
+# NINFER_V100X2_SERVE_KV_DTYPE environment variable; the option overrides the environment. The
+# concurrent-lane count is derived from this value below (see NINFER_V100X2_SERVE_MAX_CONCURRENCY).
 kv_dtype=${NINFER_V100X2_SERVE_KV_DTYPE:-int8}
 # Round-trip the model's reasoning in assistant history so prefix reuse resumes at the exact
 # generated frontier (append_frontier) instead of the conservative turn-closure checkpoint.
@@ -52,7 +49,19 @@ export NINFER_V100X2_SERVE_MODEL_ID=${NINFER_V100X2_SERVE_MODEL_ID:-}
 # no longer fit on device are demoted to pinned host RAM instead of dropped, so an evicted
 # conversation can still be restored without recomputing. Each snapshot slab is ~147 MiB, so the
 # pool is sized to hold several conversations' taps; override with NINFER_V100X2_SERVE_HOST_CACHE_MIB.
-host_cache_mib=${NINFER_V100X2_SERVE_HOST_CACHE_MIB:-28192}
+host_cache_mib=${NINFER_V100X2_SERVE_HOST_CACHE_MIB:-16384}
+
+# Bounded, crash-durable disk tier below the host tier (M3a): host slabs evicted under pressure are
+# spilled to a fixed-slot slab file, and admission restores them without recomputation. The index
+# and KV bytes survive a crash (SIGKILL) because writes go through at runtime, not only on shutdown.
+# A directory path stores <dir>/prefix-cache.bin (index) + <dir>/prefix-cache.slabs. Override with
+# NINFER_V100X2_SERVE_PREFIX_CACHE_FILE; an empty value disables the disk tier.
+prefix_cache_file=${NINFER_V100X2_SERVE_PREFIX_CACHE_FILE:-/media/optane/kvcache}
+# Disk-tier size budget. Must fit the volume holding prefix_cache_file (the slab file is sparse,
+# so it only consumes space for slots actually written, but a budget larger than the volume would
+# eventually hit ENOSPC under fill). /media/optane is ~53G with ~49G free, so default to 49152 MiB
+# (48 GiB); override with NINFER_V100X2_SERVE_DISK_CACHE_MIB.
+disk_cache_mib=${NINFER_V100X2_SERVE_DISK_CACHE_MIB:-49152}
 
 # The Engine's registered Qwen3.8-27B thinking preset keeps presence penalty at 0 (its general-task
 # default), so an agent harness that sends only temperature/top-p/top-k runs unpenalized and long
@@ -79,8 +88,9 @@ print_help() {
     cat <<EOF
 usage: ./run-tp4.sh [launcher options] [ninfer-serve options...]
 
-V100X4 profile: TP4 (devices 0,1,2,3), max-context 262144, max-concurrency 4, hybrid prefix cache
-with the pinned host tier, and MTP3. Every other argument is forwarded to ninfer-serve.
+V100X4 profile: TP4 (devices 0,1,2,3), max-context 262144, hybrid prefix cache with the pinned host
+tier, and MTP3. max-concurrency follows the KV dtype (5 for iq4nl, 4 otherwise; override with
+NINFER_V100X2_SERVE_MAX_CONCURRENCY). Every other argument is forwarded to ninfer-serve.
 
 Launcher options:
   --vision                 enable media/Vision and default the artifact to the Coder390 package
@@ -94,7 +104,8 @@ Launcher options:
   -h, --help               show this help
 
 Environment: NINFER_V100X2_SERVE_KV_DTYPE, NINFER_V100X2_SERVE_MODEL_ID,
-NINFER_V100X2_SERVE_MAX_CONTEXT, NINFER_V100X2_SERVE_HOST_CACHE_MIB,
+NINFER_V100X2_SERVE_MAX_CONTEXT, NINFER_V100X2_SERVE_MAX_CONCURRENCY,
+NINFER_V100X2_SERVE_HOST_CACHE_MIB,
 NINFER_V100X2_SERVE_PRESENCE_PENALTY, CUDA_VISIBLE_DEVICES, NINFER_V100X2_SERVE_ARTIFACT,
 NINFER_REMOTE_REQ_LOG_ENDPOINT, NINFER_REMOTE_REQ_LOG_DIR, NINFER_REMOTE_REQ_LOG_DB,
 NINFER_REMOTE_REQ_LOG_PYTHON.
@@ -184,6 +195,24 @@ while [[ $# -gt 0 ]]; do
 done
 export NINFER_V100X2_SERVE_MAX_CONTEXT=${NINFER_V100X2_SERVE_MAX_CONTEXT:-${max_context}}
 export NINFER_V100X2_SERVE_KV_DTYPE="${kv_dtype}"
+
+# Bounded FIFO ingress with no preemption; the lane count is derived from the KV storage type here.
+# With --kv-capacity auto the shared Main KV pool is provisioned at the curve ceiling
+# max_concurrency * ceil(max_context / 64) pages, but that ceiling is in PAGES, so a lower-bit dtype
+# stores each page in fewer bytes and leaves VRAM unused at four lanes. iq4nl (Int4NLGroup32: 4-bit
+# codes + one FP16 scale per 32 values, ~288 KiB/page) fits a fifth lane inside that slack (auto then
+# grows into it, leaving only the default 1 GiB automatic headroom); int8 (~2x) and bf16 (~4x) pages
+# are too large to add a lane, so four is already the budget. An explicit
+# NINFER_V100X2_SERVE_MAX_CONCURRENCY always wins.
+if [[ -n "${NINFER_V100X2_SERVE_MAX_CONCURRENCY:-}" ]]; then
+    max_concurrency=${NINFER_V100X2_SERVE_MAX_CONCURRENCY}
+else
+    case "${kv_dtype}" in
+        iq4nl) max_concurrency=5 ;;
+        *)     max_concurrency=4 ;;
+    esac
+fi
+export NINFER_V100X2_SERVE_MAX_CONCURRENCY="${max_concurrency}"
 if [[ -n "${raw_log_path}" ]]; then
     mkdir -p -- "$(dirname -- "${raw_log_path}")"
     export NINFER_RAW_OUTPUT_LOG="${raw_log_path}"
@@ -243,7 +272,13 @@ if [[ "${remote_req_log}" -eq 1 ]]; then
     forwarded_args+=(--persist-endpoint "${req_endpoint}")
 fi
 
+prefix_cache_args=()
+if [[ -n "${prefix_cache_file}" ]]; then
+    prefix_cache_args+=(--prefix-cache-file "${prefix_cache_file}" --disk-cache-mib "${disk_cache_mib}")
+fi
+
 exec "${script_dir}/tools/v100/ninfer-v100x2-serve.sh" \
     --prefix-cache --host-cache-mib "${host_cache_mib}" \
+    ${prefix_cache_args[@]+"${prefix_cache_args[@]}"} \
     --presence-penalty "${presence_penalty}" \
     ${forwarded_args[@]+"${forwarded_args[@]}"}
