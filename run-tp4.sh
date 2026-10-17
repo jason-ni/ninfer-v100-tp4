@@ -61,7 +61,7 @@ prefix_cache_file=${NINFER_V100X2_SERVE_PREFIX_CACHE_FILE:-/media/optane/kvcache
 # so it only consumes space for slots actually written, but a budget larger than the volume would
 # eventually hit ENOSPC under fill). /media/optane is ~53G with ~49G free, so default to 49152 MiB
 # (48 GiB); override with NINFER_V100X2_SERVE_DISK_CACHE_MIB.
-disk_cache_mib=${NINFER_V100X2_SERVE_DISK_CACHE_MIB:-49152}
+disk_cache_mib=${NINFER_V100X2_SERVE_DISK_CACHE_MIB:-43008}
 
 # The Engine's registered Qwen3.8-27B thinking preset keeps presence penalty at 0 (its general-task
 # default), so an agent harness that sends only temperature/top-p/top-k runs unpenalized and long
