@@ -1,8 +1,11 @@
 # Hybrid prefix cache: V100X2 adaptation plan
 
-Status: implemented and verified. M1 (device-only block + snapshot cache) and M2 (host tier,
-including the host-restore continuation-identity exit criterion) are in-tree and verified; M3
-(persistence and keys) has not started. This document adapts the content-addressed prefix cache of
+Status: implemented and verified through M2. M1 (device-only block + snapshot cache) and M2 (host
+tier, including the host-restore continuation-identity exit criterion) are in-tree and verified.
+M3 (persistence) is design-locked and in progress: persistence is a **bounded, crash-durable disk
+tier below the host tier**, not a shutdown dump — an interim dump-based `--prefix-cache-file` was
+built, verified, and is being replaced (§5, M3a). The M3 keys deliverables (media digests, explicit
+breakpoints) remain not started (§5, M3b). This document adapts the content-addressed prefix cache of
 `Wallawalla47/ninfer-custom` (its `docs/maintainer/hybrid-prefix-cache-spec.md`, referred to below
 as **HPC**) to this checkout's Qwen3.8-27B V100X2 engine. Sections 0–4 keep the original
 reference/motivation framing; §5 onward is the implementation record, and §1.1 lists where the
@@ -407,14 +410,98 @@ kept that `-1` at index 0 and `capture_prefix_after_chunk` then called `snapshot
 
 ### M3 — persistence and keys
 
+Status: **M3a implemented and verified (2026-10-17).** M3 splits into a persistence tier (M3a) and
+key extensions (M3b). M3a is implemented across `DiskSlabPool`, `PrefixIndex` disk residency, the
+index-only `prefix_store`, Program wiring, and the config/CLI/serve/metrics surface; the host-tier
+unit suite (disk pool, disk round-trip, disk rejects, crash-gap) and the metrics schema tests are
+green and the full tree builds. Live V100X2 (TP4) exit check on the NVFP4+Vision artifact: with
+`--host-cache-mib 28192 --disk-cache-mib 65536`, a 1545-token conversation warmed the cache
+(`[prefix-store] wrote index: 25 nodes, 1 snapshots`), a **SIGKILL** was followed by a restart that
+`[prefix-store] restored 25 nodes, 1 snapshots from /media/optane/kvcache/prefix-cache.bin`, and the
+first post-restart request reused the full 1536-token prefix (`cache=1536 reuse=block_snapshot
+prefix_admission=block_reused B24/B24`) with continuation-identical output (content and
+reasoning byte-equal to the pre-kill greedy run). `/metrics` reports the disk tier within budget.
+
+#### M3a — bounded, crash-durable disk tier
+
+Persistence is a **third cache tier below the host tier**, not a shutdown snapshot. An interim
+feature that saved one validated container on graceful shutdown and reloaded it at start was built
+and verified end to end and then rejected: it has no independent budget, writes nothing during
+runtime (a crash loses the whole cache), and cannot evict. Its container machinery (versioned,
+validated, atomic temp-file + rename) is reused as the disk **index**; its inline-payload path is
+replaced.
+
+Design (locked):
+
+- **Two files under the resolved base** (`resolve_prefix_store_file`; `--prefix-cache-file PATH`,
+  where a directory resolves to `<dir>/prefix-cache.bin`):
+  - `prefix-cache.bin` — the **index**: block-tree topology, per-record disk-slot id and
+    generation, and disk eviction metadata. Metadata only (no payloads). Rewritten atomically
+    (temp + rename) on a debounce and at shutdown.
+  - `prefix-cache.slabs` — a **preallocated, fixed-slot data file**: a block region and a snapshot
+    region, each slot `tp × per_rank_bytes` (the same slab geometry as the host tier). In-place slot
+    reuse gives O(1) addressing. Each slot is `[header | payload]`; the header carries
+    `{magic, kind, generation, payload checksum}` and is written **last** (payload first), so a torn
+    write is detectable.
+- **Residency.** `Residency` gains `Disk`; `BlockNode` and `Snapshot` gain `disk_page` +
+  `disk_state`, alongside the existing host fields. `is_backed()` is true for a host **or** disk
+  copy, so device demotion stays lossless when the record is disk-backed.
+- **Runtime writes (crash durability).** The disk receives data during runtime, on the host tier's
+  own write path:
+  1. **Spill on host eviction.** When `HostSlabPool` evicts a slab to make room
+     (`reconcile_host_eviction`), the record is written to a disk slot instead of dropped: the
+     evicted host bytes are written out, the slot header committed, and the owner marked
+     `disk_state = Disk` before its `host_page` is cleared. A later admission restores it from disk.
+  2. **Periodic flush.** A sweep on the round-boundary tick writes host-resident records that have
+     no disk copy yet (leaving the host copy in place) and rewrites the index on a debounce. This
+     caps what a crash can lose at one interval.
+  Durability level is **process-crash** (SIGKILL): a written file survives process death through the
+  OS page cache, so no `fsync` sits on the hot path. Power-loss durability is not a requirement of
+  this product.
+- **Admission and restore.** `match()` adds `best_disk` (deepest candidate whose whole path is
+  restorable from device, host, or disk); admission preference is device → host → disk. A disk
+  restore reads the slot into a freshly allocated host slab and then reuses the existing H2D path,
+  so no new device-side transfer code is needed.
+- **Disk eviction (own budget).** `--disk-cache-mib N` sizes the slab file; `0` disables the tier.
+  When a region is full the pool evicts by the same policy as the host tier (dead → superseded →
+  GDSF). A victim with no other copy is reconciled away (nodes erase their subtree, snapshots are
+  deleted); a victim that still has a device or host copy just loses its disk slot.
+- **Load.** Read the index; for each disk record verify its slot header (generation + checksum)
+  against the record. A stale or absent slot drops just that record and its now-unreachable subtree.
+  The host tier starts empty, so restored records are disk-resident until an admission restores
+  them; a whole-file geometry mismatch still rejects the index wholesale.
+- **Crash consistency.** A slot written after the last index rewrite is either unreferenced (treated
+  free) or referenced at an older generation (dropped); a slot written before its record is
+  committed to the index is invisible. The index is therefore always a consistent, if slightly
+  stale, view.
+
 Deliverables:
 
-- `--prefix-cache-file PATH`: load at start, dump on graceful shutdown (SIGINT), with a versioned,
-  validated container (HPC §5.5).
+- `DiskSlabPool` (`src/runtime/prefix_cache/disk_slab_pool.{h,cpp}`): fixed slot file, slot-header
+  commit, alloc/evict, read/write payload.
+- `PrefixIndex` disk residency: `Residency::Disk`, `disk_page`/`disk_state`, spill on host eviction,
+  `reconcile_disk_eviction`, `best_disk` in `match()`, disk eviction metadata.
+- `prefix_store` becomes the index-only container (payloads removed; disk-slot records added), with
+  a disk-pool occupancy restore.
+- Program wiring (`program_impl.h`): create the disk pool, spill in `reconcile_host_eviction`, the
+  flush tick + debounced index write, and the disk restore path; the shutdown-only
+  `persist_prefix_store` dump is removed.
+- Config: `--disk-cache-mib` in `include/ninfer/types.h` (`PrefixCacheOptions`), CLI
+  (`apps/cli`), serve (`src/serve`), and `run-tp4.sh`.
+
+Exit: on the V100X2 acceptance workload, a conversation cached before a **SIGKILL** is restored
+from disk after restart with continuation identical to the pre-kill run, disk usage stays within
+`--disk-cache-mib`, and the first post-restart request admits (`best_disk`) rather than resetting.
+
+#### M3b — keys
+
+Deliverables:
+
 - Media digests in the block key for the Vision-capable identities.
 - Explicit breakpoints (OpenAI/Anthropic `cache_control`/markers) plumbed from the frontend.
 
-Exit: restarting the server and re-issuing a prefix yields the same reuse as before restart.
+Exit: a rewritten-prefix request whose shared prefix ends inside an image/video span still reuses up
+to the media boundary; an explicit client breakpoint produces an exact tap.
 
 ---
 
@@ -446,12 +533,14 @@ Exit: restarting the server and re-issuing a prefix yields the same reuse as bef
 
 ## 7. Configuration surface
 
-Implemented server flags:
+Server flags:
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--prefix-cache` | off | Enable the hybrid content-addressed prefix cache (additive to the legacy owner/checkpoint reuse paths). |
 | `--host-cache-mib N` | `0` | Pinned host RAM for the prefix pool; `0` = device-only (M1). |
+| `--disk-cache-mib N` | `0` | Budget for the fixed-slot disk tier (M3a); `0` = no disk tier. |
+| `--prefix-cache-file PATH` | unset | Disk-tier base path (M3a); the index is written to the resolved base and the slab file to its `.slabs` sibling. Requires a non-zero disk budget. |
 | `--no-prefix-reuse` | reuse on | Disable all prefix reuse for the request. |
 
 Internal `PrefixCacheOptions` fields. They are not exposed as CLI flags; `ProgramImplCore` derives
@@ -464,9 +553,9 @@ these defaults when the field is zero:
 | `ladder_tokens` | `0` → `max(4096, 2·prefill_chunk)` | Ladder spacing `n − G·2^k`. |
 | `min_gap` | `0` → `max(1024, prefill_chunk)` | Minimum gap between taps. |
 
-Not yet implemented: `--prefix-cache-file` (M3 persistence), explicit client breakpoints
-(OpenAI/Anthropic `cache_control`/markers), and a `--use-original-prefix-caching` switch. The hybrid
-cache is **additive**, not a replacement: `admit_block_snapshot` is tried first and, on no usable
+Not yet implemented: media digests in the block key and explicit client breakpoints
+(OpenAI/Anthropic `cache_control`/markers) (M3b), and a `--use-original-prefix-caching` switch. The
+hybrid cache is **additive**, not a replacement: `admit_block_snapshot` is tried first and, on no usable
 hit, planning falls through to the existing owner/checkpoint paths (`AppendAtFrontier`, rewrite
 checkpoint) unchanged — unlike HPC §14.1, the legacy machinery is still constructed.
 
@@ -484,6 +573,9 @@ checkpoint) unchanged — unlike HPC §14.1, the legacy machinery is still const
 - **Rewriting clients.** Reuse will still restart at the *deepest surviving boundary* before a
   rewrite. If a client rewrites the very first tool block, only the system/tools preamble is
   reusable — that is the floor, and it is a large improvement over a full reset.
+- **Disk-tier index growth.** The index is rewritten whole on a debounce, so its cost grows with the
+  number of disk-resident records. On the target workload the tree is small (one conversation is
+  about 1.3 k nodes); revisit only if a deployment accumulates very large multi-session trees.
 - **Contract.** The cache extended the published CLI/serve surface (`--prefix-cache`,
   `--host-cache-mib`), now documented in `docs/cli.md` and `docs/serving.md`. The
   `include/ninfer/types.h` `PrefixCacheOptions` comments carry the internal fields. If the supported

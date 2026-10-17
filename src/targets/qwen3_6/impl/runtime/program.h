@@ -14,12 +14,14 @@
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "runtime/prefix_cache/prefix_index.h"
+#include "runtime/prefix_cache/prefix_store.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <cstdint>
 #include <array>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
@@ -433,6 +435,20 @@ public:
     std::unique_ptr<PrefixCacheSink> prefix_sink;
     std::unique_ptr<ninfer::prefix_cache::PrefixIndex> prefix_index;
     std::unique_ptr<ninfer::prefix_cache::HostSlabPool> prefix_host_pool; // M2
+    std::unique_ptr<ninfer::prefix_cache::DiskSlabPool> prefix_disk_pool; // M3a
+    // M3a disk tier: container paths bound at construction. The index path holds metadata
+    // (topology + per-record disk slot/generation); the slab path holds the KV bytes. Empty
+    // disables persistence, leaving the in-memory cache behavior unchanged.
+    std::filesystem::path prefix_store_file;
+    std::filesystem::path prefix_slabs_file;
+    // Bounded flush sweep cursors and the index-write debounce. The sweep spills host-resident
+    // records into the disk tier a few per round boundary so the steady-state cost stays bounded;
+    // the index is rewritten every `kPrefixIndexDebounceTicks` boundaries while the disk tier is
+    // active.
+    std::uint64_t prefix_flush_node_cursor = 1;
+    std::uint64_t prefix_flush_snap_cursor = 1;
+    std::uint64_t prefix_tick_count        = 0;
+    std::uint64_t prefix_index_written_tick = 0;
     // Eviction demand for the current admission round (see set_eviction_demand).
     std::vector<ninfer::prefix_cache::NodeId> eviction_demand_;
     std::uint64_t retained_lane_evictions_total_ = 0;
@@ -645,6 +661,18 @@ private:
     // completed request settles its writes this way so its committed blocks are host-backed and
     // evictable before any later admission reads the pool counts.
     void settle_prefix_writes() noexcept;
+    // M3a disk tier: the geometry the persisted index is bound to (mirrors the disk pool).
+    [[nodiscard]] ninfer::prefix_cache::PrefixStoreGeometry prefix_store_geometry() const noexcept;
+    // M3a: spill up to a bounded number of host-resident, not-yet-spilled records into the disk
+    // tier, then rewrite the index if the debounce has elapsed. Called at every round boundary;
+    // bounded so a round boundary never stalls on a full sweep. No-op without a disk tier.
+    void sweep_prefix_disk_tier() noexcept;
+    // M3a: spill every host-resident record into the disk tier, then serialize the index to
+    // `prefix_store_file`. No-op unless the disk tier exists. Best case only: a record that cannot
+    // reach the disk tier is dropped by the serializer with its subtree.
+    void persist_prefix_store() noexcept;
+    // M3a: write the index to `prefix_store_file` atomically. Best-effort; logs on failure.
+    void write_prefix_index() noexcept;
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets);

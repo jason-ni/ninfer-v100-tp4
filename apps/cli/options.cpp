@@ -132,7 +132,8 @@ std::string usage_text(const char* argv0) {
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--ignore-eos]\n"
             "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
             "       [--cuda-graph|--no-cuda-graph]\n"
-            "       [--prefix-cache] [--host-cache-mib N]\n"
+            "       [--prefix-cache] [--host-cache-mib N] [--disk-cache-mib N] "
+            "[--prefix-cache-file PATH]\n"
             "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
@@ -167,7 +168,13 @@ std::string usage_text(const char* argv0) {
             "--prefix-cache enables the hybrid content-addressed prefix cache, which reuses KV "
             "blocks and state snapshots across requests that share a prompt prefix. "
             "--host-cache-mib N adds a pinned host-RAM tier (N MiB) so evicted blocks and "
-            "snapshots survive device pressure; 0 keeps the cache device-only.\n";
+            "snapshots survive device pressure; 0 keeps the cache device-only. "
+            "--disk-cache-mib N adds a bounded, crash-durable disk tier (N MiB) below the host "
+            "tier; spilled host slabs are restored on admission and the tier has its own eviction "
+            "budget. "
+            "--prefix-cache-file PATH sets the disk-tier base path (load at start, write through at "
+            "runtime); it requires --host-cache-mib and --disk-cache-mib, and treats an existing "
+            "directory path as <dir>/prefix-cache.bin plus <dir>/prefix-cache.slabs.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -247,6 +254,10 @@ Options parse_options(int argc, char** argv) {
             options.prefix_cache = true;
         } else if (arg == "--host-cache-mib") {
             options.host_cache_mib = parse_u32(value(arg), "host-cache-mib", true);
+        } else if (arg == "--disk-cache-mib") {
+            options.disk_cache_mib = parse_u32(value(arg), "disk-cache-mib", true);
+        } else if (arg == "--prefix-cache-file") {
+            options.prefix_cache_file = value(arg);
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
@@ -327,6 +338,22 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
     }
     if (options.greedy) { options.sampling.temperature = 0.0F; }
+    if (!options.prefix_cache_file.empty() && options.host_cache_mib == 0) {
+        throw std::invalid_argument(
+            "--prefix-cache-file requires --host-cache-mib (the disk tier restores into the host "
+            "tier)");
+    }
+    if (!options.prefix_cache_file.empty() && options.disk_cache_mib == 0) {
+        throw std::invalid_argument(
+            "--prefix-cache-file requires --disk-cache-mib (the disk tier needs a size budget)");
+    }
+    if (options.disk_cache_mib > 0 && options.host_cache_mib == 0) {
+        throw std::invalid_argument(
+            "--disk-cache-mib requires --host-cache-mib (the disk tier restores into the host tier)");
+    }
+    if (options.disk_cache_mib > 0 && options.prefix_cache_file.empty()) {
+        throw std::invalid_argument("--disk-cache-mib requires --prefix-cache-file");
+    }
     return options;
 }
 

@@ -43,6 +43,12 @@ struct Options {
     bool prefix_cache  = false;
     // M2: pinned host RAM for the hybrid prefix cache (MiB). 0 = device-only (M1).
     std::uint32_t host_cache_mib = 0;
+    // M3a: bounded disk budget for the lower cache tier (MiB), requires host_cache_mib > 0 and
+    // prefix_cache_file. 0 = no disk tier.
+    std::uint32_t disk_cache_mib = 0;
+    // M3a: disk-tier base path (requires host_cache_mib > 0). A directory stores
+    // <dir>/prefix-cache.bin (index) and <dir>/prefix-cache.slabs (KV bytes). Empty = in-memory.
+    std::filesystem::path prefix_cache_file;
 
     bool raw_output      = false;
     bool print_token_ids = false;

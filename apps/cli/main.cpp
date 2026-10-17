@@ -317,6 +317,8 @@ int main(int argc, char** argv) {
         if (cli.prefix_cache || cli.host_cache_mib > 0) {
             engine_options.prefix_cache.enabled        = true;
             engine_options.prefix_cache.host_cache_mib = cli.host_cache_mib;
+            engine_options.prefix_cache.disk_cache_mib = cli.disk_cache_mib;
+            engine_options.prefix_cache.file = cli.prefix_cache_file;
         }
 
         const auto load_started = Clock::now();

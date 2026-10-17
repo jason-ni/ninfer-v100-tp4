@@ -105,6 +105,20 @@ std::string metrics_to_prometheus(const ninfer::MetricsSnapshot& metrics) {
            metrics.prefix_cache.host.block_slab_count);
     sample(out, "ninfer_prefix_cache_host_slabs", labels({{"kind", "snapshot"}}),
            metrics.prefix_cache.host.snapshot_slab_count);
+    header(out, "ninfer_prefix_cache_disk_enabled",
+           "1 when the bounded disk KV tier is allocated.", "gauge");
+    sample(out, "ninfer_prefix_cache_disk_enabled", "", metrics.prefix_cache.disk.enabled ? 1U : 0U);
+    header(out, "ninfer_prefix_cache_disk_bytes",
+           "Disk KV tier budget and occupied bytes.", "gauge");
+    sample(out, "ninfer_prefix_cache_disk_bytes", labels({{"kind", "budget"}}),
+           metrics.prefix_cache.disk.budget_bytes);
+    sample(out, "ninfer_prefix_cache_disk_bytes", labels({{"kind", "used"}}),
+           metrics.prefix_cache.disk.used_bytes);
+    header(out, "ninfer_prefix_cache_disk_slabs", "Disk KV tier slab count.", "gauge");
+    sample(out, "ninfer_prefix_cache_disk_slabs", labels({{"kind", "block"}}),
+           metrics.prefix_cache.disk.block_slab_count);
+    sample(out, "ninfer_prefix_cache_disk_slabs", labels({{"kind", "snapshot"}}),
+           metrics.prefix_cache.disk.snapshot_slab_count);
     header(out, "ninfer_prefix_cache_device_blocks_demoted_total",
            "Lossless device-to-host demotions by demand-aware eviction.", "counter");
     sample(out, "ninfer_prefix_cache_device_blocks_demoted_total", "",
@@ -161,6 +175,7 @@ nlohmann::json metrics_to_json(const ninfer::MetricsSnapshot& metrics) {
     }
 
     const ninfer::HostCacheMetrics& host = metrics.prefix_cache.host;
+    const ninfer::DiskCacheMetrics& disk = metrics.prefix_cache.disk;
     return nlohmann::json{
         {"scheduler", nlohmann::json{{"running_requests", metrics.scheduler.running_requests},
                                      {"prefilling_requests", metrics.scheduler.prefilling_requests},
@@ -192,7 +207,13 @@ nlohmann::json metrics_to_json(const ninfer::MetricsSnapshot& metrics) {
                                          {"pinned_bytes", host.pinned_bytes},
                                          {"used_bytes", host.used_bytes},
                                          {"block_slab_count", host.block_slab_count},
-                                         {"snapshot_slab_count", host.snapshot_slab_count}}}}}};
+                                         {"snapshot_slab_count", host.snapshot_slab_count}}},
+                         {"disk",
+                          nlohmann::json{{"enabled", disk.enabled},
+                                         {"budget_bytes", disk.budget_bytes},
+                                         {"used_bytes", disk.used_bytes},
+                                         {"block_slab_count", disk.block_slab_count},
+                                         {"snapshot_slab_count", disk.snapshot_slab_count}}}}}};
 }
 
 } // namespace ninfer::serve

@@ -9,15 +9,23 @@
 // PrefixPageSink when the index drops its last copy.
 
 #include <ninfer/types.h>
+#include "runtime/prefix_cache/disk_slab_pool.h"
 #include "runtime/prefix_cache/host_slab_pool.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <span>
 #include <vector>
 
 namespace ninfer::prefix_cache {
+
+// M3 disk-tier index container (defined in prefix_store.h). Forward-declared so the index can
+// expose its state to the serializer without pulling the file-format header into every TU.
+struct PrefixStoreGeometry;
+struct PrefixStoreStats;
+struct PrefixStore;
 
 // One tree node / snapshot tail covers exactly one PagedKV page.
 inline constexpr std::int32_t kBlockTokens = 64;
@@ -59,11 +67,12 @@ enum class SnapshotKind : std::uint8_t {
     Boundary,       // explicit client breakpoint or structural boundary, shareable
 };
 
-// A node may own a device copy, a host copy, no copy, or a copy being filled in.
+// A node may own a device copy, a host copy, a disk copy, no copy, or a copy being filled in.
 enum class Residency : std::uint8_t {
     Absent,   // no copy exists anywhere
     Resident, // device-resident
     Host,     // host-resident (data in pinned host memory)
+    Disk,     // disk-resident (data in the disk slab file; not directly device-addressable)
     Filling,  // in-flight transfer (D2H or H2D)
 };
 
@@ -82,6 +91,12 @@ struct BlockNode {
     HostPageId host_page = kInvalidHostPage;
     Residency host_state = Residency::Absent;
 
+    // Disk tier (M3a): slot in the disk slab file holding this block's KV data. Populated when the
+    // host copy is spilled (evicted) and on load; dropped when the record is erased. Only the
+    // generation stored in the pool identifies the record currently occupying the slot.
+    DiskPageId disk_page = kInvalidDiskPage;
+    Residency disk_state = Residency::Absent;
+
     std::uint32_t active_refs          = 0; // active sequences whose table maps this node
     std::uint32_t restore_pins         = 0; // in-flight transfers reading/writing this node
     std::uint32_t live_snapshots_below = 0; // snapshots whose path includes this node
@@ -97,8 +112,11 @@ struct BlockNode {
     std::uint32_t generation = 1;
     bool live                = true;
 
-    // True when a host copy exists and can back the device copy (safe to demote on eviction).
-    [[nodiscard]] bool is_backed() const noexcept { return host_state == Residency::Host; }
+    // True when a host or disk copy exists and can back the device copy (safe to demote on
+    // eviction). A disk-backed node can be materialized back into a host slab on demand.
+    [[nodiscard]] bool is_backed() const noexcept {
+        return host_state == Residency::Host || disk_state == Residency::Disk;
+    }
 };
 
 struct Snapshot {
@@ -117,6 +135,10 @@ struct Snapshot {
     HostPageId host_page = kInvalidHostPage;
     Residency host_state = Residency::Absent;
 
+    // Disk tier (M3a): slot in the disk slab file holding this snapshot's state image.
+    DiskPageId disk_page = kInvalidDiskPage;
+    Residency disk_state = Residency::Absent;
+
     SnapshotKind kind = SnapshotKind::Tap;
     bool superseded   = false;
     std::uint64_t superseded_at = 0; // tick when superseded; orders slot reclamation
@@ -132,6 +154,9 @@ struct Snapshot {
 
     [[nodiscard]] bool device_resident() const noexcept {
         return device_state == Residency::Resident;
+    }
+    [[nodiscard]] bool is_backed() const noexcept {
+        return host_state == Residency::Host || disk_state == Residency::Disk;
     }
 };
 
@@ -187,6 +212,7 @@ struct SnapshotCandidate {
     std::uint32_t frontier = 0;
     bool device_resident   = false;
     bool host_resident     = false;
+    bool disk_resident     = false;
 };
 
 struct PrefixMatch {
@@ -200,6 +226,10 @@ struct PrefixMatch {
     // (every node has a device or host copy), or invalid.
     SnapshotId best_host = kInvalidSnapshot;
     std::uint32_t best_host_frontier = 0;
+    // Deepest candidate with F <= n-1 whose image and path are restorable from a device, host, or
+    // disk copy (a disk-only path must first be materialized into the host tier), or invalid.
+    SnapshotId best_disk = kInvalidSnapshot;
+    std::uint32_t best_disk_frontier = 0;
 
     // --- D1b: miss explanation, filled in the same walk (cheap: bounded per-snapshot work) ---
     // What happened to the block walk. Completed means every eligible block matched; the miss
@@ -266,6 +296,15 @@ public:
         return static_cast<std::uint32_t>(free_slots_.size());
     }
     [[nodiscard]] std::uint64_t tick() const noexcept { return tick_; }
+
+    // Raw slot capacities, for the disk-tier serializer's iteration (ids are 1-based; a slot is
+    // live iff node(id)/snapshot(id) returns non-null).
+    [[nodiscard]] std::size_t node_capacity() const noexcept { return nodes_.size(); }
+    [[nodiscard]] std::size_t snapshot_capacity() const noexcept { return snapshots_.size(); }
+
+    // Reset to the empty index (a fresh root). Used by the disk-tier loader when a container fails
+    // validation after a partial read. Host slabs are cleared by the caller through HostSlabPool.
+    void clear();
 
     // --- lookup ---
 
@@ -341,6 +380,27 @@ public:
     // commit_block or match that involves host residency.
     void set_host_pool(HostSlabPool* pool) noexcept { host_pool_ = pool; }
 
+    // Set the disk slab pool for M3a disk-resident spill/restore. Optional; when null or disabled
+    // the disk tier is inactive and host eviction simply drops the record as before.
+    void set_disk_pool(DiskSlabPool* pool) noexcept { disk_pool_ = pool; }
+    [[nodiscard]] DiskSlabPool* disk_pool() const noexcept { return disk_pool_; }
+
+    // --- M3a disk tier ---
+
+    // Ensure a disk copy of a node's host-resident KV data. Allocates a disk slot (evicting another
+    // per disk policy), writes the host slab's bytes, and marks disk_state=Disk. Returns true when
+    // the node is disk-resident on return (already was, or the spill succeeded). No-op (false) when
+    // the node has no host copy or the disk tier is inactive.
+    bool spill_node(NodeId id);
+    bool spill_snapshot(SnapshotId id);
+
+    // Ensure a host copy for a record that is currently disk-only (materialize disk -> host slab so
+    // the existing H2D path can restore it). Returns the host page, or kInvalidHostPage when the
+    // record has no disk copy, the disk read failed, or the host tier is unavailable. Records that
+    // are already host- or device-resident return their host page / kInvalidHostPage respectively.
+    [[nodiscard]] HostPageId materialize_node_host(NodeId id);
+    [[nodiscard]] HostPageId materialize_snapshot_host(SnapshotId id);
+
     // --- M2 async fill APIs ---
     //
     // Each begin_* reserves its destination, marks the record Filling, and pins it (and, for a
@@ -393,6 +453,7 @@ public:
     [[nodiscard]] std::uint32_t evictable_pages() const noexcept { return evictable_pages_; }
 
 private:
+    friend struct PrefixStore;
     BlockNode& node_mut(NodeId id) noexcept { return nodes_[id - 1U]; }
     [[nodiscard]] bool valid(NodeId id) const noexcept {
         return id != kInvalidNode && id <= nodes_.size() && nodes_[id - 1U].live;
@@ -425,9 +486,20 @@ private:
     // data anywhere and is unpinned, drop it (erase subtree / delete snapshot).
     void reconcile_host_eviction(HostPageId page) noexcept;
 
+    // The disk pool evicted `page` to make room. Clear the owner's disk reference (the slot is
+    // already freed by the pool, so it must NOT be released again) and, if the owner now holds no
+    // copy anywhere and is unpinned, drop it.
+    void reconcile_disk_eviction(DiskPageId page) noexcept;
+
+    // Spill a record's host slab into a disk slot before the host slab is cleared. Called from
+    // reconcile_host_eviction (while the host page still holds the data) and from the flush sweep.
+    void spill_node_from_host(NodeId id, HostPageId host_page) noexcept;
+    void spill_snapshot_from_host(SnapshotId id, HostPageId host_page) noexcept;
+
     PrefixIndexOptions options_;
     PrefixPageSink* sink_ = nullptr;
     HostSlabPool* host_pool_ = nullptr; // M2: pinned host memory for write-through/restore
+    DiskSlabPool* disk_pool_ = nullptr; // M3a: disk slab file for the lower tier
 
     std::vector<BlockNode> nodes_;
     std::vector<Snapshot> snapshots_; // index + 1 == SnapshotId

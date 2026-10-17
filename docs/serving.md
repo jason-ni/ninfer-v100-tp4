@@ -129,7 +129,8 @@ Groups:
   prefix-cache-`cached`, and `free` groups, plus `page_bytes` per group. `backend_kv` is zero when
   the backend has no second pool.
 - `prefix_cache` — device snapshot-slot `total`/`used`, the host tier's `pinned`/`used` bytes and
-  slab counts (`enabled` is 0 when the tier is off or its allocation failed), and the cumulative
+  slab counts, the bounded disk tier's `budget`/`used` bytes and slab counts (`enabled` is 0 when a
+  tier is off or its allocation failed), and the cumulative
   lifetime eviction counters of the demand-aware device tier: `devices_blocks_demoted_total`
   (lossless demotions), `subtree_erased_total`, `branch_gc_removed_blocks_total`,
   `snapshots_deleted_by_eviction_total`, and `retained_lane_evictions_total`.
@@ -595,6 +596,8 @@ curl http://127.0.0.1:8080/v1/models \
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--prefix-cache` | enable the hybrid content-addressed prefix cache (block-granular KV reuse plus GDN state snapshots; device tier, optionally backed by pinned host RAM) | off |
 | `--host-cache-mib N` | pinned host RAM for the prefix-cache pool; only used with `--prefix-cache`; `0` is device-only | `0` |
+| `--disk-cache-mib N` | bounded, crash-durable disk tier (MiB) below the host tier; requires `--host-cache-mib` and `--prefix-cache-file`; `0` disables it | `0` |
+| `--prefix-cache-file PATH` | disk-tier base path; the index is written to the resolved base (a directory resolves to `<dir>/prefix-cache.bin`) and KV bytes to its `.slabs` sibling; requires `--host-cache-mib` and `--disk-cache-mib` | unset |
 | `--prefix-debug` | log a multi-line per-request explanation of every prompt-token recompute (which reuse gate failed, where the block walk stalled, which snapshots existed on the matched path and why each was rejected); emitted on the request-done line plus the stderr detail block | off |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
@@ -641,7 +644,7 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | target/weights identity and artifact, resolved Engine including tensor-parallel width `tp` and the resolved per-rank `devices` list, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `prefix_admission` when the hybrid cache runs (walk cause/stall position, per-snapshot candidate fates, slot occupancy, reuse base), unrounded phase seconds, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `prefix_admission` when the hybrid cache runs (walk cause/stall position, per-snapshot candidate fates including device/host/disk restorability, slot occupancy, disk-tier occupancy and a `served_from_disk` marker, reuse base), unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
 

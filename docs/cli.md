@@ -164,6 +164,8 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--prefix-cache` | enable the hybrid content-addressed prefix cache (block-granular KV reuse plus GDN state snapshots; device tier, optionally host-backed) | off |
 | `--host-cache-mib N` | pinned host RAM for the prefix-cache pool; implies `--prefix-cache`; `0` keeps the cache device-only | `0` |
+| `--disk-cache-mib N` | bounded, crash-durable disk tier (MiB) below the host tier; requires `--host-cache-mib` and `--prefix-cache-file`; `0` disables it | `0` |
+| `--prefix-cache-file PATH` | disk-tier base path; the index is written to the resolved base (a directory resolves to `<dir>/prefix-cache.bin`) and KV bytes to its `.slabs` sibling; requires `--host-cache-mib` and `--disk-cache-mib` | unset |
 | `--prefix-debug` | log a multi-line per-request explanation of every prompt-token recompute when the hybrid cache is enabled (gate verdict, block-walk stall, candidate rejections) | off |
 | `--cuda-graph` / `--no-cuda-graph` | force CUDA Graph capture on/off | off at `--tp > 1`, on at `--tp 1` |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |

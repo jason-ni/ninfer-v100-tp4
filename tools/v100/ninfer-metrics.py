@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Pretty viewer for the ninfer-serve ``/metrics`` endpoint.
 
-Prints device VRAM, the two paged KV pools, the hybrid prefix cache (device snapshot slots and the
-pinned host tier), and the scheduler counters, with human-readable byte sizes and usage bars.
+Prints device VRAM, the two paged KV pools, the hybrid prefix cache (device snapshot slots, the
+pinned host tier, and the bounded disk tier), and the scheduler counters, with human-readable byte
+sizes and usage bars.
 
     ./tools/v100/ninfer-metrics.py                      # http://127.0.0.1:8080/metrics
     ./tools/v100/ninfer-metrics.py --port 8081
@@ -142,6 +143,20 @@ def render(metrics: dict, color: bool, rates: dict | None) -> str:
     emit(
         f"  host slabs         {count(host.get('block_slab_count', 0))} block, "
         f"{count(host.get('snapshot_slab_count', 0))} snapshot"
+    )
+    disk = pc.get("disk", {})
+    budget = disk.get("budget_bytes", 0)
+    dused = disk.get("used_bytes", 0)
+    disk_state = paint("active", GREEN, color) if disk.get("enabled") else paint("off", RED, color)
+    frac = dused / budget if budget else 0.0
+    emit(
+        f"  disk tier          {disk_state}   "
+        f"budget {human(budget):>9}   used {human(dused):>9} "
+        f"{bar(frac, 20, color)} {frac * 100:5.1f}%"
+    )
+    emit(
+        f"  disk slabs         {count(disk.get('block_slab_count', 0))} block, "
+        f"{count(disk.get('snapshot_slab_count', 0))} snapshot"
     )
 
     sched = metrics.get("scheduler", {})

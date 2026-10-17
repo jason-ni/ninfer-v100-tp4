@@ -43,6 +43,11 @@ ninfer::MetricsSnapshot sample() {
     m.prefix_cache.host.used_bytes                     = 7ULL << 30;
     m.prefix_cache.host.block_slab_count               = 10291;
     m.prefix_cache.host.snapshot_slab_count            = 38;
+    m.prefix_cache.disk.enabled                        = true;
+    m.prefix_cache.disk.budget_bytes                   = 64ULL << 30;
+    m.prefix_cache.disk.used_bytes                     = 3ULL << 30;
+    m.prefix_cache.disk.block_slab_count               = 43862;
+    m.prefix_cache.disk.snapshot_slab_count            = 89;
     return m;
 }
 
@@ -68,6 +73,11 @@ int test_prometheus() {
                       "host pinned bytes missing");
     failures += check(has("ninfer_prefix_cache_host_slabs{kind=\"block\"} 10291"),
                       "host block slab count missing");
+    failures += check(has("ninfer_prefix_cache_disk_bytes{kind=\"budget\"} " +
+                          std::to_string(64ULL << 30)),
+                      "disk budget bytes missing");
+    failures += check(has("ninfer_prefix_cache_disk_slabs{kind=\"snapshot\"} 89"),
+                      "disk snapshot slab count missing");
     failures += check(has("ninfer_requests{state=\"waiting\"} 3"), "waiting requests missing");
     failures += check(has("# TYPE ninfer_decode_rounds_total counter"),
                       "decode rounds counter missing");
@@ -92,6 +102,10 @@ int test_json() {
                       "json host pinned wrong");
     failures += check(parsed["prefix_cache"]["host"]["block_slab_count"] == 10291,
                       "json host slab count wrong");
+    failures += check(parsed["prefix_cache"]["disk"]["budget_bytes"] == (64ULL << 30),
+                      "json disk budget wrong");
+    failures += check(parsed["prefix_cache"]["disk"]["used_bytes"] == (3ULL << 30),
+                      "json disk used wrong");
     failures += check(parsed["scheduler"]["waiting_requests"] == 3,
                       "json scheduler waiting wrong");
     return failures;

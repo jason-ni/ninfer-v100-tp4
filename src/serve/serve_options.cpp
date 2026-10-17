@@ -201,7 +201,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|iq4nl] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
 "[--vision] [--cuda-graph|--no-cuda-graph] [--no-prefix-reuse] [--prefix-cache] "
-              "[--host-cache-mib N] [--prefix-debug] [--lm-head-draft] [--no-thinking] "
+              "[--host-cache-mib N] [--disk-cache-mib N] [--prefix-cache-file PATH] [--prefix-debug] [--lm-head-draft] [--no-thinking] "
                "[--preserve-thinking] "
             "[--chat-template-kwargs JSON] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -235,8 +235,13 @@ std::string serve_usage_text(const char* argv0) {
             "       --prefix-cache enables the hybrid content-addressed prefix cache, which reuses\n"
             "       KV blocks and state snapshots across requests sharing a prompt prefix, even when\n"
             "       earlier context was rewritten between turns. --host-cache-mib N adds a pinned\n"
-"       host-RAM tier (N MiB) so evicted blocks and snapshots survive device pressure;\n"
-             "       0 keeps the cache device-only.\n"
+            "       host-RAM tier (N MiB) so evicted blocks and snapshots survive device pressure;\n"
+             "       0 keeps the cache device-only. --disk-cache-mib N adds a bounded, crash-durable\n"
+             "       disk tier (N MiB) below the host tier: spilled host slabs are restored on\n"
+             "       admission and the tier has its own eviction budget. --prefix-cache-file PATH\n"
+             "       sets the disk-tier base path (load at start, write through at runtime); it\n"
+             "       requires --host-cache-mib and --disk-cache-mib and treats an existing directory\n"
+             "       path as <dir>/prefix-cache.bin plus <dir>/prefix-cache.slabs.\n"
              "       --prefix-debug prints a multi-line explanation on every request that recomputes\n"
              "       prompt tokens: which reuse gate failed (hybrid block walk, snapshot candidates,\n"
              "       retained sequence, speculative demote), with the token-position evidence.\n"
@@ -441,6 +446,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--host-cache-mib") {
             options.host_cache_mib = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--host-cache-mib"), "host-cache-mib"));
+        } else if (arg == "--disk-cache-mib") {
+            options.disk_cache_mib = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--disk-cache-mib"), "disk-cache-mib"));
+        } else if (arg == "--prefix-cache-file") {
+            options.prefix_cache_file = require_value("--prefix-cache-file");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
@@ -506,6 +516,22 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.devices = {options.device};
     }
     if (!cuda_graph_explicit) { options.use_cuda_graph = options.tp <= 1; }
+    if (!options.prefix_cache_file.empty() && options.host_cache_mib == 0) {
+        throw std::invalid_argument(
+            "--prefix-cache-file requires --host-cache-mib (the disk tier restores into the host "
+            "tier)");
+    }
+    if (!options.prefix_cache_file.empty() && options.disk_cache_mib == 0) {
+        throw std::invalid_argument(
+            "--prefix-cache-file requires --disk-cache-mib (the disk tier needs a size budget)");
+    }
+    if (options.disk_cache_mib > 0 && options.host_cache_mib == 0) {
+        throw std::invalid_argument(
+            "--disk-cache-mib requires --host-cache-mib (the disk tier restores into the host tier)");
+    }
+    if (options.disk_cache_mib > 0 && options.prefix_cache_file.empty()) {
+        throw std::invalid_argument("--disk-cache-mib requires --prefix-cache-file");
+    }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }

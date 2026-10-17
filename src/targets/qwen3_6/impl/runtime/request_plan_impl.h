@@ -217,6 +217,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         diag.snapshot_slots_used  =
             prefix_index->device_snapshot_slots() - prefix_index->device_snapshot_slots_free();
         diag.max_new_taps         = prefix_max_new_taps;
+        const ninfer::prefix_cache::DiskSlabPool* disk_pool = prefix_index->disk_pool();
+        if (disk_pool != nullptr && disk_pool->enabled()) {
+            diag.disk_tier_enabled      = true;
+            diag.disk_tier_used_bytes   = disk_pool->used_bytes();
+            diag.disk_tier_budget_bytes = disk_pool->total_bytes();
+        }
     }
 
     // Hybrid content-addressed admission: take the deepest usable snapshot on the matched block
@@ -240,10 +246,20 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         diag.candidates_shown   = static_cast<std::uint32_t>(shown);
         ninfer::prefix_cache::SnapshotId chosen = match.best_device;
         std::uint32_t chosen_frontier           = match.best_device_frontier;
+        bool served_from_disk                   = false;
         if (match.best_host != ninfer::prefix_cache::kInvalidSnapshot &&
             match.best_host_frontier > chosen_frontier) {
             chosen          = match.best_host;
             chosen_frontier = match.best_host_frontier;
+            served_from_disk = false;
+        }
+        // Disk-restorable is the last resort: a strict frontier gain over device/host is worth the
+        // disk -> host -> device restore, but never displaces an equally deep in-memory hit.
+        if (match.best_disk != ninfer::prefix_cache::kInvalidSnapshot &&
+            match.best_disk_frontier > chosen_frontier) {
+            chosen          = match.best_disk;
+            chosen_frontier = match.best_disk_frontier;
+            served_from_disk = true;
         }
         if (chosen == ninfer::prefix_cache::kInvalidSnapshot) { return false; }
         const ninfer::prefix_cache::Snapshot* snap = prefix_index->snapshot(chosen);
@@ -261,6 +277,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             return false;
         }
         diag.selection_veto = PrefixSelectionVeto::None;
+        diag.served_from_disk   = served_from_disk;
         plan->reuse             = ReusePath::BlockSnapshot;
         plan->reuse_base        = snap->frontier;
         plan->reuse_reason      = PrefixReuseReason::ReusedBlockSnapshot;

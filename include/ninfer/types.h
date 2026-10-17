@@ -103,6 +103,17 @@ struct PrefixCacheOptions {
     std::uint32_t min_gap        = 0;
     // Pinned host RAM for the prefix pool in MiB. Zero = device-only (M1).
     std::uint32_t host_cache_mib = 0;
+    // M3a disk tier: bounded disk budget in MiB for the lower cache tier. Requires the host tier
+    // (`host_cache_mib > 0`) and a `file` path. Zero disables the disk tier. Spilled host slabs are
+    // written to a fixed-slot slab file alongside the index at runtime and restored into the host
+    // tier on admission; the budget bounds the slab file and is evicted per dead -> superseded ->
+    // GDSF policy.
+    std::uint32_t disk_cache_mib = 0;
+    // M3a disk tier: base path for persistence. Empty = disabled. A path that names an existing
+    // directory resolves the index to `<dir>/prefix-cache.bin` and the slab file to
+    // `<dir>/prefix-cache.slabs`; any other path is used verbatim for the index with its extension
+    // replaced by `.slabs` for the slab file.
+    std::filesystem::path file;
 };
 
 struct LoadProgress {
@@ -511,6 +522,9 @@ struct PrefixDiagCandidate {
     std::uint8_t  kind            = 0; // SnapshotKind code; opaque to consumers
     bool          device_resident = false;
     bool          host_restorable = false;
+    // Restorable using the device, host, or disk tier (a superset of host_restorable); false only
+    // when some node on the path has no copy in any tier.
+    bool          disk_restorable = false;
     std::uint8_t  reject          = 0; // 1 superseded/gone, 2 frontier past prompt, 3 tail mismatch,
                                        // 4 no usable storage on the path, 5 outranked by the best
 };
@@ -536,6 +550,14 @@ struct PrefixAdmissionDiagnostics {
     std::uint32_t snapshot_slots_total   = 0;
     std::uint32_t snapshot_slots_used    = 0;
     std::uint32_t max_new_taps           = 0;
+
+    // M3a bounded disk tier. Occupancy is the tier's used/budget bytes when the request was planned;
+    // `served_from_disk` is set when the consumed snapshot had to be materialized out of the disk
+    // tier (device/host had no copy of some path node), i.e. the disk tier actually served this turn.
+    bool          disk_tier_enabled      = false;
+    std::uint64_t disk_tier_used_bytes   = 0;
+    std::uint64_t disk_tier_budget_bytes = 0;
+    bool          served_from_disk       = false;
 
     // Hybrid match section; zero when PrefixStallCause::NotRun.
     PrefixStallCause walk_cause          = PrefixStallCause::NotRun;
@@ -685,6 +707,17 @@ struct HostCacheMetrics {
     std::uint32_t snapshot_slab_count = 0;
 };
 
+// Bounded disk KV tier (M3a). `budget_bytes` is the configured slab-file size (`--disk-cache-mib`);
+// `used_bytes` of it holds live block and snapshot slots. `enabled` is false when the tier is off or
+// its slab file could not be opened.
+struct DiskCacheMetrics {
+    bool enabled                      = false;
+    std::uint64_t budget_bytes        = 0;
+    std::uint64_t used_bytes          = 0;
+    std::uint32_t block_slab_count    = 0;
+    std::uint32_t snapshot_slab_count = 0;
+};
+
 // Hybrid prefix cache residency. Device snapshot slots are the on-device state images; the host
 // tier carries demoted blocks and state images. The cumulative counters record lifetime eviction
 // behavior on rank 0 so "the pool had room" stops being the only explanation available.
@@ -693,6 +726,7 @@ struct PrefixCacheMetrics {
     std::uint32_t device_snapshot_slots      = 0;
     std::uint32_t device_snapshot_slots_used = 0;
     HostCacheMetrics host;
+    DiskCacheMetrics disk;
     // Cumulative, process-lifetime, rank 0.
     std::uint64_t device_blocks_demoted_total   = 0; // lossless device -> host demotions
     std::uint64_t subtree_erased_total          = 0; // lossy subtree erasures (devices w/o host copy)

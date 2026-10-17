@@ -49,13 +49,16 @@ concurrent_executor.h:510/531) → `serve::GenerationMetrics::prefix_admission`
 - **Console done line** (`request_log.cpp`): an extra `px=...` compact segment appended whenever
   `reuse_base < prompt_tokens` (any recompute). Zero added noise on full-hit requests. Segments:
   walk outcome, stall details, candidate summary, selection veto, retained/frontier state,
-  MTP-gate shortfall, slot usage. Token windows stay out of the compact line.
+  MTP-gate shortfall, slot usage, and the disk tier's occupancy plus a `from=disk` marker when the
+  consumed snapshot was materialized out of the disk tier. Token windows stay out of the compact line.
 - **Verbose explanation**: new serve flag `--prefix-debug` (no env fallback). On every request_done,
   when recompute > 0, a multi-line English block prints the gate-by-gate verdict with values and a
   final "why this request prefilled X tokens" conclusion including the divergence window and the
   snapshot inventory. One block per request, keyed by req id.
 - **JSONL** (`request_done` events): structured `result.prefix_admission {…}` object mirroring the
-  struct, so machine analysis does not rely on parsing the compact line.
+  struct, so machine analysis does not rely on parsing the compact line. Per-candidate fates carry
+  `device_resident`/`host_restorable`/`disk_restorable`, and the object carries a `disk_tier`
+  occupancy block with `served_from_disk`.
 
 Eviction visibility rides in too: the counters below make "did pressure kill my chain" readable
 without guessing.

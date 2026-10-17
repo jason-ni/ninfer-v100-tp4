@@ -4,11 +4,13 @@
 
 #include "runtime/prefix_cache/host_slab_pool.h"
 #include "runtime/prefix_cache/prefix_index.h"
+#include "runtime/prefix_cache/prefix_store.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <string>
 #include <vector>
 
 namespace pc = ninfer::prefix_cache;
@@ -85,6 +87,48 @@ void write_snapshot_to_host(pc::PrefixIndex& index, pc::SnapshotId id) {
     const auto target = index.begin_snapshot_write(id);
     (void)target;
     index.finish_snapshot_write(id, true);
+}
+
+// Fill a record's host slab with a byte pattern so a round-trip can compare payload bytes, then
+// finalize the write-through.
+void write_block_pattern(pc::PrefixIndex& index, pc::HostSlabPool& pool, pc::NodeId node,
+                         unsigned char pattern) {
+    const auto target = index.begin_host_write(node);
+    if (target.page != pc::kInvalidHostPage) {
+        std::memset(pool.data(target.page), pattern, pool.bytes(target.page));
+    }
+    index.finish_host_write(node, true);
+}
+
+void write_snapshot_pattern(pc::PrefixIndex& index, pc::HostSlabPool& pool, pc::SnapshotId id,
+                            unsigned char pattern) {
+    const auto target = index.begin_snapshot_write(id);
+    if (target.page != pc::kInvalidHostPage) {
+        std::memset(pool.data(target.page), pattern, pool.bytes(target.page));
+    }
+    index.finish_snapshot_write(id, true);
+}
+
+bool files_equal(const std::string& x, const std::string& y) {
+    std::FILE* fx = std::fopen(x.c_str(), "rb");
+    std::FILE* fy = std::fopen(y.c_str(), "rb");
+    if (fx == nullptr || fy == nullptr) {
+        if (fx != nullptr) { std::fclose(fx); }
+        if (fy != nullptr) { std::fclose(fy); }
+        return false;
+    }
+    bool equal = true;
+    for (;;) {
+        unsigned char bx[4096];
+        unsigned char by[4096];
+        const std::size_t nx = std::fread(bx, 1, sizeof(bx), fx);
+        const std::size_t ny = std::fread(by, 1, sizeof(by), fy);
+        if (nx != ny || std::memcmp(bx, by, nx) != 0) { equal = false; break; }
+        if (nx == 0) { break; }
+    }
+    std::fclose(fx);
+    std::fclose(fy);
+    return equal;
 }
 
 // --- HostSlabPool tests ---
@@ -550,6 +594,411 @@ int test_dead_kv_and_supersede_marking() {
     return failures;
 }
 
+// --- M3a disk-tier tests ---
+
+constexpr std::size_t kDiskBlockBytes    = 512 * 1024;
+constexpr std::size_t kDiskSnapshotBytes = 128 * 1024;
+
+pc::DiskSlabPool make_test_disk_pool(const std::string& file) {
+    return pc::DiskSlabPool({.total_bytes = 4 * 1024 * 1024,
+                             .block_slab_bytes = kDiskBlockBytes,
+                             .snapshot_slab_bytes = kDiskSnapshotBytes,
+                             .block_slab_count = 4,
+                             .snapshot_slab_count = 2,
+                             .file = file});
+}
+
+pc::PrefixStoreGeometry disk_geometry(const pc::DiskSlabPool& pool) {
+    pc::PrefixStoreGeometry g;
+    g.tp                   = 1;
+    g.device_snapshot_slots = 2;
+    g.block_rank_bytes     = pool.block_slab_bytes();
+    g.snapshot_rank_bytes  = pool.snapshot_slab_bytes();
+    g.block_slab_bytes     = pool.block_slab_bytes();
+    g.snapshot_slab_bytes  = pool.snapshot_slab_bytes();
+    g.block_slab_count     = static_cast<std::uint32_t>(pool.block_slab_count());
+    g.snapshot_slab_count  = static_cast<std::uint32_t>(pool.snapshot_slab_count());
+    g.disk_file_uid        = pool.file_uid();
+    return g;
+}
+
+std::vector<unsigned char> read_bytes(const void* data, std::size_t bytes) {
+    return std::vector<unsigned char>(static_cast<const unsigned char*>(data),
+                                      static_cast<const unsigned char*>(data) + bytes);
+}
+
+int test_disk_pool_basic() {
+    int failures = 0;
+    const std::string file = "disk-pool-basic.slabs";
+    std::remove(file.c_str());
+    {
+        pc::DiskSlabPool pool = make_test_disk_pool(file);
+        failures += check(pool.enabled(), "disk pool did not open");
+        failures += check(pool.block_slab_count() == 4 && pool.snapshot_slab_count() == 2,
+                          "disk pool geometry differs");
+        const std::size_t capacity = 4 * kDiskBlockBytes + 2 * kDiskSnapshotBytes;
+        failures += check(pool.free_bytes() == capacity, "fresh pool is not fully free");
+
+        const pc::DiskSlotAllocation b0 = pool.allocate_block();
+        failures += check(b0.page == 0 && b0.evicted == pc::kInvalidDiskPage,
+                          "first block slot is not 0");
+        std::vector<unsigned char> pattern(kDiskBlockBytes, 0x9E);
+        failures += check(pool.write_slot(b0.page, pattern.data()), "write_slot failed");
+        failures += check(pool.validate_slot(b0.page, pool.generation(b0.page)),
+                          "validate_slot rejects a freshly written slot");
+        failures += check(!pool.validate_slot(b0.page, pool.generation(b0.page) + 1U),
+                          "validate_slot accepts a wrong generation");
+
+        std::vector<unsigned char> got(kDiskBlockBytes, 0);
+        failures += check(pool.read_slot(b0.page, pool.generation(b0.page), got.data()),
+                          "read_slot failed");
+        failures += check(got == pattern, "disk payload differs after round trip");
+
+        const std::uint64_t uid = pool.file_uid();
+        failures += check(uid != 0, "disk pool has no uid");
+        pool.release(b0.page);
+        failures += check(pool.free_bytes() == capacity, "release did not free the slot");
+    }
+    {
+        // Reopening the same file preserves the identity of the slab file.
+        pc::DiskSlabPool pool = make_test_disk_pool(file);
+        failures += check(pool.enabled() && pool.file_uid() != 0, "reopened pool lost its uid");
+        const std::uint64_t uid = pool.file_uid();
+        (void)uid;
+    }
+    {
+        // A different geometry reinitializes the file and yields a fresh uid.
+        pc::DiskSlabPool pool({.total_bytes = 4 * 1024 * 1024,
+                               .block_slab_bytes = kDiskBlockBytes,
+                               .snapshot_slab_bytes = kDiskSnapshotBytes,
+                               .block_slab_count = 8,
+                               .snapshot_slab_count = 2,
+                               .file = file});
+        failures += check(pool.enabled() && pool.block_slab_count() == 8,
+                          "reinitialized pool did not adopt the new geometry");
+    }
+    std::remove(file.c_str());
+    return failures;
+}
+
+int test_disk_pool_eviction_order() {
+    int failures = 0;
+    const std::string file = "disk-pool-evict.slabs";
+    std::remove(file.c_str());
+    pc::DiskSlabPool pool = make_test_disk_pool(file);
+    failures += check(pool.enabled(), "disk pool did not open");
+
+    pc::DiskPageId pages[4] = {pc::kInvalidDiskPage, pc::kInvalidDiskPage, pc::kInvalidDiskPage,
+                               pc::kInvalidDiskPage};
+    for (int i = 0; i < 4; ++i) { pages[i] = pool.allocate_block().page; }
+    failures += check(pages[0] == 0 && pages[3] == 3, "block slots are not allocated in order");
+
+    // Mark slot 2 dead; the next allocation must reclaim it first even though slot 0 is colder.
+    pool.mark_dead(2);
+    const pc::DiskSlotAllocation dead_evict = pool.allocate_block();
+    failures += check(dead_evict.page == 2 && dead_evict.evicted == 2,
+                      "dead slot was not the eviction victim");
+
+    // With no dead slot, a superseded slot is evicted before a live one.
+    pool.supersede(1);
+    const pc::DiskSlotAllocation sup_evict = pool.allocate_block();
+    failures += check(sup_evict.page == 1 && sup_evict.evicted == 1,
+                      "superseded slot was not the eviction victim");
+
+    // With neither, GDSF picks the coldest live slot.
+    const pc::DiskSlotAllocation gdsf_evict = pool.allocate_block();
+    failures += check(gdsf_evict.page == 0 && gdsf_evict.evicted == 0,
+                      "GDSF did not pick the coldest live slot");
+
+    // A pinned slot is never chosen as a victim, even when it is the only dead one.
+    for (pc::DiskPageId page : {0, 1, 2, 3}) { pool.release(page); }
+    const pc::DiskPageId p0 = pool.allocate_block().page;
+    const pc::DiskPageId p1 = pool.allocate_block().page;
+    (void)pool.allocate_block();
+    (void)pool.allocate_block();
+    pool.mark_dead(p0);
+    pool.pin(p0);
+    const pc::DiskSlotAllocation no_pin_evict = pool.allocate_block();
+    failures += check(no_pin_evict.page != p0 && no_pin_evict.evicted != p0,
+                      "a pinned dead slot was chosen as the victim");
+    pool.unpin(p0);
+    const pc::DiskSlotAllocation pinned_then = pool.allocate_block();
+    failures += check(pinned_then.page == p0, "unpinned dead slot is not the next victim");
+    (void)p1;
+
+    std::remove(file.c_str());
+    return failures;
+}
+
+int test_disk_store_roundtrip() {
+    int failures = 0;
+    const std::string idx   = "prefix-store-roundtrip.bin";
+    const std::string idx2  = "prefix-store-roundtrip2.bin";
+    const std::string slabs = "prefix-store-roundtrip.slabs";
+    std::remove(idx.c_str());
+    std::remove(idx2.c_str());
+    std::remove(slabs.c_str());
+
+    std::vector<unsigned char> expected_a;
+    std::vector<unsigned char> expected_b;
+    std::vector<unsigned char> expected_s;
+    pc::NodeId a = pc::kInvalidNode;
+    pc::NodeId b = pc::kInvalidNode;
+    pc::SnapshotId snap = pc::kInvalidSnapshot;
+    pc::PrefixStoreGeometry geometry;
+
+    {
+        TestSink sink;
+        pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
+        pc::HostSlabPool host = make_test_pool();
+        pc::DiskSlabPool disk = make_test_disk_pool(slabs);
+        index.set_host_pool(&host);
+        index.set_disk_pool(&disk);
+        failures += check(disk.enabled(), "disk pool did not open");
+
+        a = commit_block(index, index.root(), 1, 100);
+        b = commit_block(index, a, 2, 101);
+        failures += check(a != pc::kInvalidNode && b != pc::kInvalidNode, "block commits failed");
+        write_block_pattern(index, host, a, 0xA5);
+        write_block_pattern(index, host, b, 0x5A);
+        snap = add_tap(index, b, 128, 10);
+        failures += check(snap != pc::kInvalidSnapshot, "snapshot admission failed");
+        write_snapshot_pattern(index, host, snap, 0xC3);
+
+        const pc::BlockNode* na = index.node(a);
+        const pc::BlockNode* nb = index.node(b);
+        failures += check(na != nullptr && nb != nullptr, "committed nodes are missing");
+        if (na != nullptr && nb != nullptr) {
+            expected_a = read_bytes(host.data(na->host_page), host.bytes(na->host_page));
+            expected_b = read_bytes(host.data(nb->host_page), host.bytes(nb->host_page));
+        }
+        const pc::Snapshot* ns = index.snapshot(snap);
+        if (ns != nullptr) {
+            expected_s = read_bytes(host.data(ns->host_page), host.bytes(ns->host_page));
+        }
+
+        failures += check(index.spill_node(a), "spill a failed");
+        failures += check(index.spill_node(b), "spill b failed");
+        failures += check(index.spill_snapshot(snap), "spill snapshot failed");
+        failures += check(na->disk_state == pc::Residency::Disk && na->host_state == pc::Residency::Host,
+                          "spill a should keep the host copy and gain a disk copy");
+        failures += check(index.snapshot(snap)->disk_state == pc::Residency::Disk,
+                          "snapshot did not gain a disk copy");
+
+        geometry = disk_geometry(disk);
+        failures += check(pc::save_prefix_store(idx, index, disk, geometry), "save failed");
+        failures += check(pc::save_prefix_store(idx2, index, disk, geometry), "second save failed");
+        failures += check(files_equal(idx, idx2), "container bytes are not deterministic");
+    }
+
+    {
+        pc::DiskSlabPool disk = make_test_disk_pool(slabs);
+        failures += check(disk.file_uid() == geometry.disk_file_uid,
+                          "reopened slab file lost its uid");
+        TestSink sink2;
+        pc::PrefixIndex loaded(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink2);
+        pc::HostSlabPool host2 = make_test_pool();
+        loaded.set_host_pool(&host2);
+        loaded.set_disk_pool(&disk);
+        pc::PrefixStoreStats stats;
+        failures += check(pc::load_prefix_store(idx, loaded, disk, geometry, &stats), "load failed");
+        failures += check(loaded.live_node_count() == 3 && loaded.live_snapshot_count() == 1,
+                          "loaded counts differ from the saved index");
+        failures += check(stats.nodes == 3 && stats.snapshots == 1,
+                          "load stats do not match the restored cache");
+
+        const pc::BlockNode* la = loaded.node(a);
+        const pc::BlockNode* lb = loaded.node(b);
+        failures += check(la != nullptr && la->disk_state == pc::Residency::Disk &&
+                              la->host_state == pc::Residency::Absent &&
+                              la->device_state == pc::Residency::Absent,
+                          "restored block a is not disk-only");
+        failures += check(lb != nullptr && lb->disk_state == pc::Residency::Disk,
+                          "restored block b is not disk-resident");
+        if (la != nullptr) {
+            std::vector<unsigned char> got(kDiskBlockBytes, 0);
+            failures += check(disk.read_slot(la->disk_page, disk.generation(la->disk_page),
+                                             got.data()),
+                              "restored block a slot is unreadable");
+            failures += check(got == expected_a, "restored block a payload differs");
+        }
+        if (lb != nullptr) {
+            std::vector<unsigned char> got(kDiskBlockBytes, 0);
+            failures += check(disk.read_slot(lb->disk_page, disk.generation(lb->disk_page),
+                                             got.data()),
+                              "restored block b slot is unreadable");
+            failures += check(got == expected_b, "restored block b payload differs");
+        }
+        const pc::Snapshot* ls = loaded.snapshot(snap);
+        failures += check(ls != nullptr && ls->disk_state == pc::Residency::Disk &&
+                              ls->frontier == 128,
+                          "restored snapshot metadata differs");
+        if (ls != nullptr) {
+            std::vector<unsigned char> got(kDiskSnapshotBytes, 0);
+            failures += check(disk.read_slot(ls->disk_page, disk.generation(ls->disk_page),
+                                             got.data()),
+                              "restored snapshot slot is unreadable");
+            failures += check(got == expected_s, "restored snapshot payload differs");
+        }
+
+        // Materializing a disk-only record must reproduce the host payload exactly.
+        const pc::HostPageId restored_a = loaded.materialize_node_host(a);
+        failures += check(restored_a != pc::kInvalidHostPage, "materialize a failed");
+        if (restored_a != pc::kInvalidHostPage) {
+            failures += check(host2.data(restored_a) != nullptr &&
+                                  read_bytes(host2.data(restored_a), host2.bytes(restored_a)) ==
+                                      expected_a,
+                              "materialized block a payload differs");
+        }
+        const pc::HostPageId restored_s = loaded.materialize_snapshot_host(snap);
+        failures += check(restored_s != pc::kInvalidHostPage, "materialize snapshot failed");
+
+        // A re-save of the restored cache must be byte-identical to the original container.
+        failures += check(pc::save_prefix_store(idx2, loaded, disk, geometry), "re-save failed");
+        failures += check(files_equal(idx, idx2), "round-trip container bytes differ");
+    }
+
+    std::remove(idx.c_str());
+    std::remove(idx2.c_str());
+    std::remove(slabs.c_str());
+    return failures;
+}
+
+int test_disk_store_rejects() {
+    int failures = 0;
+    const std::string idx   = "prefix-store-reject.bin";
+    const std::string slabs = "prefix-store-reject.slabs";
+    std::remove(idx.c_str());
+    std::remove(slabs.c_str());
+
+    pc::PrefixStoreGeometry geometry;
+    {
+        TestSink sink;
+        pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
+        pc::HostSlabPool host = make_test_pool();
+        pc::DiskSlabPool disk = make_test_disk_pool(slabs);
+        index.set_host_pool(&host);
+        index.set_disk_pool(&disk);
+        geometry = disk_geometry(disk);
+
+        // A missing index is a clean miss, not an error state.
+        pc::PrefixStoreStats stats;
+        failures += check(
+            !pc::load_prefix_store("prefix-store-absent.bin", index, disk, geometry, &stats),
+            "load of a missing index should fail");
+        failures += check(index.live_snapshot_count() == 0, "failed load left a non-empty index");
+
+        const pc::NodeId node = commit_block(index, index.root(), 1, 100);
+        failures += check(node != pc::kInvalidNode, "block commit failed");
+        write_block_pattern(index, host, node, 0x11);
+        failures += check(index.spill_node(node), "spill failed");
+        failures += check(pc::save_prefix_store(idx, index, disk, geometry), "save failed");
+    }
+
+    // A geometry mismatch must be rejected whole.
+    {
+        pc::DiskSlabPool disk = make_test_disk_pool(slabs);
+        TestSink sink;
+        pc::PrefixIndex loaded(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
+        pc::HostSlabPool host = make_test_pool();
+        loaded.set_host_pool(&host);
+        pc::PrefixStoreGeometry wrong = geometry;
+        wrong.tp = 2;
+        pc::PrefixStoreStats stats;
+        failures += check(!pc::load_prefix_store(idx, loaded, disk, wrong, &stats),
+                          "geometry mismatch should be rejected");
+        failures += check(loaded.live_node_count() == 1 && loaded.live_snapshot_count() == 0,
+                          "rejected load left a non-empty index");
+    }
+
+    // A slab file reinitialized with a different geometry has a different uid and is rejected.
+    {
+        std::remove(slabs.c_str());
+        pc::DiskSlabPool disk({.total_bytes = 8 * 1024 * 1024,
+                               .block_slab_bytes = kDiskBlockBytes,
+                               .snapshot_slab_bytes = kDiskSnapshotBytes,
+                               .block_slab_count = 8,
+                               .snapshot_slab_count = 2,
+                               .file = slabs});
+        failures += check(disk.file_uid() != geometry.disk_file_uid, "uid did not change");
+        TestSink sink;
+        pc::PrefixIndex loaded(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
+        pc::HostSlabPool host = make_test_pool();
+        loaded.set_host_pool(&host);
+        pc::PrefixStoreStats stats;
+        failures += check(!pc::load_prefix_store(idx, loaded, disk, geometry, &stats),
+                          "uid/geometry mismatch should be rejected");
+    }
+
+    std::remove(idx.c_str());
+    std::remove(slabs.c_str());
+    return failures;
+}
+
+int test_disk_store_crash_gap() {
+    int failures = 0;
+    const std::string idx   = "prefix-store-crash.bin";
+    const std::string slabs = "prefix-store-crash.slabs";
+    std::remove(idx.c_str());
+    std::remove(slabs.c_str());
+
+    pc::PrefixStoreGeometry geometry;
+    pc::NodeId a = pc::kInvalidNode;
+    {
+        TestSink sink;
+        pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
+        pc::HostSlabPool host = make_test_pool();
+        pc::DiskSlabPool disk = make_test_disk_pool(slabs);
+        index.set_host_pool(&host);
+        index.set_disk_pool(&disk);
+        geometry = disk_geometry(disk);
+
+        a = commit_block(index, index.root(), 1, 100);
+        write_block_pattern(index, host, a, 0x7E);
+        failures += check(index.spill_node(a), "spill failed");
+        failures += check(pc::save_prefix_store(idx, index, disk, geometry), "save failed");
+
+        // Simulate a later runtime spill reusing node a's slot and bumping its generation, with a
+        // crash before the next index rewrite: the on-disk slot no longer matches the record.
+        const pc::DiskPageId slot = index.node(a)->disk_page;
+        const std::uint32_t saved_generation = disk.generation(slot);
+        const pc::DiskPageId p1 = disk.allocate_block().page;
+        const pc::DiskPageId p2 = disk.allocate_block().page;
+        const pc::DiskPageId p3 = disk.allocate_block().page;
+        (void)p1;
+        (void)p2;
+        (void)p3;
+        const pc::DiskSlotAllocation reuse = disk.allocate_block();
+        failures += check(reuse.page == slot && reuse.evicted == slot,
+                          "runtime spill did not reuse node a's slot");
+        failures += check(disk.generation(slot) != saved_generation,
+                          "reused slot did not advance its generation");
+        std::vector<unsigned char> junk(kDiskBlockBytes, 0x3C);
+        failures += check(disk.write_slot(slot, junk.data()), "overwrite of reused slot failed");
+    }
+
+    {
+        // The index still names the old generation, so the loader drops the stale record.
+        pc::DiskSlabPool disk = make_test_disk_pool(slabs);
+        TestSink sink;
+        pc::PrefixIndex loaded(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
+        pc::HostSlabPool host = make_test_pool();
+        loaded.set_host_pool(&host);
+        loaded.set_disk_pool(&disk);
+        pc::PrefixStoreStats stats;
+        failures += check(pc::load_prefix_store(idx, loaded, disk, geometry, &stats),
+                          "load should still succeed on a stale slot");
+        failures += check(loaded.live_node_count() == 1,
+                          "the stale-generation record was not dropped");
+        failures += check(loaded.node(a) == nullptr || !loaded.node(a)->live,
+                          "the stale block survived the load");
+    }
+
+    std::remove(idx.c_str());
+    std::remove(slabs.c_str());
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -564,6 +1013,11 @@ int main() {
     failures += test_slot_demote_host_backed();
     failures += test_snapshot_restore_roundtrip();
     failures += test_best_host_admission();
+    failures += test_disk_pool_basic();
+    failures += test_disk_pool_eviction_order();
+    failures += test_disk_store_roundtrip();
+    failures += test_disk_store_rejects();
+    failures += test_disk_store_crash_gap();
     if (failures == 0) {
         std::printf("All host-tier unit tests passed.\n");
         return 0;

@@ -399,6 +399,17 @@ std::string speculative_str(const GenerationMetrics& metrics) {
     }
     return out.str();
 }
+
+std::string prefix_disk_str(const ninfer::PrefixAdmissionDiagnostics& diag) {
+    if (!diag.disk_tier_enabled) { return {}; }
+    std::ostringstream out;
+    out << " disk=" << std::fixed << std::setprecision(2)
+        << static_cast<double>(diag.disk_tier_used_bytes) / 1073741824.0 << '/'
+        << std::setprecision(1)
+        << static_cast<double>(diag.disk_tier_budget_bytes) / 1073741824.0 << "GiB";
+    if (diag.served_from_disk) { out << " from=disk"; }
+    return out.str();
+}
 } // namespace
 
 std::string format_prefix_admission_compact(const ninfer::PrefixAdmissionDiagnostics& diag,
@@ -515,6 +526,7 @@ v << "\n  [inputs] prompt=" << diag.prompt_tokens << " eligible_blocks=" << diag
           << c.frontier + 1U << ") kind=" << snapshot_kind_name(c.kind);
         v << (c.device_resident ? " device=yes" : " device=no");
         v << (c.host_restorable ? " host=yes" : " host=no");
+        v << (c.disk_restorable ? " disk=yes" : " disk=no");
         v << " -> " << candidate_reject_code_name(c.reject);
     }
     if (diag.candidates_total > diag.candidates_shown) {
@@ -649,6 +661,7 @@ std::string format_request_done(const RequestLogContext& context,
         << prefix_divergence_str(metrics.prefix_divergence)
         << format_prefix_admission_compact(metrics.prefix_admission, metrics.prefix_reuse_path,
                                            metrics.prefix_reuse_reason)
+        << prefix_disk_str(metrics.prefix_admission)
         << " ttft=" << std::fixed
         << std::setprecision(0) << ttft_ms << "ms"
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
@@ -857,6 +870,7 @@ record["result"]["prefix_divergence"] =
                 {"kind", snapshot_kind_name(c.kind)},
                 {"device_resident", c.device_resident},
                 {"host_restorable", c.host_restorable},
+                {"disk_restorable", c.disk_restorable},
                 {"reject", candidate_reject_code_name(c.reject)},
             });
         }
@@ -875,6 +889,10 @@ record["result"]["prefix_divergence"] =
             {"snapshot_slots", Json{{"used", admission.snapshot_slots_used},
                                     {"total", admission.snapshot_slots_total},
                                     {"max_new_taps_per_request", admission.max_new_taps}}},
+            {"disk_tier", Json{{"enabled", admission.disk_tier_enabled},
+                               {"used_bytes", admission.disk_tier_used_bytes},
+                               {"budget_bytes", admission.disk_tier_budget_bytes},
+                               {"served_from_disk", admission.served_from_disk}}},
             {"walk",
              Json{{"cause", stall_cause_name(admission.walk_cause)},
                   {"matched_blocks", admission.matched_blocks},

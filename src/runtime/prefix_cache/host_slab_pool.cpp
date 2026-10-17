@@ -220,6 +220,29 @@ void HostSlabPool::release(HostPageId page) noexcept {
     reset_slab(*slab);
 }
 
+void HostSlabPool::occupy_loaded(HostPageId page, bool dead, bool superseded, std::uint64_t freq,
+                                 std::uint64_t last_hit_tick) noexcept {
+    HostSlab* slab = slab_mut(page);
+    if (slab == nullptr) {
+        return;
+    }
+    slab->occupied = true;
+    slab->pinned   = false;
+    slab->dead     = dead;
+    slab->dead_at  = dead ? ++tick_ : 0;
+    slab->superseded    = superseded;
+    slab->superseded_at = superseded ? ++tick_ : 0;
+    slab->freq          = freq;
+    slab->last_hit_tick = last_hit_tick;
+    if (last_hit_tick > tick_) { tick_ = last_hit_tick; }
+}
+
+void HostSlabPool::clear() noexcept {
+    for (HostSlab& slab : block_slabs_) { reset_slab(slab); }
+    for (HostSlab& slab : snapshot_slabs_) { reset_slab(slab); }
+    tick_ = 0;
+}
+
 void* HostSlabPool::data(HostPageId page) const noexcept {
     const HostSlab* s = slab(page);
     if (s == nullptr) {

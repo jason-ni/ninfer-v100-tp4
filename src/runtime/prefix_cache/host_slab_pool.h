@@ -91,6 +91,14 @@ public:
     // Release a slab back to the free list. Resets all eviction metadata.
     void release(HostPageId page) noexcept;
 
+    // Load-time (M3 disk tier): mark a specific free slab occupied with pre-existing data (already
+    // written into data(page)) and restore its eviction metadata. `page` must currently be free.
+    void occupy_loaded(HostPageId page, bool dead, bool superseded, std::uint64_t freq,
+                       std::uint64_t last_hit_tick) noexcept;
+
+    // Load-time: return every slab to the free state.
+    void clear() noexcept;
+
     // Raw pointer and size of a slab's data (for D2H/H2D transfers).
     [[nodiscard]] void* data(HostPageId page) const noexcept;
     [[nodiscard]] std::size_t bytes(HostPageId page) const noexcept;

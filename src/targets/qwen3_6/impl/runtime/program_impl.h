@@ -23,6 +23,10 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
+// Round boundaries between index rewrites while the disk tier is active. The index is metadata-only
+// (a few MB), so a modest debounce trades a small amount of crash-window for negligible I/O.
+constexpr std::uint64_t kPrefixIndexDebounceTicks = 32;
+
 // Evicted prefix-cache pages return to every rank's text-KV pool; snapshot slots are statically
 // partitioned from the linear-attention pool, so releasing one is bookkeeping only.
 struct ProgramImplCore::PrefixCacheSink final : ninfer::prefix_cache::PrefixPageSink {
@@ -642,6 +646,74 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
                 }
             }
         }
+        // M3a disk tier: a bounded, crash-durable lower tier below the pinned host tier. The slab
+        // file mirrors the host slab geometry (each slot is tp x per-rank bytes), so a spilled host
+        // slab is a whole-slot copy. The persisted index is restored into the (empty) in-memory
+        // cache as disk-resident records; the host tier is materialized on admission.
+        if (prefix_host_pool != nullptr && plan.prefix_cache.disk_cache_mib > 0 &&
+            !plan.prefix_cache.file.empty()) {
+            prefix_store_file =
+                ninfer::prefix_cache::resolve_prefix_store_file(plan.prefix_cache.file);
+            prefix_slabs_file =
+                ninfer::prefix_cache::resolve_prefix_store_slabs_file(prefix_store_file);
+            const std::size_t total_bytes =
+                static_cast<std::size_t>(plan.prefix_cache.disk_cache_mib) * 1024U * 1024U;
+            const std::size_t block_slab_bytes = static_cast<std::size_t>(tp) * prefix_block_rank_bytes;
+            const std::size_t snapshot_slab_bytes =
+                static_cast<std::size_t>(tp) * prefix_snapshot_rank_bytes;
+            // Same 80/20 split as the host tier.
+            const std::size_t block_budget = (total_bytes * 8) / 10;
+            const std::size_t snap_budget  = total_bytes - block_budget;
+            const std::size_t block_count =
+                block_slab_bytes > 0 ? (block_budget / block_slab_bytes) : 0;
+            const std::size_t snap_count =
+                snapshot_slab_bytes > 0 ? (snap_budget / snapshot_slab_bytes) : 0;
+            if (block_count == 0 || snap_count == 0) {
+                std::fprintf(stderr,
+                             "[disk-cache] requested %u MiB is too small for one block slab "
+                             "(%zu MiB) plus one snapshot slab (%zu MiB); disk tier disabled\n",
+                             plan.prefix_cache.disk_cache_mib, block_slab_bytes >> 20U,
+                             snapshot_slab_bytes >> 20U);
+            } else {
+                prefix_disk_pool = std::make_unique<ninfer::prefix_cache::DiskSlabPool>(
+                    ninfer::prefix_cache::DiskSlabPoolOptions{
+                        .total_bytes         = total_bytes,
+                        .block_slab_bytes    = block_slab_bytes,
+                        .snapshot_slab_bytes = snapshot_slab_bytes,
+                        .block_slab_count    = block_count,
+                        .snapshot_slab_count = snap_count,
+                        .file                = prefix_slabs_file,
+                    });
+                if (prefix_disk_pool->enabled()) {
+                    prefix_index->set_disk_pool(prefix_disk_pool.get());
+                    ninfer::prefix_cache::PrefixStoreStats store_stats;
+                    if (ninfer::prefix_cache::load_prefix_store(
+                            prefix_store_file, *prefix_index, *prefix_disk_pool,
+                            prefix_store_geometry(), &store_stats)) {
+                        std::fprintf(stderr,
+                                     "[prefix-store] restored %llu nodes, %llu snapshots from %s\n",
+                                     static_cast<unsigned long long>(store_stats.nodes),
+                                     static_cast<unsigned long long>(store_stats.snapshots),
+                                     prefix_store_file.string().c_str());
+                    } else {
+                        std::fprintf(stderr,
+                                     "[prefix-store] starting empty (no usable cache at %s)\n",
+                                     prefix_store_file.string().c_str());
+                    }
+                    std::fprintf(stderr, "[disk-cache] %zu MiB slab file at %s: %zu block + %zu "
+                                         "snapshot slots\n",
+                                 prefix_disk_pool->total_bytes() >> 20U,
+                                 prefix_slabs_file.string().c_str(),
+                                 prefix_disk_pool->block_slab_count(),
+                                 prefix_disk_pool->snapshot_slab_count());
+                } else {
+                    std::fprintf(stderr,
+                                 "[disk-cache] slab file %s unavailable; disk tier disabled\n",
+                                 prefix_slabs_file.string().c_str());
+                    prefix_disk_pool.reset();
+                }
+            }
+        }
         prefix_max_new_taps =
             plan.prefix_cache.max_new_taps != 0 ? plan.prefix_cache.max_new_taps : 2U;
         prefix_ladder_tokens = plan.prefix_cache.ladder_tokens != 0
@@ -678,6 +750,10 @@ ProgramImplCore::~ProgramImplCore() noexcept {
             (void)cudaStreamSynchronize(peer[slot]->device.stream);
         }
     }
+    // M3 disk tier: persist the cache before the transfer streams are torn down. The compute
+    // streams are idle and synchronized above, so the write-throughs this issues cannot read
+    // half-written device state.
+    persist_prefix_store();
     // M2: cleanup cache transfer streams and events. The sync above guarantees every enqueued
     // copy has landed, so any write-through still tracked as in-flight completes successfully.
     if (prefix_index != nullptr && !prefix_inflight_writes.empty()) {
@@ -1049,11 +1125,19 @@ keep_resident_kv = true;
                     if (node->device_pages.page[1] >= 0) {
                         backend_pages.push_back(node->device_pages.page[1]);
                     }
-                } else if (node->host_state == ninfer::prefix_cache::Residency::Host &&
+                } else if ((node->host_state == ninfer::prefix_cache::Residency::Host ||
+                            node->disk_state == ninfer::prefix_cache::Residency::Disk) &&
                            prefix_host_pool != nullptr) {
+                    // A disk-only node is first materialized back into the host tier (lossless;
+                    // the disk slot is dropped only when its host slab is later evicted again).
+                    const ninfer::prefix_cache::HostPageId src =
+                        prefix_index->materialize_node_host(node_id);
+                    if (src == ninfer::prefix_cache::kInvalidHostPage) {
+                        throw std::logic_error("planned block path node is not restorable");
+                    }
                     const ninfer::prefix_cache::PoolPages pages = acquire_cache_bundle();
                     prefix_index->begin_device_fill(node_id, pages);
-                    char* slab = static_cast<char*>(prefix_host_pool->data(node->host_page));
+                    char* slab = static_cast<char*>(prefix_host_pool->data(src));
                     bool ok = true;
                     for (int rank = 0; ok && rank < tp; ++rank) {
                         ok = copy_cache_block(rank, pages.page[0], pages.page[1],
@@ -1074,11 +1158,18 @@ keep_resident_kv = true;
                 }
             }
 
-            // Restore the snapshot image to a device slot when it is only host-resident.
+            // Restore the snapshot image to a device slot when it is only host- or disk-resident.
             const ninfer::prefix_cache::Snapshot* after = prefix_index->snapshot(snap_id);
             if (after != nullptr && !after->device_resident() &&
-                after->host_state == ninfer::prefix_cache::Residency::Host &&
+                (after->host_state == ninfer::prefix_cache::Residency::Host ||
+                 after->disk_state == ninfer::prefix_cache::Residency::Disk) &&
                 prefix_host_pool != nullptr) {
+                // A disk-only image is first materialized back into the host tier.
+                const ninfer::prefix_cache::HostPageId image_page =
+                    prefix_index->materialize_snapshot_host(snap_id);
+                if (image_page == ninfer::prefix_cache::kInvalidHostPage) {
+                    throw std::logic_error("snapshot image is not restorable");
+                }
                 const auto target = prefix_index->begin_snapshot_restore(snap_id);
                 if (target.slot == ninfer::prefix_cache::kInvalidSlot) {
                     throw std::logic_error("snapshot restore has no device slot");
@@ -3166,26 +3257,32 @@ void ProgramImplCore::issue_snapshot_write_through(ninfer::prefix_cache::Snapsho
 }
 
 void ProgramImplCore::tick_prefix_cache() noexcept {
-    if (prefix_index == nullptr || prefix_inflight_writes.empty()) { return; }
-    // The newest event on every rank's cache stream marks the end of the whole pending set: all
-    // copies were enqueued before their event, so all events ready implies all writes landed. Each
-    // event lives on its own rank's device, so query it with that device current.
-    for (int rank = 0; rank < tp; ++rank) {
-        const auto slot = static_cast<std::size_t>(rank);
-        DeviceContext& rank_device = rank == 0 ? device : peer[slot]->device;
-        const ScopedDevice scope(rank_device.device);
-        if (cudaEventQuery(prefix_cache_event[slot]) != cudaSuccess) {
-            return;
+    if (prefix_index != nullptr && !prefix_inflight_writes.empty()) {
+        // The newest event on every rank's cache stream marks the end of the whole pending set: all
+        // copies were enqueued before their event, so all events ready implies all writes landed.
+        // Each event lives on its own rank's device, so query it with that device current.
+        bool drained = true;
+        for (int rank = 0; rank < tp; ++rank) {
+            const auto slot = static_cast<std::size_t>(rank);
+            DeviceContext& rank_device = rank == 0 ? device : peer[slot]->device;
+            const ScopedDevice scope(rank_device.device);
+            if (cudaEventQuery(prefix_cache_event[slot]) != cudaSuccess) {
+                drained = false;
+                break;
+            }
+        }
+        if (drained) {
+            for (const InflightCacheWrite& write : prefix_inflight_writes) {
+                if (write.is_snapshot) {
+                    prefix_index->finish_snapshot_write(write.snapshot, true);
+                } else {
+                    prefix_index->finish_host_write(write.node, true);
+                }
+            }
+            prefix_inflight_writes.clear();
         }
     }
-    for (const InflightCacheWrite& write : prefix_inflight_writes) {
-        if (write.is_snapshot) {
-            prefix_index->finish_snapshot_write(write.snapshot, true);
-        } else {
-            prefix_index->finish_host_write(write.node, true);
-        }
-    }
-    prefix_inflight_writes.clear();
+    sweep_prefix_disk_tier();
 }
 
 void ProgramImplCore::settle_prefix_writes() noexcept {
@@ -3203,6 +3300,138 @@ void ProgramImplCore::settle_prefix_writes() noexcept {
         }
     }
     tick_prefix_cache();
+}
+
+ninfer::prefix_cache::PrefixStoreGeometry ProgramImplCore::prefix_store_geometry() const noexcept {
+    ninfer::prefix_cache::PrefixStoreGeometry geometry;
+    geometry.tp                    = static_cast<std::uint32_t>(tp);
+    geometry.device_snapshot_slots = prefix_snapshot_slots;
+    geometry.block_rank_bytes      = prefix_block_rank_bytes;
+    geometry.snapshot_rank_bytes   = prefix_snapshot_rank_bytes;
+    geometry.block_slab_bytes     = static_cast<std::uint64_t>(tp) * prefix_block_rank_bytes;
+    geometry.snapshot_slab_bytes  = static_cast<std::uint64_t>(tp) * prefix_snapshot_rank_bytes;
+    geometry.block_slab_count =
+        prefix_disk_pool != nullptr ? static_cast<std::uint32_t>(prefix_disk_pool->block_slab_count())
+                                    : 0U;
+    geometry.snapshot_slab_count =
+        prefix_disk_pool != nullptr
+            ? static_cast<std::uint32_t>(prefix_disk_pool->snapshot_slab_count())
+            : 0U;
+    geometry.disk_file_uid = prefix_disk_pool != nullptr ? prefix_disk_pool->file_uid() : 0U;
+    return geometry;
+}
+
+void ProgramImplCore::sweep_prefix_disk_tier() noexcept {
+    if (prefix_index == nullptr || prefix_disk_pool == nullptr || !prefix_disk_pool->enabled()) {
+        return;
+    }
+    // Bound the work per round boundary: spill a few host-resident records that have no disk copy
+    // yet. The cursors wrap the id space so every record is eventually offered.
+    constexpr std::uint64_t kNodesPerSweep     = 8;
+    constexpr std::uint64_t kSnapshotsPerSweep = 1;
+    const auto node_capacity     = static_cast<std::uint64_t>(prefix_index->node_capacity());
+    const auto snapshot_capacity = static_cast<std::uint64_t>(prefix_index->snapshot_capacity());
+
+    std::uint64_t examined = 0;
+    while (examined < kNodesPerSweep && node_capacity > 1U) {
+        if (prefix_flush_node_cursor < 2U || prefix_flush_node_cursor > node_capacity) {
+            prefix_flush_node_cursor = 2U; // id 1 is the root; it owns no KV data
+        }
+        const auto id = static_cast<ninfer::prefix_cache::NodeId>(prefix_flush_node_cursor);
+        ++prefix_flush_node_cursor;
+        ++examined;
+        const ninfer::prefix_cache::BlockNode* n = prefix_index->node(id);
+        if (n == nullptr) { continue; }
+        if (n->host_state == ninfer::prefix_cache::Residency::Host &&
+            n->disk_state != ninfer::prefix_cache::Residency::Disk) {
+            (void)prefix_index->spill_node(id);
+        }
+    }
+
+    std::uint64_t examined_snaps = 0;
+    while (examined_snaps < kSnapshotsPerSweep && snapshot_capacity >= 1U) {
+        if (prefix_flush_snap_cursor < 1U || prefix_flush_snap_cursor > snapshot_capacity) {
+            prefix_flush_snap_cursor = 1U;
+        }
+        const auto id = static_cast<ninfer::prefix_cache::SnapshotId>(prefix_flush_snap_cursor);
+        ++prefix_flush_snap_cursor;
+        ++examined_snaps;
+        const ninfer::prefix_cache::Snapshot* s = prefix_index->snapshot(id);
+        if (s == nullptr || s->superseded) { continue; }
+        if (s->host_state == ninfer::prefix_cache::Residency::Host &&
+            s->disk_state != ninfer::prefix_cache::Residency::Disk) {
+            (void)prefix_index->spill_snapshot(id);
+        }
+    }
+
+    ++prefix_tick_count;
+    if (prefix_tick_count - prefix_index_written_tick >= kPrefixIndexDebounceTicks) {
+        write_prefix_index();
+    }
+}
+
+void ProgramImplCore::write_prefix_index() noexcept {
+    if (prefix_index == nullptr || prefix_disk_pool == nullptr || prefix_store_file.empty()) {
+        return;
+    }
+    prefix_index_written_tick = prefix_tick_count;
+    const std::uint64_t nodes     = prefix_index->live_node_count();
+    const std::uint64_t snapshots = prefix_index->live_snapshot_count();
+    if (ninfer::prefix_cache::save_prefix_store(prefix_store_file, *prefix_index,
+                                                *prefix_disk_pool, prefix_store_geometry())) {
+        std::fprintf(stderr, "[prefix-store] wrote index: %llu nodes, %llu snapshots\n",
+                     static_cast<unsigned long long>(nodes),
+                     static_cast<unsigned long long>(snapshots));
+    } else {
+        std::fprintf(stderr, "[prefix-store] failed to write index to %s\n",
+                     prefix_store_file.string().c_str());
+    }
+}
+
+void ProgramImplCore::persist_prefix_store() noexcept {
+    if (prefix_index == nullptr || prefix_disk_pool == nullptr || prefix_store_file.empty()) {
+        return;
+    }
+    // Flush device-only records to the host tier (each issue pins its record against eviction for
+    // the transfer's duration), then spill every host-resident record into the disk tier, then
+    // serialize the index. Records that cannot land are dropped by the serializer.
+    const std::size_t node_capacity = prefix_index->node_capacity();
+    for (std::size_t i = 1; i <= node_capacity; ++i) {
+        const auto id = static_cast<ninfer::prefix_cache::NodeId>(i);
+        const ninfer::prefix_cache::BlockNode* n = prefix_index->node(id);
+        if (n != nullptr && n->device_state == ninfer::prefix_cache::Residency::Resident &&
+            n->host_state != ninfer::prefix_cache::Residency::Host) {
+            issue_block_write_through(id);
+        }
+    }
+    const std::size_t snapshot_capacity = prefix_index->snapshot_capacity();
+    for (std::size_t j = 1; j <= snapshot_capacity; ++j) {
+        const auto id = static_cast<ninfer::prefix_cache::SnapshotId>(j);
+        const ninfer::prefix_cache::Snapshot* s = prefix_index->snapshot(id);
+        if (s != nullptr && s->device_state == ninfer::prefix_cache::Residency::Resident &&
+            s->host_state != ninfer::prefix_cache::Residency::Host) {
+            issue_snapshot_write_through(id);
+        }
+    }
+    settle_prefix_writes();
+    for (std::size_t i = 1; i <= node_capacity; ++i) {
+        const auto id = static_cast<ninfer::prefix_cache::NodeId>(i);
+        const ninfer::prefix_cache::BlockNode* n = prefix_index->node(id);
+        if (n != nullptr && n->host_state == ninfer::prefix_cache::Residency::Host &&
+            n->disk_state != ninfer::prefix_cache::Residency::Disk) {
+            (void)prefix_index->spill_node(id);
+        }
+    }
+    for (std::size_t j = 1; j <= snapshot_capacity; ++j) {
+        const auto id = static_cast<ninfer::prefix_cache::SnapshotId>(j);
+        const ninfer::prefix_cache::Snapshot* s = prefix_index->snapshot(id);
+        if (s != nullptr && !s->superseded &&
+            s->host_state == ninfer::prefix_cache::Residency::Host &&
+            s->disk_state != ninfer::prefix_cache::Residency::Disk) {
+            (void)prefix_index->spill_snapshot(id);
+        }
+    }
+    write_prefix_index();
 }
 
 void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
@@ -4671,6 +4900,16 @@ MetricsSnapshot ProgramImplCore::metrics() const noexcept {
             static_cast<std::uint32_t>(prefix_host_pool->block_slab_count());
         host.snapshot_slab_count =
             static_cast<std::uint32_t>(prefix_host_pool->snapshot_slab_count());
+    }
+    if (prefix_disk_pool != nullptr) {
+        DiskCacheMetrics& disk = out.prefix_cache.disk;
+        disk.enabled           = prefix_disk_pool->enabled();
+        disk.budget_bytes      = prefix_disk_pool->total_bytes();
+        disk.used_bytes        = prefix_disk_pool->used_bytes();
+        disk.block_slab_count =
+            static_cast<std::uint32_t>(prefix_disk_pool->block_slab_count());
+        disk.snapshot_slab_count =
+            static_cast<std::uint32_t>(prefix_disk_pool->snapshot_slab_count());
     }
     return out;
 }

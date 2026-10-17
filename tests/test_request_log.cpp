@@ -355,6 +355,15 @@ int main() {
         check(format_request_done(context, outcome).find("reuse=restore_response_checkpoint") !=
                   std::string::npos,
               "human request log omits response checkpoint reuse path");
+    outcome.metrics.prefix_admission.disk_tier_enabled      = true;
+    outcome.metrics.prefix_admission.disk_tier_used_bytes   = 1073741824ULL;
+    outcome.metrics.prefix_admission.disk_tier_budget_bytes = 48ULL * 1073741824ULL;
+    outcome.metrics.prefix_admission.served_from_disk       = true;
+    const std::string done_line = format_request_done(context, outcome);
+    failures += check(done_line.find("disk=1.00/48.0GiB") != std::string::npos,
+                      "human request log omits disk tier occupancy");
+    failures += check(done_line.find("from=disk") != std::string::npos,
+                      "human request log omits disk-served marker");
     failures += check(format_request_start(context).find("submitted") != std::string::npos,
                       "human request log mislabels a submitted request");
 
@@ -521,6 +530,7 @@ int main() {
             .kind       = 0,
             .device_resident     = true,
             .host_restorable     = true,
+            .disk_restorable     = true,
             .reject = 5};
         const std::string verbose =
             format_prefix_admission_verbose(7, diag, ninfer::PrefixReusePath::FullReset,
@@ -532,6 +542,8 @@ int main() {
         failures += check(shaped && verbose.find("no consumable snapshot survived") !=
                                    std::string::npos,
                           "verbose admission explanation lost its sections or verdict");
+        failures += check(verbose.find("disk=yes") != std::string::npos,
+                          "verbose candidate listing omits disk restorability");
     }
 
     if (failures == 0) { std::cout << "ok\n"; }
