@@ -369,6 +369,44 @@ int test_eviction_policy_tiers() {
     return failures;
 }
 
+int test_evictable_page_counts_respect_demand() {
+    int failures = 0;
+    CountingSink sink;
+    PrefixIndex index(PrefixIndexOptions{2, 0}, &sink);
+
+    const auto a = tokens(kBlockTokens, 141);
+    const auto b = tokens(kBlockTokens, 142);
+    const auto c = tokens(kBlockTokens, 143);
+    const std::uint64_t ha = block_hash(kBlockHashSeed, a, 0);
+    const std::uint64_t hb = block_hash(ha, b, 0);
+    const std::uint64_t hc = block_hash(kBlockHashSeed, c, 0);
+    const NodeId n_a = commit(index, index.root(), a, ha, pages(1));
+    const NodeId n_b = commit(index, n_a, b, hb, pages(2));
+    const NodeId n_c = commit(index, index.root(), c, hc, pages(3));
+    failures += check(n_a != kInvalidNode && n_b != kInvalidNode && n_c != kInvalidNode,
+                      "evictable-count setup failed");
+
+    // With no demand every device-resident node's page is creditable.
+    const auto all = index.evictable_page_counts({});
+    failures += check(all[0] == 3U, "unprotected page count did not include every resident node");
+
+    // A demand on the chain tail protects n_b AND its ancestor n_a, so only the sibling n_c is
+    // creditable. Crediting the protected chain is exactly the over-commit that made an admitted
+    // reservation throw std::bad_alloc: eviction will never release those demand-path pages.
+    const std::array<NodeId, 1> demand{n_b};
+    const auto scoped = index.evictable_page_counts(demand);
+    failures += check(scoped[0] == 1U, "demand-protected pages were credited as evictable");
+
+    // The credited page is what eviction under the same demand reclaims first: the sibling goes,
+    // and the demand-protected chain -- whose device pages admission must not have counted -- is
+    // left untouched by that lossless step.
+    const NodeId evicted = index.evict_node(demand);
+    failures += check(evicted == n_c, "demand-scoped eviction did not reclaim the credited sibling");
+    failures += check(index.node(n_a) != nullptr && index.node(n_b) != nullptr,
+                      "demand-scoped eviction erased a protected chain node");
+    return failures;
+}
+
 int test_tap_planner_priority_and_clustering() {
     int failures = 0;
     TapPlanOptions options;
@@ -487,6 +525,7 @@ int main() {
     failures += test_lru_eviction_and_pinning();
     failures += test_match_miss_diagnostics();
     failures += test_eviction_policy_tiers();
+    failures += test_evictable_page_counts_respect_demand();
     failures += test_tap_planner_priority_and_clustering();
     failures += test_tap_planner_vision_and_ladder();
     if (failures == 0) { std::cout << "ok\n"; }

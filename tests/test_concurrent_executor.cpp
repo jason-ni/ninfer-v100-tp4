@@ -240,6 +240,12 @@ public:
             .active_lanes = 0, .main_kv_pages = residue_main_.load(std::memory_order_relaxed)};
     }
 
+    // When armed, the next start_prefill_lane rethrows this instead of running the script: the
+    // shape of an admitted plan whose KV reservation the pool cannot satisfy.
+    void set_prefill_exception(std::exception_ptr error) {
+        prefill_error_ = std::move(error);
+    }
+
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const ScriptedPlan&) const noexcept {
         if (admission_blocked_.load(std::memory_order_relaxed)) { return false; }
         return lane < max_concurrency_ && lanes_[lane].lifecycle == Lifecycle::Empty;
@@ -252,6 +258,7 @@ public:
 
     rt::PrefillStepResult start_prefill_lane(std::uint32_t lane, q36::PreparedPrompt&& prompt,
                                              ScriptedPlan&& plan, rt::TransientRegion) {
+        if (prefill_error_) { std::rethrow_exception(prefill_error_); }
         if (queued_.empty()) { throw std::logic_error("scripted program has no remaining script"); }
         Lane& state     = lanes_[lane];
         state.script    = std::move(queued_.front());
@@ -403,6 +410,7 @@ private:
     std::size_t maximum_batch_rows_ = 0;
     std::atomic<bool> admission_blocked_{false};
     std::atomic<std::uint32_t> residue_main_{0};
+    std::exception_ptr prefill_error_;
 };
 
 struct ScriptedPackage {
@@ -774,6 +782,37 @@ void test_protected_head_blocked_by_cache_residency(const q36::Frontend& fronten
     (void)a; // A is cancelled when its handle is destroyed; the Engine must still be alive.
 }
 
+// A KV reservation that cannot fit even after the cache is drained is attributable to one
+// request, not the shared unit. The Program reports it as a request-scoped
+// RequestError(ContextLengthExceeded); admission must complete only that request and keep the
+// Engine serving. Before the admission boundary discriminated request-scoped errors, this
+// rethrew out of admit_planned_request into worker_loop's catch-all and every later request
+// answered "inference engine is unavailable".
+void test_prefill_capacity_shortfall_is_isolated(const q36::Frontend& frontend,
+                                                 const ninfer::DeviceContext& device) {
+    ScriptedInstance instance{.loaded  = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                              .program = std::make_unique<ScriptedProgram>(1),
+                              .request_memory         = {},
+                              .kv_capacity_resolution = {}};
+    ScriptedProgram& program = *instance.program;
+    program.set_prefill_exception(std::make_exception_ptr(
+        ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
+                             "KV cache cannot hold this request")));
+    program.push_script(GenerationScript{.tokens = {0}}); // served once the refusal is cleared
+    Executor executor(instance, executor_options(), device);
+
+    const Outcome failed = run_request(executor, frontend, 1);
+    expect(!failed.ok, "a KV capacity shortfall did not fail its own request");
+    expect(failed.error.find("KV cache cannot hold this request") != std::string::npos,
+           "the shortfalling request did not receive its capacity error");
+    expect(program.all_lanes_idle(), "a prefill capacity shortfall left its lane active");
+
+    program.set_prefill_exception(nullptr);
+    const Outcome next = run_request(executor, frontend, 1);
+    expect(next.ok && next.content == "x",
+           "the Engine stopped serving after a request-scoped KV capacity refusal");
+}
+
 } // namespace
 
 int main() {
@@ -792,5 +831,6 @@ int main() {
     test_request_scope_failure_is_isolated(frontend, device, false);
     test_engine_scope_failure_still_fails_all(frontend, device);
     test_protected_head_blocked_by_cache_residency(frontend, device);
+    test_prefill_capacity_shortfall_is_isolated(frontend, device);
     return failures == 0 ? 0 : 1;
 }

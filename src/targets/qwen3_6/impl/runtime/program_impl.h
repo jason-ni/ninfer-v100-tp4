@@ -47,6 +47,16 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// A paged-KV reservation that cannot fit even after the device prefix cache has been drained to
+// its reclaimable floor is a property of this request's context against the configured capacity,
+// not a failure of the shared execution unit. Surface it as a request-scoped refusal so the
+// admission path can complete just this request instead of latching the Engine failed_.
+[[noreturn]] void throw_kv_capacity_shortfall() {
+    throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                       "KV cache cannot hold this request: the prefix cache left too few "
+                       "reclaimable pages for the planned context");
+}
+
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
     if (value > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error(label);
@@ -781,7 +791,20 @@ ProgramImplCore::~ProgramImplCore() noexcept {
     }
 }
 
-bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
+std::vector<ninfer::prefix_cache::NodeId> ProgramImplCore::reservation_demand(
+    std::uint32_t lane, bool include_other_lanes, bool include_current_lane) const {
+    std::vector<ninfer::prefix_cache::NodeId> demand;
+    for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+        if (!sequences[other].retained) { continue; }
+        if (other == lane ? !include_current_lane : !include_other_lanes) { continue; }
+        const std::vector<ninfer::prefix_cache::NodeId>& chain =
+            sequences[other].prefix_retained_commit_nodes;
+        demand.insert(demand.end(), chain.begin(), chain.end());
+    }
+    return demand;
+}
+
+bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const {
     if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
     const RequestControl& request = requests[lane];
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
@@ -789,11 +812,24 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
         return false;
     }
     const SequenceState& sequence = sequences[lane];
+    // A FullReset or BlockSnapshot builds a fresh allocation and drops this lane's retained commit
+    // chain before reserving (see start_prefill_lane), so those cache pages are genuinely
+    // reclaimable. A reuse that keeps the resident KV must leave them protected.
+    const bool reuses_resident = plan.impl_->reuse != ReusePath::FullReset &&
+                                 plan.impl_->reuse != ReusePath::BlockSnapshot;
     // Pool invariant: free = page_group_count - entitled - cached. Cache pages held by LRU-linked
-    // nodes are reclaimable through evict_one_prefix_node(), so they count as capacity here.
+    // nodes are reclaimable through evict_one_prefix_node(), so they count as capacity here -- but
+    // ONLY when that eviction is willing to touch them. A retained lane whose committed chain stays
+    // protected is charged here so admission never counts a page the reservation cannot reclaim.
+    // The plan's own matched/reuse path is excluded from the demand: those pages are adopted by the
+    // incoming plan (the reuse lives in cached_pages until the plan takes ownership), so they are
+    // already-available capacity, not something eviction must produce.
     const std::array<std::uint32_t, ninfer::prefix_cache::kMaxPools> evictable =
-        prefix_index != nullptr ? prefix_index->evictable_page_counts()
-                                : std::array<std::uint32_t, ninfer::prefix_cache::kMaxPools>{0U, 0U};
+        prefix_index != nullptr
+            ? prefix_index->evictable_page_counts(
+                  reservation_demand(lane, /*include_other_lanes=*/true,
+                                     /*include_current_lane=*/reuses_resident))
+            : std::array<std::uint32_t, ninfer::prefix_cache::kMaxPools>{0U, 0U};
     const auto can_replace = [&evictable](const PagedKVPool& pool, std::uint32_t old_pages,
                                  std::uint32_t new_pages, std::uint32_t evictable_pages) {
         if (old_pages > pool.entitled_pages() || new_pages > pool.logical_page_capacity()) {
@@ -823,7 +859,7 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
 }
 
 bool ProgramImplCore::can_admit_lane_after_retained_eviction(
-    std::uint32_t lane, const RequestPlan& plan) const noexcept {
+    std::uint32_t lane, const RequestPlan& plan) const {
     if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
     const RequestControl& request = requests[lane];
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
@@ -842,10 +878,17 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     }
 
     // Same cached-page accounting as can_admit_lane: cache pages are held by the pool, and only
-    // the LRU-linked ones are reclaimable.
+    // the LRU-linked ones are reclaimable. This path is taken because the OTHER retained lanes can
+    // be evicted (evict_retained_lane clears their committed chains), so their cache pages are
+    // reclaimable here even though they are demand-protected during a plain admission.
+    const bool reuses_resident = plan.impl_->reuse != ReusePath::FullReset &&
+                                 plan.impl_->reuse != ReusePath::BlockSnapshot;
     const std::array<std::uint32_t, ninfer::prefix_cache::kMaxPools> evictable =
-        prefix_index != nullptr ? prefix_index->evictable_page_counts()
-                                : std::array<std::uint32_t, ninfer::prefix_cache::kMaxPools>{0U, 0U};
+        prefix_index != nullptr
+            ? prefix_index->evictable_page_counts(
+                  reservation_demand(lane, /*include_other_lanes=*/false,
+                                     /*include_current_lane=*/reuses_resident))
+            : std::array<std::uint32_t, ninfer::prefix_cache::kMaxPools>{0U, 0U};
     const auto can_replace = [&evictable](const PagedKVPool& pool, std::uint32_t old_pages,
                                  std::uint32_t reclaimable_pages, std::uint32_t new_pages,
                                  std::uint32_t evictable_pages) {
@@ -887,17 +930,20 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
     };
 }
 
-runtime::AdmissionResources ProgramImplCore::admission_cache_residue() const noexcept {
+runtime::AdmissionResources ProgramImplCore::admission_cache_residue() const {
     // Device prefix-cache residency that an admission-time eviction cannot reclaim. A device node
     // counts here when it is cached but held off the eviction LRU by a live reference: a borrowed
-    // or promoted prefix page of a running sequence, or an in-flight write-through/restore pin.
-    // `can_admit_lane` already credits only the LRU-linked pages as capacity, so protected-admission
-    // feasibility has to charge this residue too -- otherwise a head that is genuinely blocked by
-    // pinned cache pages looks like it is "not blocked by frozen incumbents". Over-counting is
-    // safe: it can only make the protected projection conservative, never admit a request.
+    // or promoted prefix page of a running sequence, an in-flight write-through/restore pin, or a
+    // retained lane's committed chain (which evict_one_prefix_node protects). `can_admit_lane`
+    // credits only pages eviction is actually willing to reclaim, so protected-admission
+    // feasibility has to charge the rest too -- otherwise a head that is genuinely blocked by
+    // pinned/demanded cache pages looks like it is "not blocked by frozen incumbents".
+    // Over-counting is safe: it can only make the protected projection conservative.
     if (prefix_index == nullptr) { return {}; }
+    const std::vector<ninfer::prefix_cache::NodeId> demand =
+        reservation_demand(0, /*include_other_lanes=*/true, /*include_current_lane=*/true);
     const std::array<std::uint32_t, ninfer::prefix_cache::kMaxPools> evictable =
-        prefix_index->evictable_page_counts();
+        prefix_index->evictable_page_counts(demand);
     const auto residual = [](std::uint32_t cached, std::uint32_t reclaimable) {
         return cached > reclaimable ? cached - reclaimable : 0U;
     };
@@ -1016,6 +1062,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     bool keep_resident_kv = false;
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
+            // This lane's resident KV is being discarded, so its prior committed chain is no longer
+            // a reuse target and must stop demanding protection: drop it before reserving so the
+            // eviction pass can reclaim those cache pages for the fresh allocation. This is what
+            // keeps can_admit_lane()'s `reuses_resident == false` credit sound.
+            sequence.prefix_retained_commit_nodes.clear();
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
@@ -1094,17 +1145,28 @@ keep_resident_kv = true;
                 throw std::logic_error("planned block snapshot is unavailable");
             }
             // Drop any state inherited from a previous owner on this lane; hybrid reuse is
-            // content-addressed and does not depend on a retained sequence.
+            // content-addressed and does not depend on a retained sequence. The inherited
+            // committed chain likewise stops demanding protection, so its cache pages become
+            // reclaimable for this fresh allocation (see can_admit_lane's `reuses_resident`).
+            sequence.prefix_retained_commit_nodes.clear();
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
 
-            // Pin everything this lane will use before any restore work, so slot eviction and
-            // subtree erasure cannot touch the planned snapshot or path mid-restore.
-            for (ninfer::prefix_cache::NodeId id : request_plan.block_path) {
-                prefix_index->pin_node(id);
+            // Only the prefix up to the snapshot frontier is actually reused; the matched chain
+            // beyond it is re-prefilled (its blocks are re-committed as prefill advances). Pin and
+            // protect only the reused span: pinning the whole matched path would hold device pages
+            // that the reservation cannot reclaim, refusing a request that otherwise fits.
+            const std::uint32_t frontier_blocks = base / ninfer::prefix_cache::kBlockTokens;
+            const std::size_t reused_nodes =
+                std::min<std::size_t>(request_plan.block_path.size(),
+                                      static_cast<std::size_t>(frontier_blocks) + 1U);
+            // Pin the reused prefix before any restore work, so slot eviction and subtree erasure
+            // cannot touch the planned snapshot or its borrowed blocks mid-restore.
+            for (std::size_t i = 0; i < reused_nodes; ++i) {
+                prefix_index->pin_node(request_plan.block_path[i]);
             }
             prefix_index->pin_snapshot(snap_id);
 
@@ -1112,7 +1174,6 @@ keep_resident_kv = true;
             std::vector<std::int32_t> backend_pages;
             // Borrow pages up to the snapshot frontier. Device-resident nodes are borrowed
             // directly; host-resident nodes are restored H2D on every rank's cache stream first.
-            const std::uint32_t frontier_blocks = base / ninfer::prefix_cache::kBlockTokens;
             for (std::size_t i = 1; i < request_plan.block_path.size() && (i - 1) < frontier_blocks;
                  ++i) {
                 const ninfer::prefix_cache::NodeId node_id = request_plan.block_path[i];
@@ -1224,7 +1285,9 @@ keep_resident_kv = true;
             if (restored == nullptr || !restored->device_resident()) {
                 throw std::logic_error("planned block snapshot is unavailable");
             }
-            sequence.prefix_pinned_nodes = request_plan.block_path;
+            sequence.prefix_pinned_nodes.assign(
+                request_plan.block_path.begin(),
+                request_plan.block_path.begin() + static_cast<std::ptrdiff_t>(reused_nodes));
             sequence.prefix_snapshot     = snap_id;
             sequence.prefix_borrowed     = true;
             sequence.text_kv_valid       = base;
@@ -1283,7 +1346,11 @@ keep_resident_kv = true;
             sequence.prefix_taps_planned = true;
             sequence.prefix_capture      = true;
             sequence.prefix_matched_blocks = request_plan.block_path_blocks;
-            sequence.prefix_pinned_nodes = request_plan.block_path;
+            // BlockSnapshot already baselined the capture path to its reused span; only the resident
+            // append/checkpoint paths seed it from the plan's (empty) matched path here.
+            if (request_plan.reuse != ReusePath::BlockSnapshot) {
+                sequence.prefix_pinned_nodes = request_plan.block_path;
+            }
             // A reusable reuse that keeps the resident KV allocation already handed its leading blocks'
             // pages to the cache on this lane's previous life (cache-owned). Baseline the capture state from
             // that retained committed-node path -- truncated to the longest still-live prefix, since
@@ -1837,7 +1904,7 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
             break;
         } catch (const std::bad_alloc&) {
             if (evict_one_prefix_node() == ninfer::prefix_cache::kInvalidNode) {
-                throw;
+                throw_kv_capacity_shortfall();
             }
         }
     }
@@ -1887,7 +1954,7 @@ void ProgramImplCore::resize_paged_kv_with_eviction(std::span<PagedKVResize> cha
             return;
         } catch (const std::bad_alloc&) {
             if (evict_one_prefix_node() == ninfer::prefix_cache::kInvalidNode) {
-                throw;
+                throw_kv_capacity_shortfall();
             }
         }
     }
@@ -3113,7 +3180,7 @@ ninfer::prefix_cache::PoolPages ProgramImplCore::acquire_cache_bundle() {
         // page per pool through the sink; stop when nothing is evictable and rethrow.
         for (;;) {
             if (evict_one_prefix_node() == ninfer::prefix_cache::kInvalidNode) {
-                throw;
+                throw_kv_capacity_shortfall();
             }
             try {
                 return acquire_once();

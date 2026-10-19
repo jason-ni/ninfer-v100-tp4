@@ -445,10 +445,18 @@ public:
     // ok=false returns the slot to the free list.
     void finish_snapshot_restore(SnapshotId id, bool ok) noexcept;
 
-    // Pages the admission check may reclaim by calling evict_node(): one entry per pool,
-    // counting LRU-linked nodes that own a page in that pool. Eviction returns exactly these pages
-    // to the pools (backed nodes demote, unbacked nodes erase), so the counts are a sound credit.
-    [[nodiscard]] std::array<std::uint32_t, kMaxPools> evictable_page_counts() const noexcept;
+    // Pages the admission check may reclaim while preserving the demand path: one entry per pool,
+    // counting LRU-linked nodes that own a page in that pool and are not on the protected demand
+    // path. `protected_nodes` must be the SAME set later passed to `evict_node()`. The count must
+    // never exceed what eviction can release WITHOUT breaking that path: an unbacked protected
+    // node (no host/disk copy) cannot be demoted, and erasing it would kill a demanded prefix
+    // another request still addresses, so crediting it would admit a reservation the pool cannot
+    // satisfy (-> std::bad_alloc). Excluding the whole protected closure can under-credit a
+    // demanded tail that eviction would only demote as a last resort; that is safe (it can only
+    // refuse an admission), whereas over-crediting is not. Passing an empty span credits every
+    // LRU-linked page.
+    [[nodiscard]] std::array<std::uint32_t, kMaxPools>
+    evictable_page_counts(std::span<const NodeId> protected_nodes);
 
     [[nodiscard]] std::uint32_t evictable_pages() const noexcept { return evictable_pages_; }
 

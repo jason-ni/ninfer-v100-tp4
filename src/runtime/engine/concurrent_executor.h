@@ -8,6 +8,7 @@
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/raw_output_log.h"
 #include "runtime/engine/request_memory.h"
+#include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/generation/generation_budget.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
 
@@ -863,6 +864,21 @@ private:
         return selected;
     }
 
+    // A request-scoped failure is attributable to one request's inputs/resources and leaves the
+    // shared execution unit healthy: the admitted plan demanded more KV/cache than the device can
+    // hold (RequestErrorKind::ContextLengthExceeded), or an I/O or protocol-level refusal. Those
+    // are completed against their own request and must not latch the Engine failed_. Anything else
+    // reaching admit_planned_request's region is a device/state failure of the shared unit.
+    [[nodiscard]] static bool is_request_scoped_error(std::exception_ptr error) noexcept {
+        try {
+            std::rethrow_exception(error);
+        } catch (const RequestError&) {
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
                                                          std::exception_ptr error) {
         if (!erase_pending(request)) { return AdmissionProgress::None; }
@@ -912,14 +928,25 @@ private:
 
         Plan selected_plan = std::move(*request->lane_plans[lane]);
         request->lane_plans[lane].reset();
-        // Protect the admitted plan's matched prefix chain (plus every retained lane's committed
-        // chain, handled program-side) from device-tier cache eviction while its KV pages are
-        // being reserved.
-        instance_.program->set_eviction_demand(selected_plan.block_path());
+        const RequestPlanSummary summary = selected_plan.summary();
+        // Protect the prefix the plan actually adopts, plus every retained lane's committed chain
+        // (handled program-side), from device-tier cache eviction while its KV pages are reserved.
+        // A BlockSnapshot matches the full block chain but reuses only up to the deepest snapshot
+        // frontier; the matched blocks beyond that are re-prefilled, so their device pages must stay
+        // reclaimable rather than being held by the demand.
+        {
+            const std::span<const std::uint32_t> path = selected_plan.block_path();
+            const std::size_t reuse_nodes = std::min<std::size_t>(
+                path.size(),
+                static_cast<std::size_t>(
+                    summary.reusable_prompt_tokens /
+                    static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens)) +
+                    1U);
+            instance_.program->set_eviction_demand(path.first(reuse_nodes));
+        }
         if (!erase_pending(request)) { return AdmissionProgress::None; }
         release_planning_state(request);
 
-        const RequestPlanSummary summary = selected_plan.summary();
         if (backfill_class == BackfillClass::Temporal) {
             if (!protection_ || protection_->epoch_id != backfill_epoch ||
                 summary.service_work_quanta > protection_->temporal_credit) {
@@ -970,6 +997,10 @@ private:
             slots_[lane].reset();
             invalidate_lane_plans(lane);
             complete_error(request, error);
+            // Contain a request-scoped refusal (e.g. the KV bundle cannot fit even after the cache
+            // was drained) to the requesting slot. Device/state failures still propagate so the
+            // worker fails all in-flight work.
+            if (is_request_scoped_error(error)) { return AdmissionProgress::ControlProgress; }
             throw;
         }
         return AdmissionProgress::RanGpuUnit;
@@ -1035,7 +1066,16 @@ private:
 
             const ActiveAdmissionSet active = active_admission_set();
             if (active.size == 0) {
-                throw std::logic_error("exclusive-feasible request cannot enter an idle Engine");
+                // The Engine is idle, so no incumbent can be the obstacle: the head's own
+                // reservation cannot be satisfied against the shared cache. That is a capacity
+                // condition of this request, not an engine fault -- refuse it (request-scoped) so a
+                // conservative admission estimate can never latch the whole Engine.
+                (void)remove_pending_error(
+                    head, std::make_exception_ptr(RequestError(
+                              RequestErrorKind::ContextLengthExceeded,
+                              "request reservation cannot be satisfied within the shared KV cache")));
+                control_progress = true;
+                continue;
             }
             if (!protection_) {
                 protection_.emplace(make_admission_protection(

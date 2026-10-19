@@ -1094,9 +1094,24 @@ NodeId PrefixIndex::evict_node(std::span<const NodeId> protected_nodes) {
     return trim;
 }
 
-std::array<std::uint32_t, kMaxPools> PrefixIndex::evictable_page_counts() const noexcept {
+std::array<std::uint32_t, kMaxPools>
+PrefixIndex::evictable_page_counts(std::span<const NodeId> protected_nodes) {
     std::array<std::uint32_t, kMaxPools> counts{0U, 0U};
+    // Build the same protected + ancestor closure evict_node() uses and exclude it, so the credit
+    // can never include a protected page that eviction is unwilling to release while keeping the
+    // demand path intact.
+    const bool have_protection = !protected_nodes.empty();
+    if (have_protection) {
+        evict_protected_.assign(nodes_.size(), 0);
+        for (NodeId id : protected_nodes) {
+            if (!valid(id)) { continue; }
+            for (NodeId cur = id; cur != kInvalidNode; cur = nodes_[cur - 1U].parent) {
+                evict_protected_[cur - 1U] = 1;
+            }
+        }
+    }
     for (NodeId id = lru_head_; id != kInvalidNode; id = nodes_[id - 1U].lru_next) {
+        if (have_protection && evict_protected_[id - 1U]) { continue; }
         const BlockNode& record = nodes_[id - 1U];
         if (record.device_pages.page[0] >= 0) { ++counts[0]; }
         if (record.device_pages.page[1] >= 0) { ++counts[1]; }

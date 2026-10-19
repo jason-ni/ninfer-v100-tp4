@@ -301,12 +301,11 @@ public:
     [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
                                                     const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base);
-    [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
+    [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const;
     [[nodiscard]] bool
-    can_admit_lane_after_retained_eviction(std::uint32_t lane,
-                                           const RequestPlan& plan) const noexcept;
+    can_admit_lane_after_retained_eviction(std::uint32_t lane, const RequestPlan& plan) const;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
-    [[nodiscard]] runtime::AdmissionResources admission_cache_residue() const noexcept;
+    [[nodiscard]] runtime::AdmissionResources admission_cache_residue() const;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPromptData&& prompt,
                                                                 RequestPlan&& plan,
@@ -341,6 +340,17 @@ public:
     // scheduler thread for the duration of that admission round. Merged with every retained
     // lane's committed node path inside evict_one_prefix_node().
     void set_eviction_demand(std::span<const std::uint32_t> demand_nodes) noexcept;
+    // Retained lanes' committed node chains whose ancestor closure an admission reservation on
+    // `lane` leaves eviction-protected. Used so can_admit_lane() credits only cache pages eviction
+    // is actually willing to reclaim. The plan's own matched/reuse path is deliberately NOT part of
+    // the demand: those pages are adopted by the incoming plan, so they remain available capacity.
+    // `include_other_lanes` is false for the retained-eviction path (those lanes are evicted first);
+    // `include_current_lane` is true only when the plan reuses the lane's resident KV --
+    // FullReset/BlockSnapshot clear the lane's retained chain before reserving, making it
+    // reclaimable.
+    [[nodiscard]] std::vector<ninfer::prefix_cache::NodeId>
+    reservation_demand(std::uint32_t lane, bool include_other_lanes,
+                       bool include_current_lane) const;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

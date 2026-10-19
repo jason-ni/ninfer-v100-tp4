@@ -144,14 +144,13 @@ RequestPlan<Variant> Program<Variant>::plan_request_for_lane(std::uint32_t lane,
 }
 
 template <>
-bool Program<Variant>::can_admit_lane(std::uint32_t lane,
-                                      const RequestPlan<Variant>& plan) const noexcept {
+bool Program<Variant>::can_admit_lane(std::uint32_t lane, const RequestPlan<Variant>& plan) const {
     return impl_->can_admit_lane(lane, plan);
 }
 
 template <>
 bool Program<Variant>::can_admit_lane_after_retained_eviction(
-    std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept {
+    std::uint32_t lane, const RequestPlan<Variant>& plan) const {
     return impl_->can_admit_lane_after_retained_eviction(lane, plan);
 }
 
@@ -161,7 +160,7 @@ runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcep
 }
 
 template <>
-runtime::AdmissionResources Program<Variant>::admission_cache_residue() const noexcept {
+runtime::AdmissionResources Program<Variant>::admission_cache_residue() const {
     return impl_->admission_cache_residue();
 }
 
